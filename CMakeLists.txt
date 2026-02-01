@@ -1,27 +1,24 @@
-cmake_minimum_required(VERSION 3.21) # 只有这里改了一个数字
+cmake_minimum_required(VERSION 3.21)
 
-# 1. 设置 Vcpkg (保持不变)
+# =========================================================
+# 1. 设置 Vcpkg
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_TOOLCHAIN_FILE "D:/vcpkg/scripts/buildsystems/vcpkg.cmake"
         CACHE STRING "Vcpkg toolchain file")
 endif()
 
-project(AerodynamicHeatSim LANGUAGES CXX CUDA)
+project(FVM-Aerodynamic-Simulator LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
 # =========================================================
-# 改动点 1: 扩大显卡支持范围 (Fat Binary)
-# =========================================================
-# 不要写死 89 (4090)。这里涵盖了：
-# 75=RTX 20系, 80=A100/30系前沿, 86=RTX 30系, 89=RTX 40系
+# 75=RTX 20系, 80=A100/30系前沿, 86=RTX 30系, 89=RTX 40系, 120=RTX 50系
 # 最后的 "+PTX" 表示为了未来的新显卡包含虚拟架构代码(JIT编译)
-set(CMAKE_CUDA_ARCHITECTURES "75;86;89" CACHE STRING "CUDA Archs")
+set(CMAKE_CUDA_ARCHITECTURES "75;86;89;120+PTX" CACHE STRING "CUDA Archs")
 
 # =========================================================
-# 改动点 2: 动态链接 CUDA 运行时
-# =========================================================
+# 动态链接 CUDA 运行时
 # 使用动态链接以匹配vcpkg库的运行时设置，避免LIBCMT冲突
 # 注意：用户需要在PATH中包含CUDA DLL路径
 set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
@@ -44,10 +41,9 @@ set(IMGUI_SOURCES
 )
 
 # Sources
-set(PROJECT_SOURCES
-    src/main.cpp
-    src/solver.cu
-    src/renderer.cpp
+file(GLOB PROJECT_SOURCES
+    ${CMAKE_SOURCE_DIR}/src/*.cpp
+    ${CMAKE_SOURCE_DIR}/src/*.cu
 )
 
 add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SOURCES})
@@ -83,8 +79,15 @@ if(MSVC)
 endif()
 
 # =========================================================
-# 改动点 3: 自动打包安装脚本 (Install Step)
-# =========================================================
+# 构建后自动复制 assets 目录到 exe 所在目录
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/assets
+    $<TARGET_FILE_DIR:${PROJECT_NAME}>/assets
+    COMMENT "正在复制 assets 目录到输出目录..."
+)
+
+
 # 定义一个 "安装" 目标，把 exe 和所有依赖的 DLL 放到一个文件夹里
 
 include(GNUInstallDirs)
@@ -115,4 +118,4 @@ if(WIN32)
 endif()
 
 # 3. 安装可能存在的资源文件 (比如 shader 或 字体)
-# install(DIRECTORY assets/ DESTINATION bin/assets)
+install(DIRECTORY assets/ DESTINATION /assets)

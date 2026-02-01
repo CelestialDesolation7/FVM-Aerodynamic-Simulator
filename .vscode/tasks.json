@@ -16,10 +16,7 @@
                 "cwd": "${workspaceFolder}/build"
             },
             "problemMatcher": [],
-            "group": {
-                "kind": "build",
-                "isDefault": false
-            }
+            "group": "build"
         },
         {
             "label": "CMake: Build Release",
