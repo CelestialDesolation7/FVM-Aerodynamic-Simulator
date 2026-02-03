@@ -22,8 +22,6 @@
 #endif
 // clang-format on
 
-
-
 #pragma region 常量和全局变量
 #define DEBUG_MODE
 
@@ -39,9 +37,8 @@ float simTimePerStep = 0.0f; // 每步仿真耗时，单位秒
 int stepsPerFrame = 1; // 进行多少步仿真计算后再渲染一帧
 
 // 仿真参数和求解器
-SimParams simParams;
+SimParams params;
 CFDSolver solver;
-
 
 // 主机存储缓冲区
 std::vector<float> h_temperature;
@@ -67,25 +64,26 @@ void framebufferSizeCallback(GLFWwindow *window, int width, int height)
     renderer.resize(width, height);
 }
 
+void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods)
+{
+    if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
+    {
+        glfwSetWindowShouldClose(window, GLFW_TRUE);
+    }
+    if (key == GLFW_KEY_SPACE && action == GLFW_PRESS)
+    {
+        params.paused = !params.paused;
+    }
+    if (key == GLFW_KEY_R && action == GLFW_PRESS)
+    {
+        params.t_current = 0.0f;
+        params.step = 0;
+        solver.reset(params);
+    }
+}
 #pragma endregion
 
 #pragma region 工具函数
-void APIENTRY glDebugOutput(GLenum source, GLenum type, unsigned int id, GLenum severity, 
-                            GLsizei length, const char *message, const void *userParam)
-{
-    // 忽略一些不重要的通知
-    // 这几个数字对应的意思是：
-    // 131169 - 核心剖析
-    // 131185 - 性能剖析
-    // 131218 - 着色器编译
-    // 131204 - 着色器重定义
-    if(id == 131169 || id == 131185 || id == 131218 || id == 131204) return; 
-
-    std::cout << "---------------" << std::endl;
-    std::cout << "Debug message (" << id << "): " <<  message << std::endl;
-    std::cout << "---------------" << std::endl;
-}
-
 void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
     ImFontConfig fontConfig;
     fontConfig.OversampleH = 3; // 水平过采样
@@ -104,8 +102,8 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
 }
 #pragma endregion
 
-#pragma region ImGui控制面板渲染
-    void renderUI(){
+#pragma region 控制面板渲染
+void renderUI(){
         ImGui::Begin(u8"有限体积法空气动力学模拟控制面板");
         static float inputFontSize = DEFAULT_FONT_SIZE;
         if(ImGui::SliderFloat(u8"字体大小", &inputFontSize, 20.0f, 32.0f)){
@@ -116,8 +114,8 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
         if(ImGui::CollapsingHeader("性能监控")){
         ImGui::Text(u8"帧率: %.1f FPS", fps);
         ImGui::Text(u8"单步耗时: %.3f 毫秒", simTimePerStep * 1000.0f);
-        ImGui::Text(u8"仿真时间: %.6f 秒", simParams.t_current);
-        ImGui::Text(u8"迭代步数: %d", simParams.step);
+        ImGui::Text(u8"仿真时间: %.6f 秒", params.t_current);
+        ImGui::Text(u8"迭代步数: %d", params.step);
         ImGui::SliderInt(u8"每帧迭代数", &stepsPerFrame, 1, 100);
 
         ImGui::Separator();
@@ -150,21 +148,21 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
         ImGui::Separator();
 
         if(ImGui::CollapsingHeader(u8"仿真控制")){
-            if (ImGui::Button(simParams.paused ? u8"开始（space）" : u8"暂停（space）")){
-                simParams.paused = !simParams.paused;
+            if (ImGui::Button(params.paused ? u8"开始（space）" : u8"暂停（space）")){
+                params.paused = !params.paused;
             }
             ImGui::SameLine();
             if (ImGui::Button(u8"重置（R）")){
-                solver.reset(simParams);
-                simParams.t_current = 0.0f;
-                simParams.step = 0;
+                solver.reset(params);
+                params.t_current = 0.0f;
+                params.step = 0;
             }
             ImGui::SameLine();
-            if (ImGui::Button(u8"单步（N）") && simParams.paused){
-                if(simParams.paused){
-                    solver.step(simParams);
-                    simParams.t_current += simParams.dt;
-                    simParams.step += 1;
+            if (ImGui::Button(u8"单步（N）") && params.paused){
+                if(params.paused){
+                    solver.step(params);
+                    params.t_current += params.dt;
+                    params.step += 1;
                 }
             }
         }
@@ -179,110 +177,110 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
             ImGui::SliderInt(u8"Y轴网格分辨率", &ny_ui, 32, 4096);
 
             // 如果调整了，先显示再决定要不要应用修改
-            ImGui::Text(u8"当前网格分辨率：%d x %d", simParams.nx, simParams.ny);
-            if (nx_ui != simParams.nx || ny_ui != simParams.ny){
+            ImGui::Text(u8"当前网格分辨率：%d x %d", params.nx, params.ny);
+            if (nx_ui != params.nx || ny_ui != params.ny){
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), u8" -> %d x %d", nx_ui, ny_ui);
             }
 
             if (ImGui::Button(u8"应用网格尺寸"))
             {
-                simParams.nx = nx_ui;
-                simParams.ny = ny_ui;
-                simParams.computeDerived();
+                params.nx = nx_ui;
+                params.ny = ny_ui;
+                params.computeDerived();
                 //initializeSimulation();
                 // 重置时间记录
-                simParams.t_current = 0.0f;
-                simParams.step = 0;
+                params.t_current = 0.0f;
+                params.step = 0;
             }
 
-            ImGui::Text(u8"dx = %.4f m, dy = %.4f m", simParams.dx, simParams.dy);
-            ImGui::Text(u8"计算域: %.1f x %.1f m", simParams.domain_width, simParams.domain_height);
-            ImGui::Text(u8"总网格数: %d", simParams.nx * simParams.ny);
+            ImGui::Text(u8"dx = %.4f m, dy = %.4f m", params.dx, params.dy);
+            ImGui::Text(u8"计算域: %.1f x %.1f m", params.domain_width, params.domain_height);
+            ImGui::Text(u8"总网格数: %d", params.nx * params.ny);
         }
 
         ImGui::Separator();
 
-    if (ImGui::CollapsingHeader(u8"来流条件", ImGuiTreeNodeFlags_DefaultOpen))
-    {
-        bool changed = false;
-
-        changed |= ImGui::SliderFloat(u8"马赫数", &simParams.mach, 0.01f, 10.0f);
-        changed |= ImGui::SliderFloat(u8"来流温度 (K)", &simParams.T_inf, 200.0f, 400.0f);
-        changed |= ImGui::SliderFloat(u8"来流压强 (Pa)", &simParams.p_inf, 10000.0f, 101325.0f);
-
-        if (changed)
+        if (ImGui::CollapsingHeader(u8"来流条件", ImGuiTreeNodeFlags_DefaultOpen))
         {
-            simParams.computeDerived();
+            bool changed = false;
+
+            changed |= ImGui::SliderFloat(u8"马赫数", &params.mach, 0.01f, 10.0f);
+            changed |= ImGui::SliderFloat(u8"来流温度 (K)", &params.T_inf, 200.0f, 400.0f);
+            changed |= ImGui::SliderFloat(u8"来流压强 (Pa)", &params.p_inf, 10000.0f, 101325.0f);
+
+            if (changed)
+            {
+                params.computeDerived();
+            }
+
+            ImGui::Text(u8"来流密度 = %.4f kg/m^3", params.rho_inf);
+            ImGui::Text(u8"来流速度 = %.1f m/s", params.u_inf);
+            ImGui::Text(u8"声速 = %.1f m/s", params.c_inf);
+
+            ImGui::SliderFloat(u8"CFL数", &params.cfl, 0.1f, 0.9f);
+            ImGui::Text(u8"时间步长 = %.2e s", params.dt);
         }
 
-        ImGui::Text(u8"来流密度 = %.4f kg/m^3", simParams.rho_inf);
-        ImGui::Text(u8"来流速度 = %.1f m/s", simParams.u_inf);
-        ImGui::Text(u8"声速 = %.1f m/s", simParams.c_inf);
+        ImGui::Separator();
 
-        ImGui::SliderFloat(u8"CFL数", &simParams.cfl, 0.1f, 0.9f);
-        ImGui::Text(u8"时间步长 = %.2e s", simParams.dt);
-    }
-
-    ImGui::Separator();
-
-    if (ImGui::CollapsingHeader(u8"粘性设置 (Navier-Stokes)"))
-    {
-        bool viscosityChanged = false;
-
-        if (ImGui::Checkbox(u8"启用粘性模拟", &simParams.enable_viscosity))
+        if (ImGui::CollapsingHeader(u8"粘性设置 (Navier-Stokes)"))
         {
-            viscosityChanged = true;
-        }
+            bool viscosityChanged = false;
 
-        if (simParams.enable_viscosity)
-        {
-            ImGui::SliderFloat(u8"扩散CFL数", &simParams.cfl_visc, 0.1f, 0.5f);
-
-            ImGui::Separator();
-
-            ImGui::Text(u8"壁面边界条件:");
-
-            if (ImGui::Checkbox(u8"绝热壁面", &simParams.adiabatic_wall))
+            if (ImGui::Checkbox(u8"启用粘性模拟", &params.enable_viscosity))
             {
                 viscosityChanged = true;
             }
 
-            if (!simParams.adiabatic_wall)
+            if (params.enable_viscosity)
             {
-                if (ImGui::SliderFloat(u8"壁面温度 (K)", &simParams.T_wall, 200.0f, 1000.0f))
+                ImGui::SliderFloat(u8"扩散CFL数", &params.cfl_visc, 0.1f, 0.5f);
+
+                ImGui::Separator();
+
+                ImGui::Text(u8"壁面边界条件:");
+
+                if (ImGui::Checkbox(u8"绝热壁面", &params.adiabatic_wall))
                 {
                     viscosityChanged = true;
                 }
+
+                if (!params.adiabatic_wall)
+                {
+                    if (ImGui::SliderFloat(u8"壁面温度 (K)", &params.T_wall, 200.0f, 1000.0f))
+                    {
+                        viscosityChanged = true;
+                    }
+                }
+
+                ImGui::Separator();
+
+                // 计算来流粘性，用Sutherland公式，只代表刚飞进来的气体
+                float mu_inf = MU_REF * powf(params.T_inf / T_REF, 1.5f) *
+                            (T_REF + S_SUTHERLAND) / (params.T_inf + S_SUTHERLAND);
+                // 雷诺值，惯性力与粘性力之比
+                float Re = params.rho_inf * params.u_inf * (2.0f * params.obstacle_r) / mu_inf;
+                ImGui::Text(u8"雷诺数 Re ≈ %.0f", Re);
+                ImGui::Text(u8"来流粘性 μ = %.2e Pa·s", mu_inf);
+
+                ImGui::Separator();
+                ImGui::TextWrapped(u8"注意：启用粘性后，计算量增加约50%%。粘性CFL通常比对流CFL更严格。");
+            }
+            else
+            {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), u8"注意：当前为无粘性欧拉方程求解");
             }
 
-            ImGui::Separator();
-
-            // 计算来流粘性，用Sutherland公式，只代表刚飞进来的气体
-            float mu_inf = MU_REF * powf(simParams.T_inf / T_REF, 1.5f) *
-                           (T_REF + S_SUTHERLAND) / (simParams.T_inf + S_SUTHERLAND);
-            // 雷诺值，惯性力与粘性力之比
-            float Re = simParams.rho_inf * simParams.u_inf * (2.0f * simParams.obstacle_r) / mu_inf;
-            ImGui::Text(u8"雷诺数 Re ≈ %.0f", Re);
-            ImGui::Text(u8"来流粘性 μ = %.2e Pa·s", mu_inf);
-
-            ImGui::Separator();
-            ImGui::TextWrapped(u8"注意：启用粘性后，计算量增加约50%%。粘性CFL通常比对流CFL更严格。");
-        }
-        else
-        {
-            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), u8"注意：当前为无粘性欧拉方程求解");
+            if (viscosityChanged)
+            {
+                solver.reset(params);
+            }
         }
 
-        if (viscosityChanged)
-        {
-            solver.reset(simParams);
-        }
-    }
+        ImGui::Separator();
 
-    ImGui::Separator();
-
-    // Obstacle settings
+    // 障碍物设置
     if (ImGui::CollapsingHeader(u8"障碍物设置", ImGuiTreeNodeFlags_DefaultOpen))
     {
         bool changed = false;
@@ -292,64 +290,60 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
         ImGui::SameLine();
         if (ImGui::Button(u8"圆形"))
         {
-            simParams.obstacle_shape = 0;
+            params.obstacle_shape = 0;
             changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"五角星"))
         {
-            simParams.obstacle_shape = 1;
+            params.obstacle_shape = 1;
             changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"菱形"))
         {
-            simParams.obstacle_shape = 2;
+            params.obstacle_shape = 2;
             changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"胶囊形"))
         {
-            simParams.obstacle_shape = 3;
+            params.obstacle_shape = 3;
             changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"三角形"))
         {
-            simParams.obstacle_shape = 4;
+            params.obstacle_shape = 4;
             changed = true;
         }
 
         ImGui::Separator();
 
-        changed |= ImGui::SliderFloat(u8"中心 X 坐标", &simParams.obstacle_x, 0.5f, simParams.domain_width * 0.5f);
-        changed |= ImGui::SliderFloat(u8"大小 (半径)", &simParams.obstacle_r, 0.1f, 1.5f);
+        changed |= ImGui::SliderFloat(u8"中心 X 坐标", &params.obstacle_x, 0.5f, params.domain_width * 0.5f);
+        changed |= ImGui::SliderFloat(u8"大小 (半径)", &params.obstacle_r, 0.1f, 1.5f);
 
         // 障碍物旋转角度
-        float rotationDeg = simParams.obstacle_rotation * 180.0f / 3.14159265f;
+        float rotationDeg = params.obstacle_rotation * 180.0f / 3.14159265f;
         if (ImGui::SliderFloat(u8"旋转角度 (度)", &rotationDeg, -180.0f, 180.0f))
         {
-            simParams.obstacle_rotation = rotationDeg * 3.14159265f / 180.0f;
+            params.obstacle_rotation = rotationDeg * 3.14159265f / 180.0f;
             changed = true;
         }
         if (ImGui::InputFloat(u8"精确旋转角度 (度)", &rotationDeg))
         {
-            simParams.obstacle_rotation = rotationDeg * 3.14159265f / 180.0f;
+            params.obstacle_rotation = rotationDeg * 3.14159265f / 180.0f;
             changed = true;
         }
 
         if (changed)
         {
-            simParams.obstacle_y = simParams.domain_height / 2.0f;
-            solver.reset(simParams);
-            //solver.getCellTypes(h_cellTypes.data());
-            //renderer.updateCellTypes(h_cellTypes.data(), simParams.nx, simParams.ny);
+            params.obstacle_y = params.domain_height / 2.0f;
+            solver.reset(params);
+            solver.getCellTypes(h_cellTypes.data());
+            renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
         }
-
-        // Shape description
-        ImGui::Separator();
     }
-
     ImGui::Separator();
 
     if (ImGui::CollapsingHeader(u8"可视化设置", ImGuiTreeNodeFlags_DefaultOpen))
@@ -366,8 +360,14 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
             renderer.setColormap(static_cast<ColormapType>(currentColormap));
         }
 
-        ImGui::SliderFloat(u8"温度下限 (K)", &simParams.T_min, 100.0f, 500.0f);
-        ImGui::SliderFloat(u8"温度上限 (K)", &simParams.T_max, 300.0f, 2000.0f);
+        ImGui::SliderFloat(u8"温度下限 (K)", &params.T_min, 100.0f, 500.0f);
+        ImGui::SliderFloat(u8"温度上限 (K)", &params.T_max, 300.0f, 2000.0f);
+
+        bool showGrid = renderer.getShowGrid();
+        if (ImGui::Checkbox(u8"显示网格", &showGrid))
+        {
+            renderer.setShowGrid(showGrid);
+        }
 
         // Statistics
         float maxT = solver.getMaxTemperature();
@@ -378,24 +378,93 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
 
     ImGui::Separator();
 
-    // 色标控件
-    if (ImGui::CollapsingHeader(u8"色标", ImGuiTreeNodeFlags_DefaultOpen)){
+    // Colorbar
+    if (ImGui::CollapsingHeader(u8"色标", ImGuiTreeNodeFlags_DefaultOpen))
+    {
         ImDrawList *drawList = ImGui::GetWindowDrawList();
-        ImVec2 pos = ImGui::GetCursorPos();
+        ImVec2 pos = ImGui::GetCursorScreenPos();
         float barWidth = 200.0f;
         float barHeight = 20.0f;
 
-        for(int i = 0; i < (int)barWidth; i++){
+        // Draw colorbar
+        for (int i = 0; i < (int)barWidth; i++)
+        {
+            float t = (float)i / barWidth;
+            float r, g, b;
             
+            // 使用解耦的颜色映射函数
+            getColormapColor(static_cast<ColormapType>(currentColormap), t, r, g, b);
+            
+            ImU32 color = IM_COL32(r * 255, g * 255, b * 255, 255);
+            drawList->AddRectFilled(
+                ImVec2(pos.x + i, pos.y),
+                ImVec2(pos.x + i + 1, pos.y + barHeight),
+                color);
         }
+
+        ImGui::Dummy(ImVec2(barWidth, barHeight + 5));
+
+        // Labels
+        const char *unit = "";
+        float minVal = params.T_min;
+        float maxVal = params.T_max;
+
+        switch (currentField)
+        {
+        case FieldType::TEMPERATURE:
+            unit = "K";
+            minVal = params.T_min;
+            maxVal = params.T_max;
+            break;
+        case FieldType::PRESSURE:
+            unit = "Pa";
+            minVal = params.p_inf * 0.5f;
+            maxVal = params.p_inf * 5.0f;
+            break;
+        case FieldType::DENSITY:
+            unit = "kg/m^3";
+            minVal = params.rho_inf * 0.5f;
+            maxVal = params.rho_inf * 5.0f;
+            break;
+        case FieldType::VELOCITY_MAG:
+            unit = "m/s";
+            minVal = 0;
+            maxVal = params.u_inf * 1.5f;
+            break;
+        case FieldType::MACH:
+            unit = "";
+            minVal = 0;
+            maxVal = params.mach * 1.5f;
+            break;
+        }
+
+        ImGui::Text("%.1f %s", minVal, unit);
+        ImGui::SameLine(barWidth - 50);
+        ImGui::Text("%.1f %s", maxVal, unit);
     }
+
+    ImGui::Separator();
     ImGui::End();
-    }
+}
+
 #pragma endregion
 
+#pragma region 求解器设定
+void resizeBuffers(){
 
+}
+
+void initializeSimulation(){
+
+}
+#pragma endregion
+
+#pragma region 可视化函数
+void updateVisualization(){
+
+}
+#pragma endregion
 int main(int argc, char* argv[]){
-    // --------------------------
     // 设置控制台编码为 UTF-8，支持中文输出
     #ifdef _WIN32
         SetConsoleOutputCP(CP_UTF8);
@@ -404,7 +473,7 @@ int main(int argc, char* argv[]){
     //  设置工作目录为程序所在目录，方便加载资源文件
     std::filesystem::path exePath = std::filesystem::path(argv[0]).parent_path();
     std::filesystem::current_path(exePath);
-    // --------------------------
+
     // 初始化GLFW
     if(!glfwInit()){
         std::cerr << "[错误] 程序在初始化GLFW阶段失败并退出" << std::endl;
@@ -414,9 +483,7 @@ int main(int argc, char* argv[]){
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,4);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);
     glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
-    #ifdef DEBUG_MODE
-        glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT,GLFW_TRUE);
-    #endif
+
 
     GLFWwindow* window = glfwCreateWindow(windowWidth,windowHeight,"程序窗口",nullptr,nullptr);
     if(!window){
@@ -427,7 +494,10 @@ int main(int argc, char* argv[]){
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // 启用垂直同步
 
-    // --------------------------
+    // 设置回调函数
+    glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
+    glfwSetKeyCallback(window, keyCallback);
+
     // 初始化GLAD
     if(!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)){
         std::cerr << "[错误] 程序在初始化GLAD阶段失败并退出";
@@ -436,19 +506,6 @@ int main(int argc, char* argv[]){
         return -1;
     }
 
-    // --------------------------
-    // 初始化调试系统
-    int flags;
-    glGetIntegerv(GL_CONTEXT_FLAGS, &flags);
-    if(flags & GL_CONTEXT_FLAG_DEBUG_BIT){
-        glEnable(GL_DEBUG_OUTPUT);
-        glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
-        glDebugMessageCallback(glDebugOutput, nullptr);
-        glDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, nullptr, GL_TRUE);
-        std::cout << "[信息] OpenGL 上下文已处于调试模式" << std::endl;
-    }
-
-    //--------------------------
     // 初始化ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -462,8 +519,8 @@ int main(int argc, char* argv[]){
     setupImGuiFont(io, DEFAULT_FONT_PATH, DEFAULT_FONT_SIZE);
 
 
-    // Initialize renderer
-    if (!renderer.initRendererData())
+    // 初始化渲染器
+    if (!renderer.initialize(windowWidth, windowHeight))
     {
         std::cerr << "[错误] 程序在初始化Renderer阶段失败并退出";
         glfwDestroyWindow(window);
@@ -471,54 +528,55 @@ int main(int argc, char* argv[]){
         return -1;
     }
 
-    #pragma region 测试
-    // --- 高斯分布测试数据生成 ---
-    {
-        int dataW = 512;
-        int dataH = 256;
-        std::vector<float> testData(dataW * dataH);
-        for(int y=0; y<dataH; ++y) {
-            for(int x=0; x<dataW; ++x) {
-                float u = (float)x / dataW - 0.5f;
-                float v = (float)y / dataH - 0.5f;
-                // 二维高斯函数: exp(-(x^2 + y^2) / sigma)
-                float val = std::exp(-(u*u + v*v) * 20.0f); 
-                testData[y * dataW + x] = val;
-            }
-        }
-        renderer.updateTexture(dataW, dataH, testData);
-    }
-    #pragma endregion
+    // 初始化仿真器
+    // initializeSimulation();
 
+    // 初始化时间和帧率
+    auto lastTime = std::chrono::high_resolution_clock::now();
+    int frameCount = 0;
+
+    // 主渲染循环
     while(!glfwWindowShouldClose(window)){
+        auto frameStart = std::chrono::high_resolution_clock::now();
         glfwPollEvents();
 
-        // 开始ImGui新帧
+       
+   
+        // 进行一步仿真
+        if (!params.paused)
+        {
+        }
+
+        // 更新可视化数据（主机缓存）
+        updateVisualization();
+
+        // 绘制可视化数据
+        renderer.render(params);
+
+        // 最后绘制ImGui，防止控制面板被遮挡
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
-
-        // 这里编写你的ImGui界面代码
         renderUI();
-
-        // 渲染ImGui
         ImGui::Render();
-
-        int display_w, display_h;
-        glfwGetFramebufferSize(window, &display_w, &display_h);
-        glViewport(0, 0, display_w, display_h);
-
-        glClearColor(0.2f, 0.3f, 0.3f, 1.0f); // 灰青色背景
-        glClear(GL_COLOR_BUFFER_BIT); // 清屏
-
-        renderer.draw();
-
-        // 最后绘制ImGui，防止控制面板被遮挡
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window);
+
+        // 计算帧率
+        frameCount++;
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float elapsed = std::chrono::duration<float>(currentTime - lastTime).count();
+
+        if (elapsed >= 0.5f)
+        {
+            fps = frameCount / elapsed;
+            frameCount = 0;
+            lastTime = currentTime;
+        }
     }
 
+    // 例行清理代码
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
