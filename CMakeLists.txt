@@ -50,8 +50,11 @@ add_executable(${PROJECT_NAME} ${PROJECT_SOURCES} ${IMGUI_SOURCES})
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/include
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
+    ${CUDAToolkit_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}/cccl
 )
 
 target_link_libraries(${PROJECT_NAME} PRIVATE

@@ -1,6 +1,9 @@
 {
     "files.associations": {
-        "random": "cpp"
+        "random": "cpp",
+        "*.h": "cpp",
+        "*.cu": "cuda-cpp",
+        "*.cuh": "cuda-cpp"
     },
     "clangd.enable": false,
     "C_Cpp.intelliSenseEngine": "default",
@@ -8,5 +11,5 @@
     "C_Cpp.default.compilerPath": "D:/Program Files/Microsoft Visual Studio/2022/Professional/VC/Tools/MSVC/14.43.34808/bin/Hostx64/x64/cl.exe",
     "C_Cpp.default.cppStandard": "c++17",
     "C_Cpp.default.cStandard": "c17",
-
+    "C_Cpp.errorSquiggles": "enabled"
 }
