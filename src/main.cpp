@@ -22,6 +22,8 @@
 #endif
 // clang-format on
 
+
+
 #pragma region 常量和全局变量
 #define DEBUG_MODE
 
@@ -375,13 +377,24 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
     }
 
     ImGui::Separator();
+
+    // 色标控件
+    if (ImGui::CollapsingHeader(u8"色标", ImGuiTreeNodeFlags_DefaultOpen)){
+        ImDrawList *drawList = ImGui::GetWindowDrawList();
+        ImVec2 pos = ImGui::GetCursorPos();
+        float barWidth = 200.0f;
+        float barHeight = 20.0f;
+
+        for(int i = 0; i < (int)barWidth; i++){
+            
+        }
+    }
     ImGui::End();
     }
 #pragma endregion
 
 
 int main(int argc, char* argv[]){
-
     // --------------------------
     // 设置控制台编码为 UTF-8，支持中文输出
     #ifdef _WIN32
@@ -445,11 +458,37 @@ int main(int argc, char* argv[]){
     ImGui::StyleColorsDark();                                 // 设置深色主题
     ImGui_ImplGlfw_InitForOpenGL(window,true);                // ImGui接管GLFW输入
     ImGui_ImplOpenGL3_Init("#version 430 core");    // 指定GLSL版本，编写Shader时会用到
-
-    //--------------------------
     // 设置中文字体
     setupImGuiFont(io, DEFAULT_FONT_PATH, DEFAULT_FONT_SIZE);
 
+
+    // Initialize renderer
+    if (!renderer.initRendererData())
+    {
+        std::cerr << "[错误] 程序在初始化Renderer阶段失败并退出";
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
+
+    #pragma region 测试
+    // --- 高斯分布测试数据生成 ---
+    {
+        int dataW = 512;
+        int dataH = 256;
+        std::vector<float> testData(dataW * dataH);
+        for(int y=0; y<dataH; ++y) {
+            for(int x=0; x<dataW; ++x) {
+                float u = (float)x / dataW - 0.5f;
+                float v = (float)y / dataH - 0.5f;
+                // 二维高斯函数: exp(-(x^2 + y^2) / sigma)
+                float val = std::exp(-(u*u + v*v) * 20.0f); 
+                testData[y * dataW + x] = val;
+            }
+        }
+        renderer.updateTexture(dataW, dataH, testData);
+    }
+    #pragma endregion
 
     while(!glfwWindowShouldClose(window)){
         glfwPollEvents();
@@ -471,6 +510,8 @@ int main(int argc, char* argv[]){
 
         glClearColor(0.2f, 0.3f, 0.3f, 1.0f); // 灰青色背景
         glClear(GL_COLOR_BUFFER_BIT); // 清屏
+
+        renderer.draw();
 
         // 最后绘制ImGui，防止控制面板被遮挡
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
