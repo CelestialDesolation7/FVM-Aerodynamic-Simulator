@@ -13,7 +13,7 @@ CMakeUserPresets.json
 build/
 dist/
 EXAMPLE/
-docs/
+CHAT_TMP/
 
 # CLion
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
