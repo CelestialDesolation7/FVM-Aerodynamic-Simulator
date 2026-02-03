@@ -5,26 +5,33 @@
 #include <vector>
 #include "common.h"
 
-// Colormap types
+#pragma region 枚举类型定义
+// 色图类型枚举
 enum class ColormapType {
-    JET,
-    HOT,
-    PLASMA,
-    INFERNO,
-    VIRIDIS
+    JET,        // 蓝-青-绿-黄-红
+    HOT,        // 黑-红-黄-白
+    PLASMA,     // 深紫-红紫-橙-黄
+    INFERNO,    // 黑-深红-橙-黄白
+    VIRIDIS     // 深紫-蓝绿-绿黄
 };
 
-// Field display types
+// 物理场显示类型枚举
 enum class FieldType {
-    TEMPERATURE,
-    PRESSURE,
-    DENSITY,
-    VELOCITY_MAG,
-    MACH
+    TEMPERATURE,    // 温度场
+    PRESSURE,       // 压强场
+    DENSITY,        // 密度场
+    VELOCITY_MAG,   // 速度大小场
+    MACH            // 马赫数场
 };
+#pragma endregion
+#pragma endregion
 
+#pragma region 色图辅助函数
 // 全局辅助函数：根据色图类型和归一化值(0~1)计算RGB颜色
-// 返回值：RGB各分量范围为[0, 1]
+// 参数:
+//   colormap - 色图类型
+//   t - 归一化值 [0, 1]
+//   r, g, b - 输出的RGB分量 [0, 1]
 inline void getColormapColor(ColormapType colormap, float t, float& r, float& g, float& b) {
     // 将t限制在[0, 1]范围内
     t = std::max(0.0f, std::min(1.0f, t));
@@ -75,98 +82,114 @@ inline void getColormapColor(ColormapType colormap, float t, float& r, float& g,
             break;
     }
 }
+#pragma endregion
+#pragma endregion
 
+#pragma region 渲染器类定义
+// 渲染器类：负责使用 OpenGL 进行 CFD 仿真结果的可视化
 class Renderer {
 public:
     Renderer();
     ~Renderer();
     
-    // 初始化-注册OpenGL资源
+    // 初始化渲染器，创建并配置所有 OpenGL 资源
     bool initialize(int width, int height);
-    // 清理注册的OpenGL资源
+    
+    // 清理所有已分配的 OpenGL 资源
     void cleanup();
     
-    // 更新
+    // 更新物理场数据到 GPU 纹理
+    // 参数:
+    //   data - 主机端物理场数据指针
+    //   nx, ny - 网格尺寸
+    //   minVal, maxVal - 物理量的最小值和最大值（用于归一化）
+    //   type - 要显示的物理场类型
     void updateField(const float* data, int nx, int ny, 
                      float minVal, float maxVal, FieldType type);
     
-    // Update cell types for grid overlay
+    // 更新网格类型数据（用于显示障碍物和边界）
     void updateCellTypes(const uint8_t* types, int nx, int ny);
     
-    // Render the field
+    // 渲染当前帧
     void render(const SimParams& params);
     
-    // Settings
+    // 设置和获取色图类型
     void setColormap(ColormapType cmap);
     ColormapType getColormap() const { return colormap_; }
     
+    // 设置和获取网格显示开关
     void setShowGrid(bool show) { showGrid_ = show; }
     bool getShowGrid() const { return showGrid_; }
     
+    // 设置障碍物显示开关
     void setShowObstacle(bool show) { showObstacle_ = show; }
     
-    // Window resize
+    // 窗口尺寸调整
     void resize(int width, int height);
     
+    // 获取窗口尺寸
     int getWidth() const { return width_; }
     int getHeight() const { return height_; }
     
 private:
-    // Window dimensions
+    // 窗口尺寸
     int width_ = 800;
     int height_ = 600;
     
-    // Field dimensions
+    // 物理场网格维度
     int nx_ = 0;
     int ny_ = 0;
     
-    // OpenGL objects
-    GLuint fieldTexture_ = 0;
-    GLuint colormapTexture_ = 0;
-    GLuint cellTypeTexture_ = 0;
-    GLuint shaderProgram_ = 0;
+    // OpenGL 纹理对象
+    GLuint fieldTexture_ = 0;       // 物理场数据纹理
+    GLuint colormapTexture_ = 0;    // 色图查找表纹理（1D）
+    GLuint cellTypeTexture_ = 0;    // 网格类型纹理
+    
+    // OpenGL 着色器程序
+    GLuint shaderProgram_ = 0;      // 主渲染着色器
+    
+    // OpenGL 顶点数组对象和缓冲区对象（主四边形）
     GLuint VAO_ = 0;
     GLuint VBO_ = 0;
     
-    // Grid overlay shader
+    // 网格线叠加层的着色器和缓冲区
     GLuint gridShaderProgram_ = 0;
     GLuint gridVAO_ = 0;
     GLuint gridVBO_ = 0;
     
-    // Circle overlay shader
+    // 障碍物轮廓叠加层的着色器和缓冲区
     GLuint circleShaderProgram_ = 0;
     GLuint circleVAO_ = 0;
     GLuint circleVBO_ = 0;
     
-    // Settings
-    ColormapType colormap_ = ColormapType::JET;
-    bool showGrid_ = false;
-    bool showObstacle_ = true;
+    // 渲染设置
+    ColormapType colormap_ = ColormapType::JET;  // 当前色图类型
+    bool showGrid_ = false;                       // 是否显示网格线
+    bool showObstacle_ = true;                    // 是否显示障碍物轮廓
     
-    // Current field range
+    // 当前物理场的值域范围
     float minVal_ = 0.0f;
     float maxVal_ = 1.0f;
     FieldType fieldType_ = FieldType::TEMPERATURE;
     
-    // Host buffer for normalized data
+    // 主机端归一化数据缓冲区
     std::vector<float> normalizedData_;
     
-    // Create shaders
-    bool createShaders();
-    bool createGridShader();
-    bool createCircleShader();
+    // 着色器创建和编译的工具函数
+    bool createShaders();           // 创建主渲染着色器
+    bool createGridShader();        // 创建网格线着色器
+    bool createCircleShader();      // 创建障碍物轮廓着色器
+    GLuint compileShader(const char* source, GLenum type);  // 编译单个着色器
+    GLuint linkProgram(GLuint vertShader, GLuint fragShader); // 链接着色器程序
     
-    // Create colormap texture
+    // 色图纹理创建
     void createColormapTexture();
     
-    // Generate colormap data
+    // 各种色图的生成函数
     void generateJetColormap(std::vector<float>& colors);
     void generateHotColormap(std::vector<float>& colors);
     void generatePlasmaColormap(std::vector<float>& colors);
     void generateInfernoColormap(std::vector<float>& colors);
     void generateViridisColormap(std::vector<float>& colors);
-    
-    // Compile shader
-    GLuint compileShader(const char* source, GLenum type);
-    GLuint linkProgram(GLuint vertShader, GLuint fragShader);
 };
+#pragma endregion
