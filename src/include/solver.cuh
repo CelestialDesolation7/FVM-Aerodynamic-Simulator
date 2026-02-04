@@ -43,6 +43,23 @@ public:
     void getVelocityField(float *host_u, float *host_v);
     void getDensityField(float *host_rho);
     void getCellTypes(uint8_t *host_types);
+    
+    // ==================== CUDA-OpenGL 互操作接口 ====================
+    // 直接将物理场数据写入到设备指针（用于互操作模式）
+    // 这些函数将数据从求解器内部设备数组拷贝到外部设备指针（GPU到GPU拷贝）
+    void copyTemperatureToDevice(float *dev_dst);
+    void copyPressureToDevice(float *dev_dst);
+    void copyDensityToDevice(float *dev_dst);
+    void copyVelocityMagnitudeToDevice(float *dev_dst);
+    void copyMachToDevice(float *dev_dst);
+    
+    // 获取设备端数据的原始指针（用于高级用途）
+    float* getDeviceTemperature() { return d_T_; }
+    float* getDevicePressure() { return d_p_; }
+    float* getDeviceDensity() { return d_rho_; }
+    float* getDeviceVelocityU() { return d_u_; }
+    float* getDeviceVelocityV() { return d_v_; }
+    uint8_t* getDeviceCellTypes() { return d_cell_type_; }
 
     // 获取网格尺寸
     int getNx() const { return _nx; }

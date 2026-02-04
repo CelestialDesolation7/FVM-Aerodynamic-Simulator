@@ -1,7 +1,22 @@
 #include "renderer.h"
+#include <cuda_gl_interop.h>
 #include <cstdio>
 #include <cmath>
 #include <algorithm>
+#include <iostream>
+
+// CUDA错误检查宏
+#define CUDA_CHECK_INTEROP(call)                                                     \
+    do                                                                               \
+    {                                                                                \
+        cudaError_t err = call;                                                      \
+        if (err != cudaSuccess)                                                      \
+        {                                                                            \
+            fprintf(stderr, "[CUDA互操作错误] %s in %s line %i : %s.\n",              \
+                    #call, __FILE__, __LINE__, cudaGetErrorString(err));             \
+            return false;                                                            \
+        }                                                                            \
+    } while (0)
 
 // 注意：这里的所有纹理输入数据都在渲染循环或初始化阶段绑定
 #pragma region 着色器源码
@@ -264,6 +279,126 @@ void Renderer::cleanup() {
     if (vectorShaderProgram_) glDeleteProgram(vectorShaderProgram_);
     if (vectorVAO_) glDeleteVertexArrays(1, &vectorVAO_);
     if (vectorVBO_) glDeleteBuffers(1, &vectorVBO_);
+    
+    // 清理CUDA互操作资源
+    cleanupCudaInterop();
+}
+#pragma endregion
+
+#pragma region CUDA-OpenGL互操作
+// 初始化CUDA-OpenGL互操作（使用PBO方法）
+bool Renderer::initCudaInterop(int nx, int ny) {
+    // 如果已经启用，先清理
+    if (cudaInteropEnabled_) {
+        cleanupCudaInterop();
+    }
+    
+    nx_ = nx;
+    ny_ = ny;
+    size_t bufferSize = nx * ny * sizeof(float);
+    
+    // 创建PBO (Pixel Buffer Object)
+    glGenBuffers(1, &fieldPBO_);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, bufferSize, nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    
+    // 注册PBO为CUDA图形资源
+    cudaError_t err = cudaGraphicsGLRegisterBuffer(
+        &cudaPBOResource_,
+        fieldPBO_,
+        cudaGraphicsMapFlagsWriteDiscard  // CUDA只写入
+    );
+    
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA互操作] 注册PBO失败: %s\n", cudaGetErrorString(err));
+        glDeleteBuffers(1, &fieldPBO_);
+        fieldPBO_ = 0;
+        cudaPBOResource_ = nullptr;
+        return false;
+    }
+    
+    // 确保纹理有正确的尺寸
+    glBindTexture(GL_TEXTURE_2D, fieldTexture_);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, nx, ny, 0, GL_RED, GL_FLOAT, nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    
+    mappedSize_ = bufferSize;
+    cudaInteropEnabled_ = true;
+    std::cout << "[CUDA互操作] 初始化成功，网格尺寸: " << nx << " x " << ny 
+              << "，缓冲区大小: " << bufferSize / 1024.0f << " KB" << std::endl;
+    return true;
+}
+
+// 清理CUDA互操作资源
+void Renderer::cleanupCudaInterop() {
+    if (cudaPBOResource_) {
+        cudaGraphicsUnregisterResource(cudaPBOResource_);
+        cudaPBOResource_ = nullptr;
+    }
+    if (fieldPBO_) {
+        glDeleteBuffers(1, &fieldPBO_);
+        fieldPBO_ = 0;
+    }
+    cudaInteropEnabled_ = false;
+    mappedSize_ = 0;
+}
+
+// 映射PBO以供CUDA写入，返回设备指针
+float* Renderer::mapFieldTexture() {
+    if (!cudaInteropEnabled_ || !cudaPBOResource_) {
+        return nullptr;
+    }
+    
+    // 映射资源
+    cudaError_t err = cudaGraphicsMapResources(1, &cudaPBOResource_, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA互操作] 映射PBO失败: %s\n", cudaGetErrorString(err));
+        return nullptr;
+    }
+    
+    // 获取设备指针
+    float* devPtr = nullptr;
+    size_t size = 0;
+    err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&devPtr), &size, cudaPBOResource_);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[CUDA互操作] 获取设备指针失败: %s\n", cudaGetErrorString(err));
+        cudaGraphicsUnmapResources(1, &cudaPBOResource_, 0);
+        return nullptr;
+    }
+    
+    return devPtr;
+}
+
+// 取消映射，并将PBO数据传输到纹理
+void Renderer::unmapFieldTexture() {
+    if (!cudaPBOResource_) return;
+    
+    // 取消CUDA映射
+    cudaGraphicsUnmapResources(1, &cudaPBOResource_, 0);
+    
+    // 将PBO数据传输到纹理
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_);
+    glBindTexture(GL_TEXTURE_2D, fieldTexture_);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx_, ny_, GL_RED, GL_FLOAT, nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
+
+// 重新调整互操作缓冲区尺寸
+void Renderer::resizeCudaInterop(int nx, int ny) {
+    if (nx != nx_ || ny != ny_) {
+        if (cudaInteropEnabled_) {
+            initCudaInterop(nx, ny);
+        }
+    }
+}
+
+// 设置场值范围
+void Renderer::setFieldRange(float minVal, float maxVal, FieldType type) {
+    minVal_ = minVal;
+    maxVal_ = maxVal;
+    fieldType_ = type;
 }
 #pragma endregion
 
@@ -817,4 +952,9 @@ void Renderer::resize(int width, int height) {
     height_ = height;
     glViewport(0, 0, width, height);
 }
+#pragma endregion
+
+
+#pragma region cuda-OpenGL互操作
+
 #pragma endregion

@@ -2,8 +2,12 @@
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
+#include <cuda_runtime.h>
 #include <vector>
 #include "common.h"
+
+// 前向声明CUDA图形资源类型，避免在非CUDA文件中包含cuda_gl_interop.h
+struct cudaGraphicsResource;
 
 #pragma region 枚举类型定义
 // 色图类型枚举
@@ -137,8 +141,38 @@ public:
     // 获取窗口尺寸
     int getWidth() const { return width_; }
     int getHeight() const { return height_; }
+
+    // ==================== CUDA-OpenGL 互操作接口 ====================
+    
+    // 初始化CUDA-OpenGL互操作（在OpenGL初始化之后调用）
+    bool initCudaInterop(int nx, int ny);
+    
+    // 清理CUDA互操作资源
+    void cleanupCudaInterop();
+    
+    // 映射纹理以供CUDA写入，返回设备指针
+    float* mapFieldTexture();
+    
+    // 取消映射，CUDA写入完成后调用
+    void unmapFieldTexture();
+    
+    // 更新互操作纹理的尺寸（网格尺寸变化时调用）
+    void resizeCudaInterop(int nx, int ny);
+    
+    // 设置场值范围（互操作模式下使用）
+    void setFieldRange(float minVal, float maxVal, FieldType type);
+    
+    // 检查互操作是否已启用
+    bool isCudaInteropEnabled() const { return cudaInteropEnabled_; }
+    
+    // 获取网格尺寸
+    int getNx() const { return nx_; }
+    int getNy() const { return ny_; }
+
+
     
 private:
+
     // 窗口尺寸
     int width_ = 800;
     int height_ = 600;
@@ -192,6 +226,12 @@ private:
     
     // 主机端归一化数据缓冲区
     std::vector<float> normalizedData_;
+    
+    // ==================== CUDA-OpenGL 互操作相关 ====================
+    bool cudaInteropEnabled_ = false;           // 互操作是否启用
+    GLuint fieldPBO_ = 0;                       // Pixel Buffer Object for CUDA interop
+    cudaGraphicsResource* cudaPBOResource_ = nullptr;  // CUDA图形资源句柄（PBO）
+    size_t mappedSize_ = 0;                     // 映射的缓冲区大小
     
     // 着色器创建和编译的工具函数
     bool createShaders();           // 创建主渲染着色器

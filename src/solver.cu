@@ -2822,3 +2822,83 @@ size_t CFDSolver::getSimulationMemoryUsage()
 }
 #pragma endregion
 #pragma endregion
+
+#pragma region cuda-OpenGL互操作
+// ==================== CUDA-OpenGL 互操作实现 ====================
+
+// 计算速度幅值的CUDA核函数
+__global__ void computeVelocityMagnitudeKernel(
+    const float* u, const float* v, float* vmag, int nx, int ny)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (i >= nx || j >= ny) return;
+    
+    int idx = j * nx + i;
+    float uu = u[idx];
+    float vv = v[idx];
+    vmag[idx] = sqrtf(uu * uu + vv * vv);
+}
+
+// 计算马赫数的CUDA核函数
+__global__ void computeMachKernel(
+    const float* u, const float* v, const float* T, float* mach, int nx, int ny)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (i >= nx || j >= ny) return;
+    
+    int idx = j * nx + i;
+    float uu = u[idx];
+    float vv = v[idx];
+    float speed = sqrtf(uu * uu + vv * vv);
+    float c = sqrtf(GAMMA * R_GAS * T[idx]);
+    mach[idx] = speed / (c + 1e-10f);
+}
+
+// 直接将温度场拷贝到设备指针（GPU到GPU拷贝）
+void CFDSolver::copyTemperatureToDevice(float *dev_dst)
+{
+    // 先确保原始变量是最新的
+    launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+                                  d_u_, d_v_, d_p_, d_T_, _nx, _ny);
+    // GPU到GPU拷贝
+    CUDA_CHECK(cudaMemcpy(dev_dst, d_T_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToDevice));
+}
+
+// 直接将压强场拷贝到设备指针
+void CFDSolver::copyPressureToDevice(float *dev_dst)
+{
+    CUDA_CHECK(cudaMemcpy(dev_dst, d_p_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToDevice));
+}
+
+// 直接将密度场拷贝到设备指针
+void CFDSolver::copyDensityToDevice(float *dev_dst)
+{
+    CUDA_CHECK(cudaMemcpy(dev_dst, d_rho_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToDevice));
+}
+
+// 直接计算并拷贝速度幅值到设备指针
+void CFDSolver::copyVelocityMagnitudeToDevice(float *dev_dst)
+{
+    dim3 block(16, 16);
+    dim3 grid((_nx + block.x - 1) / block.x, (_ny + block.y - 1) / block.y);
+    
+    // 直接计算到目标缓冲区
+    computeVelocityMagnitudeKernel<<<grid, block>>>(d_u_, d_v_, dev_dst, _nx, _ny);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// 直接计算并拷贝马赫数到设备指针
+void CFDSolver::copyMachToDevice(float *dev_dst)
+{
+    dim3 block(16, 16);
+    dim3 grid((_nx + block.x - 1) / block.x, (_ny + block.y - 1) / block.y);
+    
+    // 直接计算到目标缓冲区
+    computeMachKernel<<<grid, block>>>(d_u_, d_v_, d_T_, dev_dst, _nx, _ny);
+    CUDA_CHECK(cudaGetLastError());
+}
+#pragma endregion

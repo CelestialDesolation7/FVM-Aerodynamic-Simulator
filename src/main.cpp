@@ -61,6 +61,10 @@ float rho_max_ratio = 5.0f;
 float v_max_ratio = 1.5f;
 float mach_max_ratio = 1.5f;
 
+// CUDA-OpenGL互操作控制
+bool enableCudaInterop = false;    // 是否启用互操作加速
+bool cudaInteropInitialized = false;  // 互操作是否已初始化
+
 #pragma endregion
 
 
@@ -178,6 +182,32 @@ void renderUI(){
 
         size_t simMemory = solver.getSimulationMemoryUsage();
         ImGui::Text(u8"仿真数据占用显存: %.1f MB", simMemory / (1024.0f * 1024.0f));
+        
+        ImGui::Separator();
+        
+        // CUDA-OpenGL 互操作开关
+        if (ImGui::Checkbox(u8"启用GPU零拷贝加速", &enableCudaInterop)) {
+            if (enableCudaInterop && !cudaInteropInitialized) {
+                // 尝试初始化互操作
+                if (renderer.initCudaInterop(params.nx, params.ny)) {
+                    cudaInteropInitialized = true;
+                    std::cout << "[主程序] CUDA-OpenGL互操作已启用" << std::endl;
+                } else {
+                    enableCudaInterop = false;
+                    std::cerr << "[主程序] CUDA-OpenGL互操作初始化失败" << std::endl;
+                }
+            } else if (!enableCudaInterop && cudaInteropInitialized) {
+                // 清理互操作资源
+                renderer.cleanupCudaInterop();
+                cudaInteropInitialized = false;
+                std::cout << "[主程序] CUDA-OpenGL互操作已禁用" << std::endl;
+            }
+        }
+        if (cudaInteropInitialized) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), u8"(已激活)");
+        }
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"零拷贝: GPU直接写入显示纹理，跳过CPU中转");
         }
         
         ImGui::Separator();
@@ -228,6 +258,11 @@ void renderUI(){
                 // 重置时间记录
                 params.t_current = 0.0f;
                 params.step = 0;
+                
+                // 如果互操作已启用，需要重新初始化互操作缓冲区
+                if (cudaInteropInitialized) {
+                    renderer.resizeCudaInterop(params.nx, params.ny);
+                }
             }
 
             ImGui::Text(u8"dx = %.4f m, dy = %.4f m", params.dx, params.dy);
@@ -531,7 +566,8 @@ void renderUI(){
 
 
 #pragma region 可视化函数
-void updateVisualization(){
+// 使用传统CPU拷贝方式更新可视化
+void updateVisualizationCPU(){
     float *fieldData = nullptr;
     float minVal, maxVal;
 
@@ -594,6 +630,84 @@ void updateVisualization(){
     }
 
     renderer.updateField(fieldData, params.nx, params.ny, minVal, maxVal, currentField);
+}
+
+// 使用CUDA-OpenGL互操作方式更新可视化（零拷贝）
+void updateVisualizationInterop(){
+    float minVal, maxVal;
+    
+    // 计算值域范围
+    switch (currentField)
+    {
+    case FieldType::TEMPERATURE:
+        minVal = params.T_min;
+        maxVal = params.T_max;
+        break;
+    case FieldType::PRESSURE:
+        minVal = params.p_inf * p_min_ratio;
+        maxVal = params.p_inf * p_max_ratio;
+        break;
+    case FieldType::DENSITY:
+        minVal = params.rho_inf * rho_min_ratio;
+        maxVal = params.rho_inf * rho_max_ratio;
+        break;
+    case FieldType::VELOCITY_MAG:
+        minVal = 0.0f;
+        maxVal = params.u_inf * v_max_ratio;
+        break;
+    case FieldType::MACH:
+        minVal = 0.0f;
+        maxVal = params.mach * mach_max_ratio;
+        break;
+    }
+    
+    // 设置渲染器的场值范围
+    renderer.setFieldRange(minVal, maxVal, currentField);
+    
+    // 映射PBO获取设备指针
+    float* devPtr = renderer.mapFieldTexture();
+    if (!devPtr) {
+        // 映射失败，回退到CPU方式
+        updateVisualizationCPU();
+        return;
+    }
+    
+    // 根据当前显示的物理量，直接在GPU上拷贝/计算数据到PBO
+    switch (currentField)
+    {
+    case FieldType::TEMPERATURE:
+        solver.copyTemperatureToDevice(devPtr);
+        break;
+    case FieldType::PRESSURE:
+        solver.copyPressureToDevice(devPtr);
+        break;
+    case FieldType::DENSITY:
+        solver.copyDensityToDevice(devPtr);
+        break;
+    case FieldType::VELOCITY_MAG:
+        solver.copyVelocityMagnitudeToDevice(devPtr);
+        // 速度矢量可视化仍需要CPU数据（箭头绘制在CPU端完成）
+        if (renderer.getShowVectors()) {
+            solver.getVelocityField(h_u.data(), h_v.data());
+            renderer.updateVelocityField(h_u.data(), h_v.data(), params.nx, params.ny, params.u_inf);
+        }
+        break;
+    case FieldType::MACH:
+        solver.copyMachToDevice(devPtr);
+        break;
+    }
+    
+    // 取消映射，数据自动传输到纹理
+    renderer.unmapFieldTexture();
+}
+
+// 统一的可视化更新函数
+void updateVisualization(){
+    if (enableCudaInterop && cudaInteropInitialized) {
+        updateVisualizationInterop();
+    } else {
+        updateVisualizationCPU();
+    }
 }
 #pragma endregion
 
