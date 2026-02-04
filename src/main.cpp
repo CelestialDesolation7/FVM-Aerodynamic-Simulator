@@ -23,7 +23,10 @@
 // clang-format on
 
 #pragma region 常量和全局变量
-#define DEBUG_MODE
+__device__ __constant__ float MIN_DENSITY = 1e-4f;
+__device__ __constant__ float MIN_PRESSURE = 1e-2f;
+__device__ __constant__ float MAX_TEMPERATURE = 5000.0f;
+__device__ __constant__ float MIN_TEMPERATURE = 50.0f;
 
 // 窗口尺寸
 int windowWidth = 1600;
@@ -446,22 +449,93 @@ void renderUI(){
     ImGui::Separator();
     ImGui::End();
 }
-
 #pragma endregion
 
 #pragma region 求解器设定
+// 临时。后续应当改用互操作
 void resizeBuffers(){
-
+    size_t size = params.nx * params.ny;
+    h_temperature.resize(size);
+    h_pressure.resize(size);
+    h_density.resize(size);
+    h_u.resize(size);
+    h_v.resize(size);
+    h_cellTypes.resize(size);
 }
 
-void initializeSimulation(){
+bool initializeSimulation(){
+    params.computeDerived();
+    resizeBuffers();
+    solver.initialize(params);
 
+    // Get initial cell types
+    solver.getCellTypes(h_cellTypes.data());
+    renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
+    return true;
 }
 #pragma endregion
 
 #pragma region 可视化函数
 void updateVisualization(){
+    float *fieldData = nullptr;
+    float minVal, maxVal;
 
+    switch (currentField)
+    {
+    case FieldType::TEMPERATURE:
+        solver.getTemperatureField(h_temperature.data());
+        fieldData = h_temperature.data();
+        minVal = params.T_min;
+        maxVal = params.T_max;
+        break;
+
+    case FieldType::PRESSURE:
+        solver.getPressureField(h_pressure.data());
+        fieldData = h_pressure.data();
+        minVal = params.p_inf * 0.5f;
+        maxVal = params.p_inf * 5.0f;
+        break;
+
+    case FieldType::DENSITY:
+        solver.getDensityField(h_density.data());
+        fieldData = h_density.data();
+        minVal = params.rho_inf * 0.5f;
+        maxVal = params.rho_inf * 5.0f;
+        break;
+
+    case FieldType::VELOCITY_MAG:
+    {
+        solver.getVelocityField(h_u.data(), h_v.data());
+        // 计算局部速率
+        for (int i = 0; i < params.nx * params.ny; i++)
+        {
+            h_temperature[i] = sqrtf(h_u[i] * h_u[i] + h_v[i] * h_v[i]);
+        }
+        fieldData = h_temperature.data();
+        minVal = 0.0f;
+        maxVal = params.u_inf * 1.5f;
+        break;
+    }
+
+    case FieldType::MACH:
+    {
+        solver.getVelocityField(h_u.data(), h_v.data());
+        solver.getTemperatureField(h_temperature.data());
+        // 计算局部马赫数
+        for (int i = 0; i < params.nx * params.ny; i++)
+        {
+            float speed = sqrtf(h_u[i] * h_u[i] + h_v[i] * h_v[i]);
+            float c = sqrtf(GAMMA * R_GAS * h_temperature[i]);
+            h_pressure[i] = speed / (c + 1e-10f);
+        }
+        fieldData = h_pressure.data();
+        minVal = 0.0f;
+        maxVal = params.mach * 1.5f;
+        break;
+    }
+    }
+
+    renderer.updateField(fieldData, params.nx, params.ny, minVal, maxVal, currentField);
 }
 #pragma endregion
 int main(int argc, char* argv[]){
@@ -477,6 +551,7 @@ int main(int argc, char* argv[]){
     // 初始化GLFW
     if(!glfwInit()){
         std::cerr << "[错误] 程序在初始化GLFW阶段失败并退出" << std::endl;
+        system("pause");
         return -1;
     }
 
@@ -488,6 +563,7 @@ int main(int argc, char* argv[]){
     GLFWwindow* window = glfwCreateWindow(windowWidth,windowHeight,"程序窗口",nullptr,nullptr);
     if(!window){
         std::cerr << "[错误] 程序在创建窗口阶段失败并退出";
+        system("pause");
         glfwTerminate();
         return -1;
     }
@@ -501,6 +577,7 @@ int main(int argc, char* argv[]){
     // 初始化GLAD
     if(!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)){
         std::cerr << "[错误] 程序在初始化GLAD阶段失败并退出";
+        system("pause");
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
@@ -522,14 +599,22 @@ int main(int argc, char* argv[]){
     // 初始化渲染器
     if (!renderer.initialize(windowWidth, windowHeight))
     {
-        std::cerr << "[错误] 程序在初始化Renderer阶段失败并退出";
+        std::cerr << "[错误] 程序在初始化Renderer阶段失败并退出\n";
+        system("pause");
         glfwDestroyWindow(window);
         glfwTerminate();
         return -1;
     }
 
     // 初始化仿真器
-    // initializeSimulation();
+    if (!initializeSimulation())
+    {
+        std::cerr << "[错误] 程序在初始化Solver阶段失败并退出\n";
+        system("pause");
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
 
     // 初始化时间和帧率
     auto lastTime = std::chrono::high_resolution_clock::now();
@@ -545,6 +630,18 @@ int main(int argc, char* argv[]){
         // 进行一步仿真
         if (!params.paused)
         {
+            auto simStart = std::chrono::high_resolution_clock::now();
+
+            for (int i = 0; i < stepsPerFrame; i++)
+            {
+                // 计算 CFL 限制
+                float dt = solver.computeStableTimeStep(params);
+                params.dt = dt;
+                solver.step(params);
+            }
+
+            auto simEnd = std::chrono::high_resolution_clock::now();
+            simTimePerStep = std::chrono::duration<float>(simEnd - simStart).count() / stepsPerFrame;
         }
 
         // 更新可视化数据（主机缓存）
@@ -580,6 +677,8 @@ int main(int argc, char* argv[]){
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+
+    renderer.cleanup();
 
     glfwDestroyWindow(window);
     glfwTerminate();
