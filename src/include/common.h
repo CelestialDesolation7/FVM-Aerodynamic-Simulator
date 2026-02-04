@@ -102,9 +102,9 @@ enum class ObstacleShape{
 // 单元格分类
 enum CellType : uint8_t
 {
-    CELL_FLUID = 0,     // 完全固体
-    CELL_SOLID = 1,     // 完全流体
+    CELL_FLUID = 0,     // 完全流体
+    CELL_SOLID = 1,     // 完全固体
     CELL_GHOST = 2,     // 固液交界
     CELL_INFLOW = 3,    // 左侧，入流面边界
-    CELL_OUTFLOW = 4    // 右侧，出溜面边界
+    CELL_OUTFLOW = 4    // 右侧，出流面边界
 };

@@ -23,10 +23,6 @@
 // clang-format on
 
 #pragma region 常量和全局变量
-__device__ __constant__ float MIN_DENSITY = 1e-4f;
-__device__ __constant__ float MIN_PRESSURE = 1e-2f;
-__device__ __constant__ float MAX_TEMPERATURE = 5000.0f;
-__device__ __constant__ float MIN_TEMPERATURE = 50.0f;
 
 // 窗口尺寸
 int windowWidth = 1600;
@@ -59,6 +55,7 @@ int currentColormap = 0;
 
 #pragma endregion
 
+
 #pragma region 窗口回调函数
 void framebufferSizeCallback(GLFWwindow *window, int width, int height)
 {
@@ -86,6 +83,7 @@ void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods
 }
 #pragma endregion
 
+
 #pragma region 工具函数
 void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
     ImFontConfig fontConfig;
@@ -104,6 +102,32 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
     }
 }
 #pragma endregion
+
+
+#pragma region 求解器设定
+// 临时。后续应当改用互操作
+void resizeBuffers(){
+    size_t size = params.nx * params.ny;
+    h_temperature.resize(size);
+    h_pressure.resize(size);
+    h_density.resize(size);
+    h_u.resize(size);
+    h_v.resize(size);
+    h_cellTypes.resize(size);
+}
+
+bool initializeSimulation(){
+    params.computeDerived();
+    resizeBuffers();
+    solver.initialize(params);
+
+    // Get initial cell types
+    solver.getCellTypes(h_cellTypes.data());
+    renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
+    return true;
+}
+#pragma endregion
+
 
 #pragma region 控制面板渲染
 void renderUI(){
@@ -191,7 +215,8 @@ void renderUI(){
                 params.nx = nx_ui;
                 params.ny = ny_ui;
                 params.computeDerived();
-                //initializeSimulation();
+                // 重新初始化仿真（重新分配显存和缓冲区）
+                initializeSimulation();
                 // 重置时间记录
                 params.t_current = 0.0f;
                 params.step = 0;
@@ -451,29 +476,6 @@ void renderUI(){
 }
 #pragma endregion
 
-#pragma region 求解器设定
-// 临时。后续应当改用互操作
-void resizeBuffers(){
-    size_t size = params.nx * params.ny;
-    h_temperature.resize(size);
-    h_pressure.resize(size);
-    h_density.resize(size);
-    h_u.resize(size);
-    h_v.resize(size);
-    h_cellTypes.resize(size);
-}
-
-bool initializeSimulation(){
-    params.computeDerived();
-    resizeBuffers();
-    solver.initialize(params);
-
-    // Get initial cell types
-    solver.getCellTypes(h_cellTypes.data());
-    renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
-    return true;
-}
-#pragma endregion
 
 #pragma region 可视化函数
 void updateVisualization(){
@@ -538,6 +540,8 @@ void updateVisualization(){
     renderer.updateField(fieldData, params.nx, params.ny, minVal, maxVal, currentField);
 }
 #pragma endregion
+
+
 int main(int argc, char* argv[]){
     // 设置控制台编码为 UTF-8，支持中文输出
     #ifdef _WIN32
