@@ -53,6 +53,14 @@ FieldType currentField = FieldType::TEMPERATURE;
 const char *colormapNames[] = {"Jet", "Hot", "Plasma", "Inferno", "Viridis"};
 int currentColormap = 0;
 
+// 颜色映射范围控制变量
+float p_min_ratio = 0.5f;
+float p_max_ratio = 5.0f;
+float rho_min_ratio = 0.5f;
+float rho_max_ratio = 5.0f;
+float v_max_ratio = 1.5f;
+float mach_max_ratio = 1.5f;
+
 #pragma endregion
 
 
@@ -388,13 +396,58 @@ void renderUI(){
             renderer.setColormap(static_cast<ColormapType>(currentColormap));
         }
 
-        ImGui::SliderFloat(u8"温度下限 (K)", &params.T_min, 100.0f, 500.0f);
-        ImGui::SliderFloat(u8"温度上限 (K)", &params.T_max, 300.0f, 2000.0f);
-
-        bool showGrid = renderer.getShowGrid();
-        if (ImGui::Checkbox(u8"显示网格", &showGrid))
+        // 根据当前显示的物理量动态调整范围控制
+        ImGui::Separator();
+        ImGui::Text(u8"颜色映射范围调整:");
+        
+        switch (currentField)
         {
-            renderer.setShowGrid(showGrid);
+        case FieldType::TEMPERATURE:
+            ImGui::SliderFloat(u8"温度下限 (K)", &params.T_min, 100.0f, 500.0f);
+            ImGui::SliderFloat(u8"温度上限 (K)", &params.T_max, 300.0f, 2000.0f);
+            break;
+        case FieldType::PRESSURE:
+            ImGui::SliderFloat(u8"压强下限 (倍数)", &p_min_ratio, 0.1f, 1.0f);
+            ImGui::SliderFloat(u8"压强上限 (倍数)", &p_max_ratio, 1.0f, 10.0f);
+            ImGui::Text(u8"实际范围: %.0f - %.0f Pa", params.p_inf * p_min_ratio, params.p_inf * p_max_ratio);
+            break;
+        case FieldType::DENSITY:
+            ImGui::SliderFloat(u8"密度下限 (倍数)", &rho_min_ratio, 0.1f, 1.0f);
+            ImGui::SliderFloat(u8"密度上限 (倍数)", &rho_max_ratio, 1.0f, 10.0f);
+            ImGui::Text(u8"实际范围: %.3f - %.3f kg/m³", params.rho_inf * rho_min_ratio, params.rho_inf * rho_max_ratio);
+            break;
+        case FieldType::VELOCITY_MAG:
+            ImGui::SliderFloat(u8"速度上限 (倍数)", &v_max_ratio, 0.5f, 3.0f);
+            ImGui::Text(u8"实际范围: 0 - %.1f m/s", params.u_inf * v_max_ratio);
+            break;
+        case FieldType::MACH:
+            ImGui::SliderFloat(u8"马赫数上限 (倍数)", &mach_max_ratio, 0.5f, 3.0f);
+            ImGui::Text(u8"实际范围: 0 - %.2f", params.mach * mach_max_ratio);
+            break;
+        }
+        ImGui::Separator();
+
+        // 速度矢量显示（仅在速度大小可视化模式下可用）
+        if (currentField == FieldType::VELOCITY_MAG) {
+            bool showVectors = renderer.getShowVectors();
+            if (ImGui::Checkbox(u8"显示速度矢量", &showVectors))
+            {
+                renderer.setShowVectors(showVectors);
+            }
+            
+            // 如果显示矢量开启，显示密度控制滑块
+            if (showVectors) {
+                int vectorDensity = renderer.getVectorDensity();
+                if (ImGui::SliderInt(u8"矢量箭头间隔", &vectorDensity, 5, 50, u8"%d 格"))
+                {
+                    renderer.setVectorDensity(vectorDensity);
+                }
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), u8"（值越小箭头越密集）");
+            }
+        } else {
+            // 非速度可视化模式时，自动关闭矢量显示
+            renderer.setShowVectors(false);
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), u8"（速度矢量仅在[速度大小]模式下可用）");
         }
 
         // Statistics
@@ -494,15 +547,15 @@ void updateVisualization(){
     case FieldType::PRESSURE:
         solver.getPressureField(h_pressure.data());
         fieldData = h_pressure.data();
-        minVal = params.p_inf * 0.5f;
-        maxVal = params.p_inf * 5.0f;
+        minVal = params.p_inf * p_min_ratio;
+        maxVal = params.p_inf * p_max_ratio;
         break;
 
     case FieldType::DENSITY:
         solver.getDensityField(h_density.data());
         fieldData = h_density.data();
-        minVal = params.rho_inf * 0.5f;
-        maxVal = params.rho_inf * 5.0f;
+        minVal = params.rho_inf * rho_min_ratio;
+        maxVal = params.rho_inf * rho_max_ratio;
         break;
 
     case FieldType::VELOCITY_MAG:
@@ -515,7 +568,10 @@ void updateVisualization(){
         }
         fieldData = h_temperature.data();
         minVal = 0.0f;
-        maxVal = params.u_inf * 1.5f;
+        maxVal = params.u_inf * v_max_ratio;
+        
+        // 更新速度场数据用于矢量可视化
+        renderer.updateVelocityField(h_u.data(), h_v.data(), params.nx, params.ny, params.u_inf);
         break;
     }
 
@@ -532,7 +588,7 @@ void updateVisualization(){
         }
         fieldData = h_pressure.data();
         minVal = 0.0f;
-        maxVal = params.mach * 1.5f;
+        maxVal = params.mach * mach_max_ratio;
         break;
     }
     }
@@ -564,7 +620,7 @@ int main(int argc, char* argv[]){
     glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
 
 
-    GLFWwindow* window = glfwCreateWindow(windowWidth,windowHeight,"程序窗口",nullptr,nullptr);
+    GLFWwindow* window = glfwCreateWindow(windowWidth,windowHeight,"FVM空气动力学模拟器",nullptr,nullptr);
     if(!window){
         std::cerr << "[错误] 程序在创建窗口阶段失败并退出";
         system("pause");

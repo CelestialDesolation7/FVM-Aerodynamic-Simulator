@@ -117,9 +117,16 @@ public:
     void setColormap(ColormapType cmap);
     ColormapType getColormap() const { return colormap_; }
     
-    // 设置和获取网格显示开关
-    void setShowGrid(bool show) { showGrid_ = show; }
-    bool getShowGrid() const { return showGrid_; }
+    // 设置和获取矢量显示开关
+    void setShowVectors(bool show) { showVectors_ = show; }
+    bool getShowVectors() const { return showVectors_; }
+    
+    // 设置矢量密度（每多少个格子显示一个箭头）
+    void setVectorDensity(int density) { vectorDensity_ = std::max(2, density); }
+    int getVectorDensity() const { return vectorDensity_; }
+    
+    // 更新速度场数据（用于矢量可视化）
+    void updateVelocityField(const float* u, const float* v, int nx, int ny, float u_inf);
     
     // 设置障碍物显示开关
     void setShowObstacle(bool show) { showObstacle_ = show; }
@@ -152,7 +159,7 @@ private:
     GLuint VAO_ = 0;
     GLuint VBO_ = 0;
     
-    // 网格线叠加层的着色器和缓冲区
+    // 网格线叠加层的着色器和缓冲区（现用于矢量箭头）
     GLuint gridShaderProgram_ = 0;
     GLuint gridVAO_ = 0;
     GLuint gridVBO_ = 0;
@@ -162,10 +169,21 @@ private:
     GLuint circleVAO_ = 0;
     GLuint circleVBO_ = 0;
     
+    // 矢量箭头叠加层的着色器和缓冲区
+    GLuint vectorShaderProgram_ = 0;
+    GLuint vectorVAO_ = 0;
+    GLuint vectorVBO_ = 0;
+    
     // 渲染设置
     ColormapType colormap_ = ColormapType::JET;  // 当前色图类型
-    bool showGrid_ = false;                       // 是否显示网格线
+    bool showVectors_ = false;                    // 是否显示速度矢量
+    int vectorDensity_ = 20;                      // 矢量箭头密度（每多少格子显示一个）
     bool showObstacle_ = true;                    // 是否显示障碍物轮廓
+    
+    // 速度场数据（用于矢量可视化）
+    std::vector<float> velocityU_;
+    std::vector<float> velocityV_;
+    float u_inf_ = 1.0f;  // 来流速度，用于归一化箭头长度
     
     // 当前物理场的值域范围
     float minVal_ = 0.0f;
@@ -177,8 +195,9 @@ private:
     
     // 着色器创建和编译的工具函数
     bool createShaders();           // 创建主渲染着色器
-    bool createGridShader();        // 创建网格线着色器
+    bool createGridShader();        // 创建网格线着色器（现用于矢量箭头）
     bool createCircleShader();      // 创建障碍物轮廓着色器
+    bool createVectorShader();      // 创建矢量箭头着色器
     GLuint compileShader(const char* source, GLenum type);  // 编译单个着色器
     GLuint linkProgram(GLuint vertShader, GLuint fragShader); // 链接着色器程序
     

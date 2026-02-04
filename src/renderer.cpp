@@ -42,18 +42,11 @@ uniform float maxVal;                 // 物理量最大值（用于归一化）
 
 void main() {
     float value = texture(fieldTexture, TexCoord).r;
-    float cellType = texture(cellTypeTexture, TexCoord).r * 255.0;
+    float cellType = texture(cellTypeTexture, TexCoord).r;
     
-    // 网格类型定义: CELL_SOLID = 1, CELL_GHOST = 2
-    // 固体网格: 显示为深灰色
-    if (cellType > 0.5 && cellType < 1.5) {
-        FragColor = vec4(0.15, 0.15, 0.15, 1.0);
-        return;
-    }
-    
-    // 虚拟网格（边界层）: 显示为稍亮的灰色
-    // 注释掉以下代码可以查看虚拟网格的物理量，用于调试
-    if (cellType > 1.5 && cellType < 2.5) {
+    // 网格类型定义: CELL_FLUID = 0, CELL_SOLID = 1, CELL_GHOST = 2
+    // 将固体网格（内部）和边界网格（Ghost Cell）都显示为深灰色
+    if (cellType > 0.5 && cellType < 2.5) {
         FragColor = vec4(0.3, 0.3, 0.3, 1.0);
         return;
     }
@@ -70,7 +63,7 @@ void main() {
 
 // -----------------------------------------------------------
 // 网格线叠加层的顶点着色器
-// 作用：绘制网格线条
+// 作用：绘制网格线条（现用于矢量箭头）
 // -----------------------------------------------------------
 const char* gridVertexShader = R"(
 #version 330 core
@@ -85,7 +78,7 @@ void main() {
 
 // -----------------------------------------------------------
 // 网格线叠加层的片元着色器
-// 作用：绘制半透明的网格线
+// 作用：绘制半透明的网格线（现用于矢量箭头）
 // -----------------------------------------------------------
 const char* gridFragmentShader = R"(
 #version 330 core
@@ -95,6 +88,35 @@ uniform vec4 gridColor;
 
 void main() {
     FragColor = gridColor;
+}
+)";
+
+// -----------------------------------------------------------
+// 矢量箭头的顶点着色器
+// -----------------------------------------------------------
+const char* vectorVertexShader = R"(
+#version 330 core
+layout (location = 0) in vec2 aPos;
+layout (location = 1) in vec3 aColor;
+
+out vec3 vertexColor;
+
+void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    vertexColor = aColor;
+}
+)";
+
+// -----------------------------------------------------------
+// 矢量箭头的片元着色器
+// -----------------------------------------------------------
+const char* vectorFragmentShader = R"(
+#version 330 core
+in vec3 vertexColor;
+out vec4 FragColor;
+
+void main() {
+    FragColor = vec4(vertexColor, 1.0);
 }
 )";
 
@@ -158,6 +180,12 @@ bool Renderer::initialize(int width, int height) {
         return false;
     }
     
+    // 创建矢量箭头着色器程序
+    if (!createVectorShader()) {
+        fprintf(stderr, "创建矢量箭头着色器失败\n");
+        return false;;
+    }
+    
     // 创建全屏四边形的 VAO 和 VBO
     float quadVertices[] = {
         // 位置          // 纹理坐标
@@ -213,6 +241,10 @@ bool Renderer::initialize(int width, int height) {
     glGenVertexArrays(1, &circleVAO_);
     glGenBuffers(1, &circleVBO_);
     
+    // 创建矢量箭头的 VAO/VBO
+    glGenVertexArrays(1, &vectorVAO_);
+    glGenBuffers(1, &vectorVBO_);
+    
     return true;
 }
 
@@ -229,6 +261,9 @@ void Renderer::cleanup() {
     if (circleShaderProgram_) glDeleteProgram(circleShaderProgram_);
     if (circleVAO_) glDeleteVertexArrays(1, &circleVAO_);
     if (circleVBO_) glDeleteBuffers(1, &circleVBO_);
+    if (vectorShaderProgram_) glDeleteProgram(vectorShaderProgram_);
+    if (vectorVAO_) glDeleteVertexArrays(1, &vectorVAO_);
+    if (vectorVBO_) glDeleteBuffers(1, &vectorVBO_);
 }
 #pragma endregion
 
@@ -273,6 +308,20 @@ bool Renderer::createCircleShader() {
     glDeleteShader(fragShader);
     
     return circleShaderProgram_ != 0;
+}
+
+bool Renderer::createVectorShader() {
+    GLuint vertShader = compileShader(vectorVertexShader, GL_VERTEX_SHADER);
+    GLuint fragShader = compileShader(vectorFragmentShader, GL_FRAGMENT_SHADER);
+    
+    if (!vertShader || !fragShader) return false;
+    
+    vectorShaderProgram_ = linkProgram(vertShader, fragShader);
+    
+    glDeleteShader(vertShader);
+    glDeleteShader(fragShader);
+    
+    return vectorShaderProgram_ != 0;
 }
 
 GLuint Renderer::compileShader(const char* source, GLenum type) {
@@ -500,6 +549,20 @@ void Renderer::updateCellTypes(const uint8_t* types, int nx, int ny) {
     glBindTexture(GL_TEXTURE_2D, cellTypeTexture_);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, nx, ny, 0, GL_RED, GL_FLOAT, typeData.data());
 }
+
+// 更新速度场数据（用于矢量可视化）
+void Renderer::updateVelocityField(const float* u, const float* v, int nx, int ny, float u_inf) {
+    if (nx <= 0 || ny <= 0) return;
+    
+    size_t size = static_cast<size_t>(nx) * ny;
+    velocityU_.resize(size);
+    velocityV_.resize(size);
+    
+    std::copy(u, u + size, velocityU_.begin());
+    std::copy(v, v + size, velocityV_.begin());
+    
+    u_inf_ = u_inf;
+}
 #pragma endregion
 
 #pragma region 渲染主循环
@@ -644,60 +707,105 @@ void Renderer::render(const SimParams& params) {
         glDrawArrays(GL_LINE_STRIP, 0, obstacleVerts.size() / 2);
     }
     
-    // 第三层：渲染网格线
-    if (showGrid_ && nx_ > 0 && ny_ > 0) {
-        glUseProgram(gridShaderProgram_);
+    // 第三层：渲染速度矢量箭头
+    if (showVectors_ && nx_ > 0 && ny_ > 0 && !velocityU_.empty() && !velocityV_.empty()) {
+        glUseProgram(vectorShaderProgram_);
         
-        // 创建投影矩阵（NDC 坐标系下为单位矩阵）
-        float projection[16] = {
-            1, 0, 0, 0,
-            0, 1, 0, 0,
-            0, 0, 1, 0,
-            0, 0, 0, 1
-        };
-        glUniformMatrix4fv(glGetUniformLocation(gridShaderProgram_, "projection"), 
-                          1, GL_FALSE, projection);
-        glUniform4f(glGetUniformLocation(gridShaderProgram_, "gridColor"), 
-                    0.3f, 0.3f, 0.3f, 0.5f); // 半透明灰色
+        // 生成矢量箭头顶点数据
+        // 格式: x, y, r, g, b (位置 + 颜色)
+        std::vector<float> vectorVerts;
         
-        // 生成网格线顶点
-        std::vector<float> gridVerts;
+        // 计算屏幕宽高比，用于调整箭头显示
+        float aspectRatio = (float)width_ / (float)height_;
+        float domainAspect = (float)nx_ / (float)ny_;
         
-        // 限制网格线数量以提高性能
-        int step = std::max(1, std::min(nx_, ny_) / 50);
+        // 箭头参数
+        const float arrowHeadAngle = 0.5f; // 箭头头部张角（弧度）
+        const float arrowHeadLength = 0.3f; // 箭头头部相对于箭身的长度比例
         
-        // 生成竖直网格线
-        for (int i = 0; i <= nx_; i += step) {
-            float x = (float)i / nx_ * 2.0f - 1.0f;
-            gridVerts.push_back(x);
-            gridVerts.push_back(-1.0f);
-            gridVerts.push_back(x);
-            gridVerts.push_back(1.0f);
+        // 根据密度设置计算步长
+        int step = vectorDensity_;
+        
+        // 计算单个格子在NDC中的尺寸
+        float cellWidth = 2.0f / nx_;
+        float cellHeight = 2.0f / ny_;
+        
+        // 箭头最大长度（相对于格子尺寸）
+        float maxArrowLength = std::min(cellWidth, cellHeight) * (step * 0.8f);
+        
+        // 遍历网格，在每隔step个格子处绘制一个箭头
+        for (int j = step / 2; j < ny_; j += step) {
+            for (int i = step / 2; i < nx_; i += step) {
+                int idx = j * nx_ + i;
+                
+                // 获取该点的速度分量
+                float u = velocityU_[idx];
+                float v = velocityV_[idx];
+                
+                // 计算速度大小
+                float speed = sqrtf(u * u + v * v);
+                if (speed < 1e-6f * u_inf_) continue; // 跳过速度接近零的点
+                
+                // 归一化速度
+                float normalizedSpeed = std::min(speed / (u_inf_ * 1.5f), 1.0f);
+                
+                // 计算箭头起点（NDC坐标）
+                float startX = (float)i / nx_ * 2.0f - 1.0f;
+                float startY = (float)j / ny_ * 2.0f - 1.0f;
+                
+                // 计算箭头方向和长度
+                float dirX = u / speed;
+                float dirY = v / speed;
+                float arrowLength = maxArrowLength * normalizedSpeed;
+                
+                // 箭头终点
+                float endX = startX + dirX * arrowLength;
+                float endY = startY + dirY * arrowLength;
+                
+                // 使用黑色箭头，更加醒目
+                float r = 0.0f, g = 0.0f, b = 0.0f;
+                
+                // 添加箭身线段
+                vectorVerts.insert(vectorVerts.end(), {startX, startY, r, g, b});
+                vectorVerts.insert(vectorVerts.end(), {endX, endY, r, g, b});
+                
+                // 计算箭头头部的两个点
+                float headLen = arrowLength * arrowHeadLength;
+                float cosA = cosf(arrowHeadAngle);
+                float sinA = sinf(arrowHeadAngle);
+                
+                // 旋转箭头方向得到头部两个边
+                float head1X = endX - headLen * (dirX * cosA - dirY * sinA);
+                float head1Y = endY - headLen * (dirX * sinA + dirY * cosA);
+                float head2X = endX - headLen * (dirX * cosA + dirY * sinA);
+                float head2Y = endY - headLen * (-dirX * sinA + dirY * cosA);
+                
+                // 添加箭头头部两条线段
+                vectorVerts.insert(vectorVerts.end(), {endX, endY, r, g, b});
+                vectorVerts.insert(vectorVerts.end(), {head1X, head1Y, r, g, b});
+                vectorVerts.insert(vectorVerts.end(), {endX, endY, r, g, b});
+                vectorVerts.insert(vectorVerts.end(), {head2X, head2Y, r, g, b});
+            }
         }
         
-        // 生成水平网格线
-        for (int j = 0; j <= ny_; j += step) {
-            float y = (float)j / ny_ * 2.0f - 1.0f;
-            gridVerts.push_back(-1.0f);
-            gridVerts.push_back(y);
-            gridVerts.push_back(1.0f);
-            gridVerts.push_back(y);
+        if (!vectorVerts.empty()) {
+            // 上传矢量箭头顶点数据
+            glBindVertexArray(vectorVAO_);
+            glBindBuffer(GL_ARRAY_BUFFER, vectorVBO_);
+            glBufferData(GL_ARRAY_BUFFER, vectorVerts.size() * sizeof(float), 
+                         vectorVerts.data(), GL_DYNAMIC_DRAW);
+            
+            // 位置属性
+            glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
+            glEnableVertexAttribArray(0);
+            // 颜色属性
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(2 * sizeof(float)));
+            glEnableVertexAttribArray(1);
+            
+            // 绘制箭头（使用较粗的线条）
+            glLineWidth(2.0f);
+            glDrawArrays(GL_LINES, 0, vectorVerts.size() / 5);
         }
-        
-        // 上传网格线顶点数据
-        glBindVertexArray(gridVAO_);
-        glBindBuffer(GL_ARRAY_BUFFER, gridVBO_);
-        glBufferData(GL_ARRAY_BUFFER, gridVerts.size() * sizeof(float), 
-                     gridVerts.data(), GL_DYNAMIC_DRAW);
-        
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
-        glEnableVertexAttribArray(0);
-        
-        // 启用混合以支持半透明
-        glEnable(GL_BLEND);
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glDrawArrays(GL_LINES, 0, gridVerts.size() / 2);
-        glDisable(GL_BLEND);
     }
     
     glBindVertexArray(0);
