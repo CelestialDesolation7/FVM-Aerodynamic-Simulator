@@ -32,7 +32,6 @@ struct SimParams{
     float mach = 3.0f;          // 来流马赫数
     float T_inf = 300.0f;       // 来流温度，单位 K
     float p_inf = 101325.0f;    // 来流静压，单位 Pa
-
     float rho_inf;     // 来流密度，单位 kg/m³
     float u_inf;       // 来流水平速度，单位 m/s
     float v_inf;         // 来流垂直速度，单位 m/s
@@ -91,10 +90,21 @@ struct PrimitiveVars{
     float T;   // 温度
 };
 
+// 提供五种障碍物
 enum class ObstacleShape{
     CIRCLE = 0,  // 圆形
     STAR = 1,    // 五角星
     DIAMOND = 2, // 菱形
     CAPSULE = 3, // 胶囊形（圆角矩形）
     TRIANGLE = 4 // 三角形
+};
+
+// 单元格分类
+enum CellType : uint8_t
+{
+    CELL_FLUID = 0,     // 完全固体
+    CELL_SOLID = 1,     // 完全流体
+    CELL_GHOST = 2,     // 固液交界
+    CELL_INFLOW = 3,    // 左侧，入流面边界
+    CELL_OUTFLOW = 4    // 右侧，出溜面边界
 };
