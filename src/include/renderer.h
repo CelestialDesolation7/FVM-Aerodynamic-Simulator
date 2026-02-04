@@ -142,7 +142,7 @@ public:
     int getWidth() const { return width_; }
     int getHeight() const { return height_; }
 
-    // ==================== CUDA-OpenGL 互操作接口 ====================
+    // CUDA-OpenGL 互操作接口
     
     // 初始化CUDA-OpenGL互操作（在OpenGL初始化之后调用）
     bool initCudaInterop(int nx, int ny);
@@ -227,11 +227,16 @@ private:
     // 主机端归一化数据缓冲区
     std::vector<float> normalizedData_;
     
-    // ==================== CUDA-OpenGL 互操作相关 ====================
+    // CUDA-OpenGL 互操作相关（双缓冲PBO）
     bool cudaInteropEnabled_ = false;           // 互操作是否启用
-    GLuint fieldPBO_ = 0;                       // Pixel Buffer Object for CUDA interop
-    cudaGraphicsResource* cudaPBOResource_ = nullptr;  // CUDA图形资源句柄（PBO）
-    size_t mappedSize_ = 0;                     // 映射的缓冲区大小
+    
+    // 双缓冲PBO：两个PBO交替使用
+    // - 一个用于CUDA写入（writeIndex_指向）
+    // - 另一个用于OpenGL读取（1-writeIndex_指向）
+    GLuint fieldPBO_[2] = {0, 0};               // 双缓冲Pixel Buffer Objects
+    cudaGraphicsResource* cudaPBOResource_[2] = {nullptr, nullptr};  // 对应的CUDA资源句柄
+    int writeIndex_ = 0;                        // 当前CUDA写入的PBO索引（0或1）
+    size_t mappedSize_ = 0;                     // 单个PBO的缓冲区大小
     
     // 着色器创建和编译的工具函数
     bool createShaders();           // 创建主渲染着色器

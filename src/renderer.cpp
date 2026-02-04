@@ -286,7 +286,7 @@ void Renderer::cleanup() {
 #pragma endregion
 
 #pragma region CUDA-OpenGL互操作
-// 初始化CUDA-OpenGL互操作（使用PBO方法）
+// 初始化CUDA-OpenGL互操作（使用双缓冲PBO方法）
 bool Renderer::initCudaInterop(int nx, int ny) {
     // 如果已经启用，先清理
     if (cudaInteropEnabled_) {
@@ -297,25 +297,34 @@ bool Renderer::initCudaInterop(int nx, int ny) {
     ny_ = ny;
     size_t bufferSize = nx * ny * sizeof(float);
     
-    // 创建PBO (Pixel Buffer Object)
-    glGenBuffers(1, &fieldPBO_);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, bufferSize, nullptr, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    // 创建两个PBO用于双缓冲
+    glGenBuffers(2, fieldPBO_);
     
-    // 注册PBO为CUDA图形资源
-    cudaError_t err = cudaGraphicsGLRegisterBuffer(
-        &cudaPBOResource_,
-        fieldPBO_,
-        cudaGraphicsMapFlagsWriteDiscard  // CUDA只写入
-    );
-    
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA互操作] 注册PBO失败: %s\n", cudaGetErrorString(err));
-        glDeleteBuffers(1, &fieldPBO_);
-        fieldPBO_ = 0;
-        cudaPBOResource_ = nullptr;
-        return false;
+    for (int i = 0; i < 2; i++) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_[i]);
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, bufferSize, nullptr, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        
+        // 注册PBO为CUDA图形资源
+        cudaError_t err = cudaGraphicsGLRegisterBuffer(
+            &cudaPBOResource_[i],
+            fieldPBO_[i],
+            cudaGraphicsMapFlagsWriteDiscard  // CUDA只写入
+        );
+        
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[CUDA互操作] 注册PBO[%d]失败: %s\n", i, cudaGetErrorString(err));
+            // 清理已创建的资源
+            for (int j = 0; j <= i; j++) {
+                if (cudaPBOResource_[j]) {
+                    cudaGraphicsUnregisterResource(cudaPBOResource_[j]);
+                    cudaPBOResource_[j] = nullptr;
+                }
+            }
+            glDeleteBuffers(2, fieldPBO_);
+            fieldPBO_[0] = fieldPBO_[1] = 0;
+            return false;
+        }
     }
     
     // 确保纹理有正确的尺寸
@@ -324,61 +333,72 @@ bool Renderer::initCudaInterop(int nx, int ny) {
     glBindTexture(GL_TEXTURE_2D, 0);
     
     mappedSize_ = bufferSize;
+    writeIndex_ = 0;
     cudaInteropEnabled_ = true;
-    std::cout << "[CUDA互操作] 初始化成功，网格尺寸: " << nx << " x " << ny 
-              << "，缓冲区大小: " << bufferSize / 1024.0f << " KB" << std::endl;
+    std::cout << "[CUDA互操作] 双缓冲PBO初始化成功" << std::endl;
+    std::cout << "  网格尺寸: " << nx << " x " << ny << std::endl;
+    std::cout << "  每个PBO大小: " << bufferSize / 1024.0f << " KB" << std::endl;
+    std::cout << "  总显存占用: " << (bufferSize * 2) / 1024.0f << " KB" << std::endl;
     return true;
 }
 
 // 清理CUDA互操作资源
 void Renderer::cleanupCudaInterop() {
-    if (cudaPBOResource_) {
-        cudaGraphicsUnregisterResource(cudaPBOResource_);
-        cudaPBOResource_ = nullptr;
+    for (int i = 0; i < 2; i++) {
+        if (cudaPBOResource_[i]) {
+            cudaGraphicsUnregisterResource(cudaPBOResource_[i]);
+            cudaPBOResource_[i] = nullptr;
+        }
     }
-    if (fieldPBO_) {
-        glDeleteBuffers(1, &fieldPBO_);
-        fieldPBO_ = 0;
+    if (fieldPBO_[0] || fieldPBO_[1]) {
+        glDeleteBuffers(2, fieldPBO_);
+        fieldPBO_[0] = fieldPBO_[1] = 0;
     }
     cudaInteropEnabled_ = false;
     mappedSize_ = 0;
+    writeIndex_ = 0;
 }
 
-// 映射PBO以供CUDA写入，返回设备指针
+// 映射当前写入PBO以供CUDA写入，返回设备指针
 float* Renderer::mapFieldTexture() {
-    if (!cudaInteropEnabled_ || !cudaPBOResource_) {
+    if (!cudaInteropEnabled_ || !cudaPBOResource_[writeIndex_]) {
         return nullptr;
     }
     
-    // 映射资源
-    cudaError_t err = cudaGraphicsMapResources(1, &cudaPBOResource_, 0);
+    // 映射当前写入PBO
+    cudaError_t err = cudaGraphicsMapResources(1, &cudaPBOResource_[writeIndex_], 0);
     if (err != cudaSuccess) {
-        fprintf(stderr, "[CUDA互操作] 映射PBO失败: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "[CUDA互操作] 映射PBO[%d]失败: %s\n", writeIndex_, cudaGetErrorString(err));
         return nullptr;
     }
     
     // 获取设备指针
     float* devPtr = nullptr;
     size_t size = 0;
-    err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&devPtr), &size, cudaPBOResource_);
+    err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void**>(&devPtr), &size, cudaPBOResource_[writeIndex_]);
     if (err != cudaSuccess) {
         fprintf(stderr, "[CUDA互操作] 获取设备指针失败: %s\n", cudaGetErrorString(err));
-        cudaGraphicsUnmapResources(1, &cudaPBOResource_, 0);
+        cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
         return nullptr;
     }
     
     return devPtr;
 }
 
-// 取消映射，并将PBO数据传输到纹理
+// 取消映射，交换缓冲区，并将读取PBO数据传输到纹理
 void Renderer::unmapFieldTexture() {
-    if (!cudaPBOResource_) return;
+    if (!cudaPBOResource_[writeIndex_]) return;
     
-    // 取消CUDA映射
-    cudaGraphicsUnmapResources(1, &cudaPBOResource_, 0);
+    // 取消当前写入PBO的CUDA映射
+    cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
     
-    // 将PBO数据传输到纹理
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_);
+    // 交换缓冲区索引：下一帧CUDA写入另一个PBO
+    int readIndex = writeIndex_;
+    writeIndex_ = 1 - writeIndex_;
+    
+    // 将刚写入完成的PBO（现在是读取PBO）的数据传输到纹理
+    // 这个传输在GPU内部进行，非常快
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_[readIndex]);
     glBindTexture(GL_TEXTURE_2D, fieldTexture_);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx_, ny_, GL_RED, GL_FLOAT, nullptr);
     glBindTexture(GL_TEXTURE_2D, 0);

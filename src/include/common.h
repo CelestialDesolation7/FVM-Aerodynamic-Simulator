@@ -1,6 +1,5 @@
 #pragma once
 
-// #include <cuda_gl_interop.h>  // 已移至renderer.cpp，避免CUDA编译器与GL头文件冲突
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
