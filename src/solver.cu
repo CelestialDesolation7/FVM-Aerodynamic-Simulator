@@ -303,7 +303,6 @@ __global__ void computeSDFKernel(float *sdf, uint8_t *cell_type,
         cell_type[idx] = CELL_OUTFLOW;
     }
 }
-
 #pragma endregion
 
 #pragma region 物理逻辑操作核函数
@@ -311,151 +310,166 @@ __global__ void computeSDFKernel(float *sdf, uint8_t *cell_type,
 #pragma endregion
 
 #pragma region 并行计算任务发射函数
-__global__ void testBlinkKernel(float *T, int nx, int ny, float time)
-{
-    // 计算当前线程对应的全局网格索引
-    int i = blockIdx.x * blockDim.x + threadIdx.x; // X 方向索引
-    int j = blockIdx.y * blockDim.y + threadIdx.y; // Y 方向索引
 
-    // 边界检查，防止越界
-    if (i < nx && j < ny)
-    {
-        int idx = j * nx + i; // 展平的一维索引
-
-        // 生成一个随空间(i,j)和时间(time)变化的波
-        // float val = 300.0f + 100.0f * sinf(time * 5.0f + i * 0.1f + j * 0.1f);
-        float val = 400.0f + 300.0f * sinf(time * 2.0f + i / 50.0f);
-
-        T[idx] = val; // 写入显存
-    }
-}
 #pragma endregion
 
 #pragma region 计算链顶层的求解器类内部方法实现
+
+// 功能:分配所有GPU显存
+// 说明:根据网格尺寸 _nx, _ny 分配守恒变量、通量、辅助变量等数组
 void CFDSolver::allocateMemory()
 {
     if (_nx <= 0 || _ny <= 0)
         return;
 
-    size_t num_cells = _nx * _ny;
-    size_t float_size = num_cells * sizeof(float);
-    size_t uint8_size = num_cells * sizeof(uint8_t);
+    size_t size = _nx * _ny * sizeof(float);
+    size_t size_byte = _nx * _ny * sizeof(uint8_t);
 
-    // 1. 分配内存给当前时间步守恒变量
-    CUDA_CHECK(cudaMalloc((void **)&d_rho_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_rho_u_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_rho_v_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_E_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_rho_e_, float_size));
+    // 1. 分配守恒变量(当前时间步)
+    CUDA_CHECK(cudaMalloc(&d_rho_, size));
+    CUDA_CHECK(cudaMalloc(&d_rho_u_, size));
+    CUDA_CHECK(cudaMalloc(&d_rho_v_, size));
+    CUDA_CHECK(cudaMalloc(&d_E_, size));
+    CUDA_CHECK(cudaMalloc(&d_rho_e_, size)); // 内能(双能量法)
 
-    // 2. 分配下一步守恒变量
-    CUDA_CHECK(cudaMalloc((void **)&d_rho_new_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_rho_u_new_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_rho_v_new_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_E_new_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_rho_e_new_, float_size));
+    // 2. 分配守恒变量(下一时间步，用于双缓冲)
+    CUDA_CHECK(cudaMalloc(&d_rho_new_, size));
+    CUDA_CHECK(cudaMalloc(&d_rho_u_new_, size));
+    CUDA_CHECK(cudaMalloc(&d_rho_v_new_, size));
+    CUDA_CHECK(cudaMalloc(&d_E_new_, size));
+    CUDA_CHECK(cudaMalloc(&d_rho_e_new_, size));
 
     // 3. 分配原始变量
-    CUDA_CHECK(cudaMalloc((void **)&d_u_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_v_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_p_, float_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_T_, float_size));
+    CUDA_CHECK(cudaMalloc(&d_u_, size));
+    CUDA_CHECK(cudaMalloc(&d_v_, size));
+    CUDA_CHECK(cudaMalloc(&d_p_, size));
+    CUDA_CHECK(cudaMalloc(&d_T_, size));
 
-    // 4. 分配辅助数据
-    CUDA_CHECK(cudaMalloc((void **)&d_cell_type_, uint8_size));
-    CUDA_CHECK(cudaMalloc((void **)&d_sdf_, float_size));
+    // 4. 分配网格类型和SDF
+    CUDA_CHECK(cudaMalloc(&d_cell_type_, size_byte));
+    CUDA_CHECK(cudaMalloc(&d_sdf_, size));
 
-    // 初始化显存为0，避免脏数据
-    CUDA_CHECK(cudaMemset(d_rho_, 0, float_size));
-    CUDA_CHECK(cudaMemset(d_T_, 0, float_size));
+    // 5. 分配通量数组
+    CUDA_CHECK(cudaMalloc(&d_flux_rho_x_, size));
+    CUDA_CHECK(cudaMalloc(&d_flux_rho_u_x_, size));
+    CUDA_CHECK(cudaMalloc(&d_flux_rho_v_x_, size));
+    CUDA_CHECK(cudaMalloc(&d_flux_E_x_, size));
+    CUDA_CHECK(cudaMalloc(&d_flux_rho_e_x_, size)); // 内能通量
+
+    CUDA_CHECK(cudaMalloc(&d_flux_rho_y_, size));
+    CUDA_CHECK(cudaMalloc(&d_flux_rho_u_y_, size));
+    CUDA_CHECK(cudaMalloc(&d_flux_rho_v_y_, size));
+    CUDA_CHECK(cudaMalloc(&d_flux_E_y_, size));
+    CUDA_CHECK(cudaMalloc(&d_flux_rho_e_y_, size));
+
+    // 6. 分配归约缓冲区
+    CUDA_CHECK(cudaMalloc(&d_reduction_buffer_, sizeof(float)));
+
+    // 7. 分配粘性相关数组(Navier-Stokes)
+    CUDA_CHECK(cudaMalloc(&d_mu_, size));     // 动力粘性系数
+    CUDA_CHECK(cudaMalloc(&d_k_, size));      // 热导率
+    CUDA_CHECK(cudaMalloc(&d_tau_xx_, size)); // 应力张量XX分量
+    CUDA_CHECK(cudaMalloc(&d_tau_yy_, size)); // 应力张量YY分量
+    CUDA_CHECK(cudaMalloc(&d_tau_xy_, size)); // 应力张量XY分量
+    CUDA_CHECK(cudaMalloc(&d_qx_, size));     // X方向热通量
+    CUDA_CHECK(cudaMalloc(&d_qy_, size));     // Y方向热通量
 }
 
+// 功能:释放所有GPU显存
 void CFDSolver::freeMemory()
 {
-    // 释放所有指针
+    // 释放守恒变量
     if (d_rho_)
-    {
-        CUDA_CHECK(cudaFree(d_rho_));
-        d_rho_ = nullptr;
-    }
+        cudaFree(d_rho_);
     if (d_rho_u_)
-    {
-        CUDA_CHECK(cudaFree(d_rho_u_));
-        d_rho_u_ = nullptr;
-    }
+        cudaFree(d_rho_u_);
     if (d_rho_v_)
-    {
-        CUDA_CHECK(cudaFree(d_rho_v_));
-        d_rho_v_ = nullptr;
-    }
+        cudaFree(d_rho_v_);
     if (d_E_)
-    {
-        CUDA_CHECK(cudaFree(d_E_));
-        d_E_ = nullptr;
-    }
+        cudaFree(d_E_);
     if (d_rho_e_)
-    {
-        CUDA_CHECK(cudaFree(d_rho_e_));
-        d_rho_e_ = nullptr;
-    }
+        cudaFree(d_rho_e_);
 
+    // 释放双缓冲区
     if (d_rho_new_)
-    {
-        CUDA_CHECK(cudaFree(d_rho_new_));
-        d_rho_new_ = nullptr;
-    }
+        cudaFree(d_rho_new_);
     if (d_rho_u_new_)
-    {
-        CUDA_CHECK(cudaFree(d_rho_u_new_));
-        d_rho_u_new_ = nullptr;
-    }
+        cudaFree(d_rho_u_new_);
     if (d_rho_v_new_)
-    {
-        CUDA_CHECK(cudaFree(d_rho_v_new_));
-        d_rho_v_new_ = nullptr;
-    }
+        cudaFree(d_rho_v_new_);
     if (d_E_new_)
-    {
-        CUDA_CHECK(cudaFree(d_E_new_));
-        d_E_new_ = nullptr;
-    }
+        cudaFree(d_E_new_);
     if (d_rho_e_new_)
-    {
-        CUDA_CHECK(cudaFree(d_rho_e_new_));
-        d_rho_e_new_ = nullptr;
-    }
+        cudaFree(d_rho_e_new_);
 
+    // 释放原始变量
     if (d_u_)
-    {
-        CUDA_CHECK(cudaFree(d_u_));
-        d_u_ = nullptr;
-    }
+        cudaFree(d_u_);
     if (d_v_)
-    {
-        CUDA_CHECK(cudaFree(d_v_));
-        d_v_ = nullptr;
-    }
+        cudaFree(d_v_);
     if (d_p_)
-    {
-        CUDA_CHECK(cudaFree(d_p_));
-        d_p_ = nullptr;
-    }
+        cudaFree(d_p_);
     if (d_T_)
-    {
-        CUDA_CHECK(cudaFree(d_T_));
-        d_T_ = nullptr;
-    }
+        cudaFree(d_T_);
 
+    // 释放辅助数据
     if (d_cell_type_)
-    {
-        CUDA_CHECK(cudaFree(d_cell_type_));
-        d_cell_type_ = nullptr;
-    }
+        cudaFree(d_cell_type_);
     if (d_sdf_)
-    {
-        CUDA_CHECK(cudaFree(d_sdf_));
-        d_sdf_ = nullptr;
-    }
+        cudaFree(d_sdf_);
+
+    // 释放通量数组
+    if (d_flux_rho_x_)
+        cudaFree(d_flux_rho_x_);
+    if (d_flux_rho_u_x_)
+        cudaFree(d_flux_rho_u_x_);
+    if (d_flux_rho_v_x_)
+        cudaFree(d_flux_rho_v_x_);
+    if (d_flux_E_x_)
+        cudaFree(d_flux_E_x_);
+    if (d_flux_rho_e_x_)
+        cudaFree(d_flux_rho_e_x_);
+
+    if (d_flux_rho_y_)
+        cudaFree(d_flux_rho_y_);
+    if (d_flux_rho_u_y_)
+        cudaFree(d_flux_rho_u_y_);
+    if (d_flux_rho_v_y_)
+        cudaFree(d_flux_rho_v_y_);
+    if (d_flux_E_y_)
+        cudaFree(d_flux_E_y_);
+    if (d_flux_rho_e_y_)
+        cudaFree(d_flux_rho_e_y_);
+
+    if (d_reduction_buffer_)
+        cudaFree(d_reduction_buffer_);
+
+    // 释放粘性相关数组
+    if (d_mu_)
+        cudaFree(d_mu_);
+    if (d_k_)
+        cudaFree(d_k_);
+    if (d_tau_xx_)
+        cudaFree(d_tau_xx_);
+    if (d_tau_yy_)
+        cudaFree(d_tau_yy_);
+    if (d_tau_xy_)
+        cudaFree(d_tau_xy_);
+    if (d_qx_)
+        cudaFree(d_qx_);
+    if (d_qy_)
+        cudaFree(d_qy_);
+
+    // 置空所有指针(防止重复释放)
+    d_rho_ = d_rho_u_ = d_rho_v_ = d_E_ = d_rho_e_ = nullptr;
+    d_rho_new_ = d_rho_u_new_ = d_rho_v_new_ = d_E_new_ = d_rho_e_new_ = nullptr;
+    d_u_ = d_v_ = d_p_ = d_T_ = nullptr;
+    d_cell_type_ = nullptr;
+    d_sdf_ = nullptr;
+    d_flux_rho_x_ = d_flux_rho_u_x_ = d_flux_rho_v_x_ = d_flux_E_x_ = d_flux_rho_e_x_ = nullptr;
+    d_flux_rho_y_ = d_flux_rho_u_y_ = d_flux_rho_v_y_ = d_flux_E_y_ = d_flux_rho_e_y_ = nullptr;
+    d_reduction_buffer_ = nullptr;
+    d_mu_ = d_k_ = d_tau_xx_ = d_tau_yy_ = d_tau_xy_ = d_qx_ = d_qy_ = nullptr;
 }
 
 void CFDSolver::updateCellTypes(const SimParams &params)
@@ -468,34 +482,43 @@ void computeSDF(const SimParams &params)
 #pragma endregion
 
 #pragma region 计算链顶层的求解器类公开接口实现
-CFDSolver::CFDSolver()
-{
-}
+// 功能:求解器构造函数
+// 说明:初始化为空状态，需要调用initialize()分配内存
+CFDSolver::CFDSolver() {}
 
+// 功能:求解器析构函数
+// 说明:自动释放所有显存
 CFDSolver::~CFDSolver()
 {
     freeMemory();
-    // 清理CUDA资源
 }
 
-// 初始化求解器，分配内存等
+// 功能:初始化求解器
+// 输入:仿真参数 params(包含网格尺寸、来流条件等)
+// 说明:设置网格尺寸，分配显存，调用reset初始化流场
 void CFDSolver::initialize(const SimParams &params)
 {
-    // 先清理旧内存，再设置尺寸，分配新内存
-    freeMemory();
     _nx = params.nx;
     _ny = params.ny;
-    allocateMemory();
+
+    freeMemory();     // 先释放旧内存
+    allocateMemory(); // 分配新内存
+
+    reset(params); // 初始化流场
 }
 
-// 修改网格分辨率后的重新初始化
+// 功能:调整网格分辨率
+// 输入:新的网格尺寸 nx, ny
+// 说明:如果尺寸改变，重新分配显存
 void CFDSolver::resize(int nx, int ny)
 {
-    if (_nx == nx && _ny == ny)
-        return;
-    freeMemory();
+    if (nx == _nx && ny == _ny)
+        return; // 尺寸未变，无需操作
+
     _nx = nx;
     _ny = ny;
+
+    freeMemory();
     allocateMemory();
 }
 
@@ -509,7 +532,7 @@ void CFDSolver::step(SimParams &params)
                   (_ny + blockSize.y - 1) / blockSize.y);
 
     // 启动 Kernel
-    testBlinkKernel<<<gridSize, blockSize>>>(d_T_, _nx, _ny, params.t_current);
+    // testBlinkKernel<<<gridSize, blockSize>>>(d_T_, _nx, _ny, params.t_current);
 
     // 检查 Kernel 启动是否出错（异步错误可能稍后才会捕获）
     CUDA_CHECK(cudaGetLastError());
@@ -594,4 +617,47 @@ size_t CFDSolver::getSimulationMemoryUsage()
 {
     return (size_t)_nx * _ny * MEM_PER_UNIT; // 假设有10个浮点数组用于存储模拟数据
 }
+#pragma endregion
+
+#pragma region 统计数据的接口
+
+// 功能:获取最大温度(使用CUB库的归约)
+float CFDSolver::getMaxTemperature()
+{
+    return launchComputeMaxTemperature(d_T_, _nx, _ny);
+}
+
+// 功能:获取最大马赫数
+float CFDSolver::getMaxMach()
+{
+    return launchComputeMaxMach(d_u_, d_v_, d_p_, d_rho_, _nx, _ny);
+}
+
+// 归约核函数实现(使用CUB库)
+float launchComputeMaxTemperature(const float *T, int nx, int ny)
+{
+    float *d_out;
+    cudaMalloc(&d_out, sizeof(float));
+
+    // 第一次调用确定临时存储大小
+    void *d_temp = nullptr;
+    size_t temp_bytes = 0;
+    cub::DeviceReduce::Max(d_temp, temp_bytes, T, d_out, nx * ny);
+
+    // 分配临时存储
+    cudaMalloc(&d_temp, temp_bytes);
+
+    // 第二次调用执行归约
+    cub::DeviceReduce::Max(d_temp, temp_bytes, T, d_out, nx * ny);
+
+    // 拷贝结果回主机
+    float result;
+    cudaMemcpy(&result, d_out, sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_temp);
+    cudaFree(d_out);
+
+    return result;
+}
+
 #pragma endregion
