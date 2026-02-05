@@ -7,21 +7,46 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
         CACHE STRING "Vcpkg toolchain file")
 endif()
 
+# =========================================================
+# 2. 指定 CUDA 版本（用于兼容性）
+# 如果需要兼容 CUDA 12.x 驱动，请安装 CUDA 12 Toolkit 并设置此路径
+# 可以通过命令行覆盖：cmake -B build -DCUDAToolkit_ROOT="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6"
+if(NOT DEFINED CUDAToolkit_ROOT)
+    # 优先使用 CUDA 12.x（更好的兼容性）
+    set(CUDA12_PATHS
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.8"
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.7"
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.6"
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.5"
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4"
+    )
+    foreach(CUDA_PATH ${CUDA12_PATHS})
+        if(EXISTS "${CUDA_PATH}")
+            set(CUDAToolkit_ROOT "${CUDA_PATH}" CACHE PATH "CUDA Toolkit Root")
+            set(CMAKE_CUDA_COMPILER "${CUDA_PATH}/bin/nvcc.exe" CACHE FILEPATH "CUDA Compiler")
+            message(STATUS "Using CUDA 12.x for better compatibility: ${CUDA_PATH}")
+            break()
+        endif()
+    endforeach()
+endif()
+
 project(FVM-Aerodynamic-Simulator LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
 
 # =========================================================
-# 75=RTX 20系, 80=A100/30系前沿, 86=RTX 30系, 89=RTX 40系, 120=RTX 50系
-# 最后的 "+PTX" 表示为了未来的新显卡包含虚拟架构代码(JIT编译)
-set(CMAKE_CUDA_ARCHITECTURES "75;86;89;120+PTX" CACHE STRING "CUDA Archs")
+# GPU 架构设置
+# 75=RTX 20系, 86=RTX 30系, 89=RTX 40系
+# 注意：120(RTX 50系) 需要 CUDA 13+，为了兼容 CUDA 12 这里不包含
+# "+PTX" 表示包含虚拟架构代码，支持未来显卡的JIT编译
+set(CMAKE_CUDA_ARCHITECTURES "75;86;89+PTX" CACHE STRING "CUDA Archs")
 
 # =========================================================
-# 动态链接 CUDA 运行时
-# 使用动态链接以匹配vcpkg库的运行时设置，避免LIBCMT冲突
-# 注意：用户需要在PATH中包含CUDA DLL路径
-set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+# 静态链接 CUDA 运行时（推荐用于分发）
+# 这样客户机不需要安装 CUDA，也不需要分发 cudart DLL
+# 只要客户的显卡驱动支持所需的 CUDA 版本即可
+set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
 
 # Find packages
 find_package(OpenGL REQUIRED)
@@ -74,10 +99,12 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
 )
 
-# 解决LIBCMT冲突警告（如果使用静态CUDA运行时）
+# 解决运行时库冲突警告
 if(MSVC)
+    # 静态 CUDA 运行时会引入 LIBCMT，需要忽略以避免与 vcpkg 的动态运行时冲突
     target_link_options(${PROJECT_NAME} PRIVATE 
-        /NODEFAULTLIB:LIBCMT  # 忽略静态运行时库
+        /NODEFAULTLIB:LIBCMT
+        /NODEFAULTLIB:LIBCMTD
     )
 endif()
 
@@ -90,35 +117,82 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     COMMENT "正在复制 assets 目录到输出目录..."
 )
 
+# =========================================================
+# 【关键修复】构建后自动复制所有依赖 DLL 到 exe 目录
+# 这确保直接运行 exe 时不会因缺少 DLL 而闪退
+if(WIN32)
+    # 1. 复制 CMake 追踪的运行时 DLL (vcpkg 的 GLFW, GLAD 等)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_RUNTIME_DLLS:${PROJECT_NAME}>
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>
+        COMMAND_EXPAND_LISTS
+        COMMENT "正在复制 vcpkg 依赖 DLL..."
+    )
+    
+    # 2. 复制 CUDA 运行时 DLL (cudart64_*.dll)
+    # CMAKE_CUDA_RUNTIME_LIBRARY=Shared 模式下必须分发这些 DLL
+    # 注意：CUDA 13+ 的 DLL 位于 bin/x64 子目录中
+    if(CUDAToolkit_FOUND)
+        get_filename_component(CUDA_BIN_DIR "${CUDAToolkit_BIN_DIR}" ABSOLUTE)
+        
+        # 搜索多个可能的路径 (CUDA 12 及之前在 bin/, CUDA 13+ 在 bin/x64/)
+        file(GLOB CUDA_RUNTIME_DLLS 
+            "${CUDA_BIN_DIR}/cudart64_*.dll"
+            "${CUDA_BIN_DIR}/x64/cudart64_*.dll"
+        )
+        
+        if(CUDA_RUNTIME_DLLS)
+            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CUDA_RUNTIME_DLLS}
+                $<TARGET_FILE_DIR:${PROJECT_NAME}>
+                COMMENT "正在复制 CUDA 运行时 DLL..."
+            )
+        else()
+            message(WARNING "未找到 CUDA 运行时 DLL，请手动复制 cudart64_*.dll 到输出目录")
+        endif()
+    endif()
+endif()
 
-# 定义一个 "安装" 目标，把 exe 和所有依赖的 DLL 放到一个文件夹里
+# =========================================================
+# 定义一个 "安装" 目标，用于创建完整的可分发包
 
 include(GNUInstallDirs)
+
+# 设置安装前缀（默认为 dist 目录）
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+    set(CMAKE_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/dist" CACHE PATH "安装路径" FORCE)
+endif()
 
 # 1. 安装可执行文件
 install(TARGETS ${PROJECT_NAME}
-    RUNTIME DESTINATION bin
-)
-
-# 2. 自动抓取并安装第三方 DLL (GLFW, GLAD)
-# Windows下，vcpkg 的动态库通常在 bin 目录下
-include(GNUInstallDirs)
-
-# 1. 安装 exe
-install(TARGETS ${PROJECT_NAME}
     EXPORT ${PROJECT_NAME}Targets
-    RUNTIME DESTINATION bin
+    RUNTIME DESTINATION .
 )
 
-# 2. 【关键】自动抓取所有依赖的 DLL (GLFW, GLAD 等)
-# 这里的 $<TARGET_RUNTIME_DLLS:...> 会在安装的那一刻，
-# 自动去查询目标依赖了哪些 DLL，并把它们复制过来。
+# 2. 自动抓取并安装第三方 DLL (GLFW, GLAD 等)
 if(WIN32)
     install(FILES $<TARGET_RUNTIME_DLLS:${PROJECT_NAME}>
-        DESTINATION bin
+        DESTINATION .
         COMPONENT dependency
     )
+    
+    # 3. 安装 CUDA 运行时 DLL (支持 CUDA 12 和 13+)
+    if(CUDAToolkit_FOUND)
+        get_filename_component(CUDA_BIN_DIR "${CUDAToolkit_BIN_DIR}" ABSOLUTE)
+        file(GLOB CUDA_RUNTIME_DLLS_INSTALL 
+            "${CUDA_BIN_DIR}/cudart64_*.dll"
+            "${CUDA_BIN_DIR}/x64/cudart64_*.dll"
+        )
+        if(CUDA_RUNTIME_DLLS_INSTALL)
+            install(FILES ${CUDA_RUNTIME_DLLS_INSTALL}
+                DESTINATION .
+                COMPONENT cuda_runtime
+            )
+        endif()
+    endif()
 endif()
 
-# 3. 安装可能存在的资源文件 (比如 shader 或 字体)
-install(DIRECTORY assets/ DESTINATION /assets)
+# 4. 安装资源文件 (字体等)
+install(DIRECTORY assets/ DESTINATION assets)

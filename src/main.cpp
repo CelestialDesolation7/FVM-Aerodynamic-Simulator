@@ -33,7 +33,7 @@ const std::string DEFAULT_FONT_PATH = "assets/fonts/msyh.ttc";
 // 性能监控
 float fps = 0.0f;
 float simTimePerStep = 0.0f; // 每步仿真耗时，单位秒
-int stepsPerFrame = 1; // 进行多少步仿真计算后再渲染一帧
+int stepsPerFrame = 1;       // 进行多少步仿真计算后再渲染一帧
 
 // 仿真参数和求解器
 SimParams params;
@@ -62,11 +62,10 @@ float v_max_ratio = 1.5f;
 float mach_max_ratio = 1.5f;
 
 // CUDA-OpenGL互操作控制
-bool enableCudaInterop = false;    // 是否启用互操作加速
-bool cudaInteropInitialized = false;  // 互操作是否已初始化
+bool enableCudaInterop = false;      // 是否启用互操作加速
+bool cudaInteropInitialized = false; // 互操作是否已初始化
 
 #pragma endregion
-
 
 #pragma region 窗口回调函数
 void framebufferSizeCallback(GLFWwindow *window, int width, int height)
@@ -95,18 +94,21 @@ void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods
 }
 #pragma endregion
 
-
 #pragma region 工具函数
-void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
+void setupImGuiFont(ImGuiIO &io, const std::string &fontPath, float fontSize)
+{
     ImFontConfig fontConfig;
-    fontConfig.OversampleH = 3; // 水平过采样
-    fontConfig.OversampleV = 1; // 垂直过采样
+    fontConfig.OversampleH = 3;   // 水平过采样
+    fontConfig.OversampleV = 1;   // 垂直过采样
     fontConfig.PixelSnapH = true; // 像素对齐
 
-    if(std::filesystem::exists(fontPath)){
-        io.Fonts->AddFontFromFileTTF(fontPath.c_str(), fontSize, &fontConfig, 
-        io.Fonts->GetGlyphRangesChineseFull());
-    } else {
+    if (std::filesystem::exists(fontPath))
+    {
+        io.Fonts->AddFontFromFileTTF(fontPath.c_str(), fontSize, &fontConfig,
+                                     io.Fonts->GetGlyphRangesChineseFull());
+    }
+    else
+    {
         std::cerr << "[警告] 字体文件未找到，请检查assets/fonts，使用默认字体。" << std::endl;
         std::cerr << "程序正在试图查找的字体路径：" << fontPath << std::endl;
         std::cerr << "当前工作目录：" << std::filesystem::current_path() << std::endl;
@@ -115,10 +117,10 @@ void setupImGuiFont(ImGuiIO& io, const std::string& fontPath, float fontSize){
 }
 #pragma endregion
 
-
 #pragma region 求解器设定
 // 临时。后续应当改用互操作
-void resizeBuffers(){
+void resizeBuffers()
+{
     size_t size = params.nx * params.ny;
     h_temperature.resize(size);
     h_pressure.resize(size);
@@ -128,7 +130,8 @@ void resizeBuffers(){
     h_cellTypes.resize(size);
 }
 
-bool initializeSimulation(){
+bool initializeSimulation()
+{
     params.computeDerived();
     resizeBuffers();
     solver.initialize(params);
@@ -140,17 +143,19 @@ bool initializeSimulation(){
 }
 #pragma endregion
 
-
 #pragma region 控制面板渲染
-void renderUI(){
-        ImGui::Begin(u8"有限体积法空气动力学模拟控制面板");
-        static float inputFontSize = DEFAULT_FONT_SIZE;
-        if(ImGui::SliderFloat(u8"字体大小", &inputFontSize, 20.0f, 32.0f)){
-            ImGuiIO& io = ImGui::GetIO();
-            io.FontGlobalScale = inputFontSize / DEFAULT_FONT_SIZE;
-        };
+void renderUI()
+{
+    ImGui::Begin(u8"有限体积法空气动力学模拟控制面板");
+    static float inputFontSize = DEFAULT_FONT_SIZE;
+    if (ImGui::SliderFloat(u8"字体大小", &inputFontSize, 20.0f, 32.0f))
+    {
+        ImGuiIO &io = ImGui::GetIO();
+        io.FontGlobalScale = inputFontSize / DEFAULT_FONT_SIZE;
+    };
 
-        if(ImGui::CollapsingHeader("性能监控")){
+    if (ImGui::CollapsingHeader("性能监控"))
+    {
         ImGui::Text(u8"帧率: %.1f FPS", fps);
         ImGui::Text(u8"单步耗时: %.3f 毫秒", simTimePerStep * 1000.0f);
         ImGui::Text(u8"仿真时间: %.6f 秒", params.t_current);
@@ -165,15 +170,14 @@ void renderUI(){
         float usedMem = (totalMem - freeMem) / (1024.0f * 1024.0f);
         float totalMemMB = totalMem / (1024.0f * 1024.0f);
         float memUsagePercent = (totalMem - freeMem) * 100.0f / totalMem;
-        
+
         ImGui::Text(u8"GPU 显存使用");
         ImGui::SameLine();
 
         // 用一个进度条显示
         // RGBA 绿色->黄色->红色
-        ImVec4 barColor = (memUsagePercent < 70.0f) ? ImVec4(0.0f, 1.0f, 0.0f, 1.0f) : 
-                          (memUsagePercent < 90.0f) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f) : 
-                                                     ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
+        ImVec4 barColor = (memUsagePercent < 70.0f) ? ImVec4(0.0f, 1.0f, 0.0f, 1.0f) : (memUsagePercent < 90.0f) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f)
+                                                                                                                 : ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
         char memInfoLabel[64];
         std::snprintf(memInfoLabel, sizeof(memInfoLabel), u8"GPU 显存使用: %.1f MB / %.1f MB (%.1f%%)", usedMem, totalMemMB, memUsagePercent);
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barColor);
@@ -182,174 +186,190 @@ void renderUI(){
 
         size_t simMemory = solver.getSimulationMemoryUsage();
         ImGui::Text(u8"仿真数据占用显存: %.1f MB", simMemory / (1024.0f * 1024.0f));
-        
+
         ImGui::Separator();
-        
+
         // CUDA-OpenGL 互操作开关
-        if (ImGui::Checkbox(u8"启用GPU零拷贝加速", &enableCudaInterop)) {
-            if (enableCudaInterop && !cudaInteropInitialized) {
+        if (ImGui::Checkbox(u8"启用GPU零拷贝加速", &enableCudaInterop))
+        {
+            if (enableCudaInterop && !cudaInteropInitialized)
+            {
                 // 尝试初始化互操作
-                if (renderer.initCudaInterop(params.nx, params.ny)) {
+                if (renderer.initCudaInterop(params.nx, params.ny))
+                {
                     cudaInteropInitialized = true;
                     std::cout << "[主程序] CUDA-OpenGL互操作已启用" << std::endl;
-                } else {
+                }
+                else
+                {
                     enableCudaInterop = false;
                     std::cerr << "[主程序] CUDA-OpenGL互操作初始化失败" << std::endl;
                 }
-            } else if (!enableCudaInterop && cudaInteropInitialized) {
+            }
+            else if (!enableCudaInterop && cudaInteropInitialized)
+            {
                 // 清理互操作资源
                 renderer.cleanupCudaInterop();
                 cudaInteropInitialized = false;
                 std::cout << "[主程序] CUDA-OpenGL互操作已禁用" << std::endl;
             }
         }
-        if (cudaInteropInitialized) {
+        if (cudaInteropInitialized)
+        {
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), u8"(已激活)");
         }
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"零拷贝: GPU直接写入显示纹理，跳过CPU中转");
-        }
-        
-        ImGui::Separator();
+    }
 
-        if(ImGui::CollapsingHeader(u8"仿真控制")){
-            if (ImGui::Button(params.paused ? u8"开始（space）" : u8"暂停（space）")){
-                params.paused = !params.paused;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button(u8"重置（R）")){
-                solver.reset(params);
-                params.t_current = 0.0f;
-                params.step = 0;
-            }
-            ImGui::SameLine();
-            if (ImGui::Button(u8"单步（N）") && params.paused){
-                if(params.paused){
-                    solver.step(params);
-                    params.t_current += params.dt;
-                    params.step += 1;
-                }
-            }
-        }
+    ImGui::Separator();
 
-        ImGui::Separator();
-
-        if(ImGui::CollapsingHeader(u8"网格设置")){
-            static int nx_ui = 1024;
-            static int ny_ui = 512;
-            
-            ImGui::SliderInt(u8"X轴网格分辨率", &nx_ui, 64, 4096);
-            ImGui::SliderInt(u8"Y轴网格分辨率", &ny_ui, 32, 4096);
-
-            // 如果调整了，先显示再决定要不要应用修改
-            ImGui::Text(u8"当前网格分辨率：%d x %d", params.nx, params.ny);
-            if (nx_ui != params.nx || ny_ui != params.ny){
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), u8" -> %d x %d", nx_ui, ny_ui);
-            }
-
-            if (ImGui::Button(u8"应用网格尺寸"))
-            {
-                params.nx = nx_ui;
-                params.ny = ny_ui;
-                params.computeDerived();
-                // 重新初始化仿真（重新分配显存和缓冲区）
-                initializeSimulation();
-                // 重置时间记录
-                params.t_current = 0.0f;
-                params.step = 0;
-                
-                // 如果互操作已启用，需要重新初始化互操作缓冲区
-                if (cudaInteropInitialized) {
-                    renderer.resizeCudaInterop(params.nx, params.ny);
-                }
-            }
-
-            ImGui::Text(u8"dx = %.4f m, dy = %.4f m", params.dx, params.dy);
-            ImGui::Text(u8"计算域: %.1f x %.1f m", params.domain_width, params.domain_height);
-            ImGui::Text(u8"总网格数: %d", params.nx * params.ny);
-        }
-
-        ImGui::Separator();
-
-        if (ImGui::CollapsingHeader(u8"来流条件", ImGuiTreeNodeFlags_DefaultOpen))
+    if (ImGui::CollapsingHeader(u8"仿真控制"))
+    {
+        if (ImGui::Button(params.paused ? u8"开始（space）" : u8"暂停（space）"))
         {
-            bool changed = false;
-
-            changed |= ImGui::SliderFloat(u8"马赫数", &params.mach, 0.01f, 10.0f);
-            changed |= ImGui::SliderFloat(u8"来流温度 (K)", &params.T_inf, 200.0f, 400.0f);
-            changed |= ImGui::SliderFloat(u8"来流压强 (Pa)", &params.p_inf, 10000.0f, 101325.0f);
-
-            if (changed)
+            params.paused = !params.paused;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(u8"重置（R）"))
+        {
+            solver.reset(params);
+            params.t_current = 0.0f;
+            params.step = 0;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(u8"单步（N）") && params.paused)
+        {
+            if (params.paused)
             {
-                params.computeDerived();
+                solver.step(params);
+                params.t_current += params.dt;
+                params.step += 1;
             }
+        }
+    }
 
-            ImGui::Text(u8"来流密度 = %.4f kg/m^3", params.rho_inf);
-            ImGui::Text(u8"来流速度 = %.1f m/s", params.u_inf);
-            ImGui::Text(u8"声速 = %.1f m/s", params.c_inf);
+    ImGui::Separator();
 
-            ImGui::SliderFloat(u8"CFL数", &params.cfl, 0.1f, 0.9f);
-            ImGui::Text(u8"时间步长 = %.2e s", params.dt);
+    if (ImGui::CollapsingHeader(u8"网格设置"))
+    {
+        static int nx_ui = 1024;
+        static int ny_ui = 512;
+
+        ImGui::SliderInt(u8"X轴网格分辨率", &nx_ui, 64, 4096);
+        ImGui::SliderInt(u8"Y轴网格分辨率", &ny_ui, 32, 4096);
+
+        // 如果调整了，先显示再决定要不要应用修改
+        ImGui::Text(u8"当前网格分辨率：%d x %d", params.nx, params.ny);
+        if (nx_ui != params.nx || ny_ui != params.ny)
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.0f, 1.0f), u8" -> %d x %d", nx_ui, ny_ui);
         }
 
-        ImGui::Separator();
-
-        if (ImGui::CollapsingHeader(u8"粘性设置 (Navier-Stokes)"))
+        if (ImGui::Button(u8"应用网格尺寸"))
         {
-            bool viscosityChanged = false;
+            params.nx = nx_ui;
+            params.ny = ny_ui;
+            params.computeDerived();
+            // 重新初始化仿真（重新分配显存和缓冲区）
+            initializeSimulation();
+            // 重置时间记录
+            params.t_current = 0.0f;
+            params.step = 0;
 
-            if (ImGui::Checkbox(u8"启用粘性模拟", &params.enable_viscosity))
+            // 如果互操作已启用，需要重新初始化互操作缓冲区
+            if (cudaInteropInitialized)
+            {
+                renderer.resizeCudaInterop(params.nx, params.ny);
+            }
+        }
+
+        ImGui::Text(u8"dx = %.4f m, dy = %.4f m", params.dx, params.dy);
+        ImGui::Text(u8"计算域: %.1f x %.1f m", params.domain_width, params.domain_height);
+        ImGui::Text(u8"总网格数: %d", params.nx * params.ny);
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader(u8"来流条件", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        bool changed = false;
+
+        changed |= ImGui::SliderFloat(u8"马赫数", &params.mach, 0.01f, 10.0f);
+        changed |= ImGui::SliderFloat(u8"来流温度 (K)", &params.T_inf, 200.0f, 400.0f);
+        changed |= ImGui::SliderFloat(u8"来流压强 (Pa)", &params.p_inf, 10000.0f, 101325.0f);
+
+        if (changed)
+        {
+            params.computeDerived();
+        }
+
+        ImGui::Text(u8"来流密度 = %.4f kg/m^3", params.rho_inf);
+        ImGui::Text(u8"来流速度 = %.1f m/s", params.u_inf);
+        ImGui::Text(u8"声速 = %.1f m/s", params.c_inf);
+
+        ImGui::SliderFloat(u8"CFL数", &params.cfl, 0.1f, 0.9f);
+        ImGui::Text(u8"时间步长 = %.2e s", params.dt);
+    }
+
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader(u8"粘性设置 (Navier-Stokes)"))
+    {
+        bool viscosityChanged = false;
+
+        if (ImGui::Checkbox(u8"启用粘性模拟", &params.enable_viscosity))
+        {
+            viscosityChanged = true;
+        }
+
+        if (params.enable_viscosity)
+        {
+            ImGui::SliderFloat(u8"扩散CFL数", &params.cfl_visc, 0.1f, 0.5f);
+
+            ImGui::Separator();
+
+            ImGui::Text(u8"壁面边界条件:");
+
+            if (ImGui::Checkbox(u8"绝热壁面", &params.adiabatic_wall))
             {
                 viscosityChanged = true;
             }
 
-            if (params.enable_viscosity)
+            if (!params.adiabatic_wall)
             {
-                ImGui::SliderFloat(u8"扩散CFL数", &params.cfl_visc, 0.1f, 0.5f);
-
-                ImGui::Separator();
-
-                ImGui::Text(u8"壁面边界条件:");
-
-                if (ImGui::Checkbox(u8"绝热壁面", &params.adiabatic_wall))
+                if (ImGui::SliderFloat(u8"壁面温度 (K)", &params.T_wall, 200.0f, 1000.0f))
                 {
                     viscosityChanged = true;
                 }
-
-                if (!params.adiabatic_wall)
-                {
-                    if (ImGui::SliderFloat(u8"壁面温度 (K)", &params.T_wall, 200.0f, 1000.0f))
-                    {
-                        viscosityChanged = true;
-                    }
-                }
-
-                ImGui::Separator();
-
-                // 计算来流粘性，用Sutherland公式，只代表刚飞进来的气体
-                float mu_inf = MU_REF * powf(params.T_inf / T_REF, 1.5f) *
-                            (T_REF + S_SUTHERLAND) / (params.T_inf + S_SUTHERLAND);
-                // 雷诺值，惯性力与粘性力之比
-                float Re = params.rho_inf * params.u_inf * (2.0f * params.obstacle_r) / mu_inf;
-                ImGui::Text(u8"雷诺数 Re ≈ %.0f", Re);
-                ImGui::Text(u8"来流粘性 μ = %.2e Pa·s", mu_inf);
-
-                ImGui::Separator();
-                ImGui::TextWrapped(u8"注意：启用粘性后，计算量增加约50%%。粘性CFL通常比对流CFL更严格。");
-            }
-            else
-            {
-                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), u8"注意：当前为无粘性欧拉方程求解");
             }
 
-            if (viscosityChanged)
-            {
-                solver.reset(params);
-            }
+            ImGui::Separator();
+
+            // 计算来流粘性，用Sutherland公式，只代表刚飞进来的气体
+            float mu_inf = MU_REF * powf(params.T_inf / T_REF, 1.5f) *
+                           (T_REF + S_SUTHERLAND) / (params.T_inf + S_SUTHERLAND);
+            // 雷诺值，惯性力与粘性力之比
+            float Re = params.rho_inf * params.u_inf * (2.0f * params.obstacle_r) / mu_inf;
+            ImGui::Text(u8"雷诺数 Re ≈ %.0f", Re);
+            ImGui::Text(u8"来流粘性 μ = %.2e Pa·s", mu_inf);
+
+            ImGui::Separator();
+            ImGui::TextWrapped(u8"注意：启用粘性后，计算量增加约50%%。粘性CFL通常比对流CFL更严格。");
+        }
+        else
+        {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), u8"注意：当前为无粘性欧拉方程求解");
         }
 
-        ImGui::Separator();
+        if (viscosityChanged)
+        {
+            solver.reset(params);
+        }
+    }
+
+    ImGui::Separator();
 
     // 障碍物设置
     if (ImGui::CollapsingHeader(u8"障碍物设置", ImGuiTreeNodeFlags_DefaultOpen))
@@ -434,7 +454,7 @@ void renderUI(){
         // 根据当前显示的物理量动态调整范围控制
         ImGui::Separator();
         ImGui::Text(u8"颜色映射范围调整:");
-        
+
         switch (currentField)
         {
         case FieldType::TEMPERATURE:
@@ -463,15 +483,17 @@ void renderUI(){
         ImGui::Separator();
 
         // 速度矢量显示（仅在速度大小可视化模式下可用）
-        if (currentField == FieldType::VELOCITY_MAG) {
+        if (currentField == FieldType::VELOCITY_MAG)
+        {
             bool showVectors = renderer.getShowVectors();
             if (ImGui::Checkbox(u8"显示速度矢量", &showVectors))
             {
                 renderer.setShowVectors(showVectors);
             }
-            
+
             // 如果显示矢量开启，显示密度控制滑块
-            if (showVectors) {
+            if (showVectors)
+            {
                 int vectorDensity = renderer.getVectorDensity();
                 if (ImGui::SliderInt(u8"矢量箭头间隔", &vectorDensity, 5, 50, u8"%d 格"))
                 {
@@ -479,7 +501,9 @@ void renderUI(){
                 }
                 ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), u8"（值越小箭头越密集）");
             }
-        } else {
+        }
+        else
+        {
             // 非速度可视化模式时，自动关闭矢量显示
             renderer.setShowVectors(false);
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), u8"（速度矢量仅在[速度大小]模式下可用）");
@@ -507,10 +531,10 @@ void renderUI(){
         {
             float t = (float)i / barWidth;
             float r, g, b;
-            
+
             // 使用解耦的颜色映射函数
             getColormapColor(static_cast<ColormapType>(currentColormap), t, r, g, b);
-            
+
             ImU32 color = IM_COL32(r * 255, g * 255, b * 255, 255);
             drawList->AddRectFilled(
                 ImVec2(pos.x + i, pos.y),
@@ -564,10 +588,10 @@ void renderUI(){
 }
 #pragma endregion
 
-
 #pragma region 可视化函数
 // 使用传统CPU拷贝方式更新可视化
-void updateVisualizationCPU(){
+void updateVisualizationCPU()
+{
     float *fieldData = nullptr;
     float minVal, maxVal;
 
@@ -605,7 +629,7 @@ void updateVisualizationCPU(){
         fieldData = h_temperature.data();
         minVal = 0.0f;
         maxVal = params.u_inf * v_max_ratio;
-        
+
         // 更新速度场数据用于矢量可视化
         renderer.updateVelocityField(h_u.data(), h_v.data(), params.nx, params.ny, params.u_inf);
         break;
@@ -633,9 +657,10 @@ void updateVisualizationCPU(){
 }
 
 // 使用CUDA-OpenGL互操作方式更新可视化（零拷贝）
-void updateVisualizationInterop(){
+void updateVisualizationInterop()
+{
     float minVal, maxVal;
-    
+
     // 计算值域范围
     switch (currentField)
     {
@@ -660,18 +685,19 @@ void updateVisualizationInterop(){
         maxVal = params.mach * mach_max_ratio;
         break;
     }
-    
+
     // 设置渲染器的场值范围
     renderer.setFieldRange(minVal, maxVal, currentField);
-    
+
     // 映射PBO获取设备指针
-    float* devPtr = renderer.mapFieldTexture();
-    if (!devPtr) {
+    float *devPtr = renderer.mapFieldTexture();
+    if (!devPtr)
+    {
         // 映射失败，回退到CPU方式
         updateVisualizationCPU();
         return;
     }
-    
+
     // 根据当前显示的物理量，直接在GPU上拷贝/计算数据到PBO
     switch (currentField)
     {
@@ -687,7 +713,8 @@ void updateVisualizationInterop(){
     case FieldType::VELOCITY_MAG:
         solver.copyVelocityMagnitudeToDevice(devPtr);
         // 速度矢量可视化仍需要CPU数据（箭头绘制在CPU端完成）
-        if (renderer.getShowVectors()) {
+        if (renderer.getShowVectors())
+        {
             solver.getVelocityField(h_u.data(), h_v.data());
             renderer.updateVelocityField(h_u.data(), h_v.data(), params.nx, params.ny, params.u_inf);
         }
@@ -696,46 +723,176 @@ void updateVisualizationInterop(){
         solver.copyMachToDevice(devPtr);
         break;
     }
-    
+
     // 取消映射，数据自动传输到纹理
     renderer.unmapFieldTexture();
 }
 
 // 统一的可视化更新函数
-void updateVisualization(){
-    if (enableCudaInterop && cudaInteropInitialized) {
+void updateVisualization()
+{
+    if (enableCudaInterop && cudaInteropInitialized)
+    {
         updateVisualizationInterop();
-    } else {
+    }
+    else
+    {
         updateVisualizationCPU();
     }
 }
 #pragma endregion
 
+#pragma region CUDA环境检测
+// 检查CUDA/GPU可用性，返回false表示不可用
+bool checkCudaAvailability()
+{
+    std::cout << "[信息] 正在检测 CUDA 环境..." << std::endl;
 
-int main(int argc, char* argv[]){
-    // 设置控制台编码为 UTF-8，支持中文输出
-    #ifdef _WIN32
-        SetConsoleOutputCP(CP_UTF8);
-        SetConsoleCP(CP_UTF8);
-    #endif
+    int deviceCount = 0;
+    cudaError_t error = cudaGetDeviceCount(&deviceCount);
+
+    if (error != cudaSuccess)
+    {
+        std::cerr << "========================================" << std::endl;
+        std::cerr << "[错误] CUDA 初始化失败！" << std::endl;
+        std::cerr << "错误代码: " << static_cast<int>(error) << std::endl;
+
+        const char *errorStr = cudaGetErrorString(error);
+        const char *errorName = cudaGetErrorName(error);
+
+        if (errorStr && strlen(errorStr) > 0)
+        {
+            std::cerr << "错误信息: " << errorStr << std::endl;
+        }
+        if (errorName && strlen(errorName) > 0)
+        {
+            std::cerr << "错误名称: " << errorName << std::endl;
+        }
+
+        std::cerr << std::endl;
+
+        // 根据错误代码给出具体建议
+        if (error == cudaErrorNoDevice)
+        {
+            std::cerr << "[诊断] 未检测到 NVIDIA GPU" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "本程序需要 NVIDIA 显卡才能运行。" << std::endl;
+            std::cerr << "如果您有 NVIDIA 显卡，请尝试：" << std::endl;
+            std::cerr << "  1. 更新 NVIDIA 显卡驱动" << std::endl;
+            std::cerr << "  2. 在 BIOS 中启用独立显卡" << std::endl;
+        }
+        else if (error == cudaErrorInsufficientDriver)
+        {
+            std::cerr << "[诊断] 显卡驱动版本过旧" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "请更新 NVIDIA 显卡驱动到最新版本：" << std::endl;
+            std::cerr << "  https://www.nvidia.cn/Download/index.aspx" << std::endl;
+        }
+        else if (error == cudaErrorInitializationError)
+        {
+            std::cerr << "[诊断] CUDA 驱动初始化失败" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "可能的原因：" << std::endl;
+            std::cerr << "  1. 显卡驱动损坏或不兼容" << std::endl;
+            std::cerr << "  2. 其他程序占用了 GPU" << std::endl;
+            std::cerr << "  3. 系统刚从休眠恢复" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "建议：重启电脑后再试" << std::endl;
+        }
+        else
+        {
+            std::cerr << "可能的原因：" << std::endl;
+            std::cerr << "  1. 您的电脑没有 NVIDIA 显卡" << std::endl;
+            std::cerr << "  2. NVIDIA 显卡驱动未安装或版本过旧" << std::endl;
+            std::cerr << "  3. CUDA 运行时库 (cudart64_*.dll) 缺失" << std::endl;
+            std::cerr << std::endl;
+            std::cerr << "解决方案：" << std::endl;
+            std::cerr << "  - 本程序需要 NVIDIA 显卡才能运行" << std::endl;
+            std::cerr << "  - 请更新显卡驱动: https://www.nvidia.cn/Download/index.aspx" << std::endl;
+        }
+
+        std::cerr << "========================================" << std::endl;
+        return false;
+    }
+
+    if (deviceCount == 0)
+    {
+        std::cerr << "========================================" << std::endl;
+        std::cerr << "[错误] 未检测到支持 CUDA 的 GPU！" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "本程序需要 NVIDIA 显卡进行 GPU 加速计算。" << std::endl;
+        std::cerr << "请确保您的电脑配备了 NVIDIA 独立显卡。" << std::endl;
+        std::cerr << "========================================" << std::endl;
+        return false;
+    }
+
+    // 获取并显示GPU信息
+    cudaDeviceProp prop;
+    error = cudaGetDeviceProperties(&prop, 0);
+    if (error != cudaSuccess)
+    {
+        std::cerr << "[警告] 无法获取 GPU 详细信息" << std::endl;
+    }
+    else
+    {
+        std::cout << "[信息] 检测到 GPU: " << prop.name << std::endl;
+        std::cout << "[信息] 计算能力: " << prop.major << "." << prop.minor << std::endl;
+        std::cout << "[信息] 显存大小: " << (prop.totalGlobalMem / 1024 / 1024) << " MB" << std::endl;
+
+        // 检查计算能力是否足够（至少需要 7.5，对应 RTX 20 系列）
+        int computeCapability = prop.major * 10 + prop.minor;
+        if (computeCapability < 75)
+        {
+            std::cerr << "========================================" << std::endl;
+            std::cerr << "[警告] GPU 计算能力较低 (" << prop.major << "." << prop.minor << ")" << std::endl;
+            std::cerr << "本程序针对 RTX 20 系列及更新显卡优化。" << std::endl;
+            std::cerr << "旧显卡可能无法运行或性能较差。" << std::endl;
+            std::cerr << "========================================" << std::endl;
+            // 不返回false，尝试继续运行
+        }
+    }
+
+    std::cout << "[信息] CUDA 环境检测通过" << std::endl;
+    return true;
+}
+
+#pragma endregion
+
+int main(int argc, char *argv[])
+{
+// 设置控制台编码为 UTF-8，支持中文输出
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
     //  设置工作目录为程序所在目录，方便加载资源文件
     std::filesystem::path exePath = std::filesystem::path(argv[0]).parent_path();
     std::filesystem::current_path(exePath);
 
+    // 【关键】首先检查CUDA/GPU可用性
+    if (!checkCudaAvailability())
+    {
+        std::cerr << std::endl;
+        std::cerr << "按任意键退出..." << std::endl;
+        system("pause");
+        return -1;
+    }
+
     // 初始化GLFW
-    if(!glfwInit()){
+    if (!glfwInit())
+    {
         std::cerr << "[错误] 程序在初始化GLFW阶段失败并退出" << std::endl;
         system("pause");
         return -1;
     }
 
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR,4);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR,3);
-    glfwWindowHint(GLFW_OPENGL_PROFILE,GLFW_OPENGL_CORE_PROFILE);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-
-    GLFWwindow* window = glfwCreateWindow(windowWidth,windowHeight,"FVM空气动力学模拟器",nullptr,nullptr);
-    if(!window){
+    GLFWwindow *window = glfwCreateWindow(windowWidth, windowHeight, "FVM空气动力学模拟器", nullptr, nullptr);
+    if (!window)
+    {
         std::cerr << "[错误] 程序在创建窗口阶段失败并退出";
         system("pause");
         glfwTerminate();
@@ -749,7 +906,8 @@ int main(int argc, char* argv[]){
     glfwSetKeyCallback(window, keyCallback);
 
     // 初始化GLAD
-    if(!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)){
+    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
+    {
         std::cerr << "[错误] 程序在初始化GLAD阶段失败并退出";
         system("pause");
         glfwDestroyWindow(window);
@@ -760,15 +918,14 @@ int main(int argc, char* argv[]){
     // 初始化ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); 
-    (void)io;   //用于避免未使用警告
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // 启用键盘控制
-    ImGui::StyleColorsDark();                                 // 设置深色主题
-    ImGui_ImplGlfw_InitForOpenGL(window,true);                // ImGui接管GLFW输入
-    ImGui_ImplOpenGL3_Init("#version 430 core");    // 指定GLSL版本，编写Shader时会用到
+    ImGuiIO &io = ImGui::GetIO();
+    (void)io;                                             // 用于避免未使用警告
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard; // 启用键盘控制
+    ImGui::StyleColorsDark();                             // 设置深色主题
+    ImGui_ImplGlfw_InitForOpenGL(window, true);           // ImGui接管GLFW输入
+    ImGui_ImplOpenGL3_Init("#version 430 core");          // 指定GLSL版本，编写Shader时会用到
     // 设置中文字体
     setupImGuiFont(io, DEFAULT_FONT_PATH, DEFAULT_FONT_SIZE);
-
 
     // 初始化渲染器
     if (!renderer.initialize(windowWidth, windowHeight))
@@ -795,12 +952,11 @@ int main(int argc, char* argv[]){
     int frameCount = 0;
 
     // 主渲染循环
-    while(!glfwWindowShouldClose(window)){
+    while (!glfwWindowShouldClose(window))
+    {
         auto frameStart = std::chrono::high_resolution_clock::now();
         glfwPollEvents();
 
-       
-   
         // 进行一步仿真
         if (!params.paused)
         {
