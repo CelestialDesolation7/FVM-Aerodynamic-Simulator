@@ -35,23 +35,19 @@ public:
     // 按照当前参数重置求解器状态
     void reset(const SimParams &params);
 
-    // 获取可视化数据（暂时不使用OpenGL-cuda互操作）
-    // 注意这里指针都是主机缓冲区数组
-    // 上线前一定要记得改成OpenGL-cuda互操作以提升性能
+    // CPU数据传输路径（非零拷贝模式）
     void getTemperatureField(float *host_T);
     void getPressureField(float *host_p);
     void getVelocityField(float *host_u, float *host_v);
     void getDensityField(float *host_rho);
     void getCellTypes(uint8_t *host_types);
 
-    // CUDA-OpenGL 互操作接口
-    // 直接将物理场数据写入到设备指针（用于互操作模式）
-    // 这些函数将数据从求解器内部设备数组拷贝到外部设备指针（GPU到GPU拷贝）
-    void copyTemperatureToDevice(float *dev_dst);
-    void copyPressureToDevice(float *dev_dst);
-    void copyDensityToDevice(float *dev_dst);
-    void copyVelocityMagnitudeToDevice(float *dev_dst);
-    void copyMachToDevice(float *dev_dst);
+    // GPU零拷贝路径（CUDA-OpenGL互操作）
+    void computeTemperatureToDevice(float *dev_dst);
+    void computePressureToDevice(float *dev_dst);
+    void computeDensityToDevice(float *dev_dst);
+    void computeVelocityMagToDevice(float *dev_dst);
+    void computeMachToDevice(float *dev_dst);
 
     // 获取网格尺寸
     int getNx() const { return _nx; }

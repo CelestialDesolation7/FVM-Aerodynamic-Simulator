@@ -2732,7 +2732,7 @@ void CFDSolver::step(SimParams &params)
 }
 #pragma endregion
 
-#pragma region 获得数据的接口
+#pragma region 非零拷贝模式下的数据获取接口
 // 功能:获取最大温度(使用CUB库的归约)
 float CFDSolver::getMaxTemperature()
 {
@@ -2747,12 +2747,12 @@ float CFDSolver::getMaxMach()
 
 // 功能:获取温度场(从GPU拷贝到CPU)
 // 输出:主机端温度数组 host_T
+// CPU路径：获取温度场（GPU->CPU拷贝）
+// 注意：此函数仅在非零拷贝模式下使用
+// 假设step()已经计算了最新的原始变量，因此不需要重复计算
 void CFDSolver::getTemperatureField(float *host_T)
 {
-    // 先计算原始变量
-    launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
-                                  d_u_, d_v_, d_p_, d_T_, _nx, _ny);
-    // 拷贝到主机
+    // 直接拷贝到主机（原始变量已在step()中计算）
     CUDA_CHECK(cudaMemcpy(host_T, d_T_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
@@ -2780,6 +2780,10 @@ void CFDSolver::getCellTypes(uint8_t *host_types)
 {
     CUDA_CHECK(cudaMemcpy(host_types, d_cell_type_, _nx * _ny * sizeof(uint8_t), cudaMemcpyDeviceToHost));
 }
+
+#pragma endregion
+
+#pragma region 内存占用统计
 
 // 静态函数:获取GPU内存信息
 void CFDSolver::getGPUMemoryInfo(size_t &freeMem, size_t &totalMem)
@@ -2824,11 +2828,11 @@ size_t CFDSolver::getSimulationMemoryUsage()
 #pragma endregion
 
 #pragma region cuda-OpenGL互操作
-// CUDA-OpenGL 互操作实现
+// CUDA-OpenGL 互操作实现 - 零拷贝核函数
 
-// 计算速度幅值的CUDA核函数
-__global__ void computeVelocityMagnitudeKernel(
-    const float *u, const float *v, float *vmag, int nx, int ny)
+// 从保守变量直接计算温度到目标指针（避免中间拷贝）
+__global__ void computeTemperatureDirectKernel(
+    const float *rho, const float *rho_e, float *T_out, int nx, int ny)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -2837,14 +2841,18 @@ __global__ void computeVelocityMagnitudeKernel(
         return;
 
     int idx = j * nx + i;
-    float uu = u[idx];
-    float vv = v[idx];
-    vmag[idx] = sqrtf(uu * uu + vv * vv);
+    float rho_val = rho[idx];
+    float rho_e_val = rho_e[idx];
+
+    // 理想气体状态方程: p = (gamma - 1) * rho * e
+    // T = p / (rho * R) = (gamma - 1) * e / R
+    float e = rho_e_val / (rho_val + 1e-10f);
+    T_out[idx] = (GAMMA - 1.0f) * e / R_GAS;
 }
 
-// 计算马赫数的CUDA核函数
-__global__ void computeMachKernel(
-    const float *u, const float *v, const float *T, float *mach, int nx, int ny)
+// 从保守变量直接计算压强到目标指针
+__global__ void computePressureDirectKernel(
+    const float *rho, const float *rho_e, float *p_out, int nx, int ny)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -2853,51 +2861,96 @@ __global__ void computeMachKernel(
         return;
 
     int idx = j * nx + i;
-    float uu = u[idx];
-    float vv = v[idx];
-    float speed = sqrtf(uu * uu + vv * vv);
-    float c = sqrtf(GAMMA * R_GAS * T[idx]);
-    mach[idx] = speed / (c + 1e-10f);
+    float rho_val = rho[idx];
+    float rho_e_val = rho_e[idx];
+
+    // p = (gamma - 1) * rho * e = (gamma - 1) * rho_e
+    p_out[idx] = (GAMMA - 1.0f) * rho_e_val;
 }
 
-// 直接将温度场拷贝到设备指针（GPU到GPU拷贝）
-void CFDSolver::copyTemperatureToDevice(float *dev_dst)
+// 从保守变量直接计算速度大小和马赫数到目标指针
+__global__ void computeVelocityMagDirectKernel(
+    const float *rho, const float *rho_u, const float *rho_v,
+    float *vmag_out, int nx, int ny)
 {
-    // GPU到GPU拷贝
-    CUDA_CHECK(cudaMemcpy(dev_dst, d_T_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToDevice));
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= nx || j >= ny)
+        return;
+
+    int idx = j * nx + i;
+    float rho_val = rho[idx] + 1e-10f;
+    float u = rho_u[idx] / rho_val;
+    float v = rho_v[idx] / rho_val;
+
+    vmag_out[idx] = sqrtf(u * u + v * v);
 }
 
-// 直接将压强场拷贝到设备指针
-void CFDSolver::copyPressureToDevice(float *dev_dst)
+// 从保守变量直接计算马赫数到目标指针
+__global__ void computeMachDirectKernel(
+    const float *rho, const float *rho_u, const float *rho_v,
+    const float *rho_e, float *mach_out, int nx, int ny)
 {
-    CUDA_CHECK(cudaMemcpy(dev_dst, d_p_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToDevice));
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= nx || j >= ny)
+        return;
+
+    int idx = j * nx + i;
+    float rho_val = rho[idx] + 1e-10f;
+    float u = rho_u[idx] / rho_val;
+    float v = rho_v[idx] / rho_val;
+    float speed = sqrtf(u * u + v * v);
+
+    // 计算温度和声速
+    float e = rho_e[idx] / rho_val;
+    float T = (GAMMA - 1.0f) * e / R_GAS;
+    float c = sqrtf(GAMMA * R_GAS * T);
+
+    mach_out[idx] = speed / (c + 1e-10f);
 }
 
-// 直接将密度场拷贝到设备指针
-void CFDSolver::copyDensityToDevice(float *dev_dst)
+// 直接计算温度到目标指针
+void CFDSolver::computeTemperatureToDevice(float *dev_dst)
+{
+    dim3 block(16, 16);
+    dim3 grid((_nx + block.x - 1) / block.x, (_ny + block.y - 1) / block.y);
+    computeTemperatureDirectKernel<<<grid, block>>>(d_rho_, d_rho_e_, dev_dst, _nx, _ny);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// 直接计算压强到目标指针
+void CFDSolver::computePressureToDevice(float *dev_dst)
+{
+    dim3 block(16, 16);
+    dim3 grid((_nx + block.x - 1) / block.x, (_ny + block.y - 1) / block.y);
+    computePressureDirectKernel<<<grid, block>>>(d_rho_, d_rho_e_, dev_dst, _nx, _ny);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// 直接计算密度到目标指针
+void CFDSolver::computeDensityToDevice(float *dev_dst)
 {
     CUDA_CHECK(cudaMemcpy(dev_dst, d_rho_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToDevice));
 }
 
-// 直接计算并拷贝速度幅值到设备指针
-void CFDSolver::copyVelocityMagnitudeToDevice(float *dev_dst)
+// 直接计算速度大小到目标指针
+void CFDSolver::computeVelocityMagToDevice(float *dev_dst)
 {
     dim3 block(16, 16);
     dim3 grid((_nx + block.x - 1) / block.x, (_ny + block.y - 1) / block.y);
-
-    // 直接计算到目标缓冲区
-    computeVelocityMagnitudeKernel<<<grid, block>>>(d_u_, d_v_, dev_dst, _nx, _ny);
+    computeVelocityMagDirectKernel<<<grid, block>>>(d_rho_, d_rho_u_, d_rho_v_, dev_dst, _nx, _ny);
     CUDA_CHECK(cudaGetLastError());
 }
 
-// 直接计算并拷贝马赫数到设备指针
-void CFDSolver::copyMachToDevice(float *dev_dst)
+// 直接计算马赫数到目标指针
+void CFDSolver::computeMachToDevice(float *dev_dst)
 {
     dim3 block(16, 16);
     dim3 grid((_nx + block.x - 1) / block.x, (_ny + block.y - 1) / block.y);
-
-    // 直接计算到目标缓冲区
-    computeMachKernel<<<grid, block>>>(d_u_, d_v_, d_T_, dev_dst, _nx, _ny);
+    computeMachDirectKernel<<<grid, block>>>(d_rho_, d_rho_u_, d_rho_v_, d_rho_e_, dev_dst, _nx, _ny);
     CUDA_CHECK(cudaGetLastError());
 }
 #pragma endregion

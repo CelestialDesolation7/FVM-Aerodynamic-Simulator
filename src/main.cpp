@@ -53,13 +53,25 @@ FieldType currentField = FieldType::TEMPERATURE;
 const char *colormapNames[] = {"Jet", "Hot", "Plasma", "Inferno", "Viridis"};
 int currentColormap = 0;
 
-// 颜色映射范围控制变量
-float p_min_ratio = 0.5f;
-float p_max_ratio = 5.0f;
-float rho_min_ratio = 0.5f;
-float rho_max_ratio = 5.0f;
-float v_max_ratio = 1.5f;
-float mach_max_ratio = 1.5f;
+// 颜色映射范围控制变量（绝对值）
+float temperature_min = 200.0f; // 温度下限 (K)
+float temperature_max = 400.0f; // 温度上限 (K)
+float pressure_min = 50000.0f;  // 压强下限 (Pa)
+float pressure_max = 200000.0f; // 压强上限 (Pa)
+float density_min = 0.5f;       // 密度下限 (kg/m³)
+float density_max = 2.0f;       // 密度上限 (kg/m³)
+float velocity_max = 500.0f;    // 速度上限 (m/s)
+float mach_max = 2.0f;          // 马赫数上限
+
+// UI滑块范围限制常量
+constexpr float TEMPERATURE_MIN_LIMIT = 100.0f;
+constexpr float TEMPERATURE_MAX_LIMIT = 5000.0f;
+constexpr float PRESSURE_MIN_LIMIT = 1000.0f;
+constexpr float PRESSURE_MAX_LIMIT = 500000.0f;
+constexpr float DENSITY_MIN_LIMIT = 0.01f;
+constexpr float DENSITY_MAX_LIMIT = 10.0f;
+constexpr float VELOCITY_MAX_LIMIT = 2000.0f;
+constexpr float MACH_MAX_LIMIT = 10.0f;
 
 // CUDA-OpenGL互操作控制
 bool enableCudaInterop = false;      // 是否启用互操作加速
@@ -219,7 +231,7 @@ void renderUI()
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), u8"(已激活)");
         }
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"零拷贝: GPU直接写入显示纹理，跳过CPU中转");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"零拷贝: GPU直接写入显示纹理，跳过所有中间传输");
     }
 
     ImGui::Separator();
@@ -458,26 +470,34 @@ void renderUI()
         switch (currentField)
         {
         case FieldType::TEMPERATURE:
-            ImGui::SliderFloat(u8"温度下限 (K)", &params.T_min, 100.0f, 500.0f);
-            ImGui::SliderFloat(u8"温度上限 (K)", &params.T_max, 300.0f, 2000.0f);
+            ImGui::SliderFloat(u8"温度下限 (K)", &temperature_min, TEMPERATURE_MIN_LIMIT, TEMPERATURE_MAX_LIMIT);
+            ImGui::SliderFloat(u8"温度上限 (K)", &temperature_max, TEMPERATURE_MIN_LIMIT, TEMPERATURE_MAX_LIMIT);
+            if (temperature_min > temperature_max)
+                temperature_min = temperature_max;
             break;
         case FieldType::PRESSURE:
-            ImGui::SliderFloat(u8"压强下限 (倍数)", &p_min_ratio, 0.1f, 1.0f);
-            ImGui::SliderFloat(u8"压强上限 (倍数)", &p_max_ratio, 1.0f, 10.0f);
-            ImGui::Text(u8"实际范围: %.0f - %.0f Pa", params.p_inf * p_min_ratio, params.p_inf * p_max_ratio);
+            ImGui::SliderFloat(u8"压强下限 (Pa)", &pressure_min, PRESSURE_MIN_LIMIT, PRESSURE_MAX_LIMIT);
+            ImGui::SliderFloat(u8"压强上限 (Pa)", &pressure_max, PRESSURE_MIN_LIMIT, PRESSURE_MAX_LIMIT);
+            if (pressure_min > pressure_max)
+                pressure_min = pressure_max;
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"参考: 来流压强 = %.0f Pa", params.p_inf);
             break;
         case FieldType::DENSITY:
-            ImGui::SliderFloat(u8"密度下限 (倍数)", &rho_min_ratio, 0.1f, 1.0f);
-            ImGui::SliderFloat(u8"密度上限 (倍数)", &rho_max_ratio, 1.0f, 10.0f);
-            ImGui::Text(u8"实际范围: %.3f - %.3f kg/m³", params.rho_inf * rho_min_ratio, params.rho_inf * rho_max_ratio);
+            ImGui::SliderFloat(u8"密度下限 (kg/m³)", &density_min, DENSITY_MIN_LIMIT, DENSITY_MAX_LIMIT);
+            ImGui::SliderFloat(u8"密度上限 (kg/m³)", &density_max, DENSITY_MIN_LIMIT, DENSITY_MAX_LIMIT);
+            if (density_min > density_max)
+                density_min = density_max;
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"参考: 来流密度 = %.3f kg/m³", params.rho_inf);
             break;
         case FieldType::VELOCITY_MAG:
-            ImGui::SliderFloat(u8"速度上限 (倍数)", &v_max_ratio, 0.5f, 3.0f);
-            ImGui::Text(u8"实际范围: 0 - %.1f m/s", params.u_inf * v_max_ratio);
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"速度下限固定为 0 m/s");
+            ImGui::SliderFloat(u8"速度上限 (m/s)", &velocity_max, 0.0f, VELOCITY_MAX_LIMIT);
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"参考: 来流速度 = %.1f m/s", params.u_inf);
             break;
         case FieldType::MACH:
-            ImGui::SliderFloat(u8"马赫数上限 (倍数)", &mach_max_ratio, 0.5f, 3.0f);
-            ImGui::Text(u8"实际范围: 0 - %.2f", params.mach * mach_max_ratio);
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"马赫数下限固定为 0");
+            ImGui::SliderFloat(u8"马赫数上限", &mach_max, 0.0f, MACH_MAX_LIMIT);
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"参考: 来流马赫数 = %.2f", params.mach);
             break;
         }
         ImGui::Separator();
@@ -553,28 +573,28 @@ void renderUI()
         {
         case FieldType::TEMPERATURE:
             unit = "K";
-            minVal = params.T_min;
-            maxVal = params.T_max;
+            minVal = temperature_min;
+            maxVal = temperature_max;
             break;
         case FieldType::PRESSURE:
             unit = "Pa";
-            minVal = params.p_inf * 0.5f;
-            maxVal = params.p_inf * 5.0f;
+            minVal = pressure_min;
+            maxVal = pressure_max;
             break;
         case FieldType::DENSITY:
             unit = "kg/m^3";
-            minVal = params.rho_inf * 0.5f;
-            maxVal = params.rho_inf * 5.0f;
+            minVal = density_min;
+            maxVal = density_max;
             break;
         case FieldType::VELOCITY_MAG:
             unit = "m/s";
             minVal = 0;
-            maxVal = params.u_inf * 1.5f;
+            maxVal = velocity_max;
             break;
         case FieldType::MACH:
             unit = "";
             minVal = 0;
-            maxVal = params.mach * 1.5f;
+            maxVal = mach_max;
             break;
         }
 
@@ -589,7 +609,9 @@ void renderUI()
 #pragma endregion
 
 #pragma region 可视化函数
-// 使用传统CPU拷贝方式更新可视化
+// 使用传统CPU拷贝方式更新可视化（非零拷贝模式）
+// 数据流：GPU -> CPU -> GPU
+// 性能开销：两次PCIe总线传输
 void updateVisualizationCPU()
 {
     float *fieldData = nullptr;
@@ -598,48 +620,53 @@ void updateVisualizationCPU()
     switch (currentField)
     {
     case FieldType::TEMPERATURE:
+        // GPU -> CPU 拷贝
         solver.getTemperatureField(h_temperature.data());
         fieldData = h_temperature.data();
-        minVal = params.T_min;
-        maxVal = params.T_max;
+        minVal = temperature_min;
+        maxVal = temperature_max;
         break;
 
     case FieldType::PRESSURE:
+        // GPU -> CPU 拷贝
         solver.getPressureField(h_pressure.data());
         fieldData = h_pressure.data();
-        minVal = params.p_inf * p_min_ratio;
-        maxVal = params.p_inf * p_max_ratio;
+        minVal = pressure_min;
+        maxVal = pressure_max;
         break;
 
     case FieldType::DENSITY:
+        // GPU -> CPU 拷贝
         solver.getDensityField(h_density.data());
         fieldData = h_density.data();
-        minVal = params.rho_inf * rho_min_ratio;
-        maxVal = params.rho_inf * rho_max_ratio;
+        minVal = density_min;
+        maxVal = density_max;
         break;
 
     case FieldType::VELOCITY_MAG:
     {
+        // GPU -> CPU 拷贝
         solver.getVelocityField(h_u.data(), h_v.data());
-        // 计算局部速率
+        // CPU端计算速度大小
         for (int i = 0; i < params.nx * params.ny; i++)
         {
             h_temperature[i] = sqrtf(h_u[i] * h_u[i] + h_v[i] * h_v[i]);
         }
         fieldData = h_temperature.data();
         minVal = 0.0f;
-        maxVal = params.u_inf * v_max_ratio;
+        maxVal = velocity_max;
 
-        // 更新速度场数据用于矢量可视化
+        // 更新速度场数据用于矢量可视化（CPU端缓存）
         renderer.updateVelocityField(h_u.data(), h_v.data(), params.nx, params.ny, params.u_inf);
         break;
     }
 
     case FieldType::MACH:
     {
+        // GPU -> CPU 拷贝
         solver.getVelocityField(h_u.data(), h_v.data());
         solver.getTemperatureField(h_temperature.data());
-        // 计算局部马赫数
+        // CPU端计算马赫数
         for (int i = 0; i < params.nx * params.ny; i++)
         {
             float speed = sqrtf(h_u[i] * h_u[i] + h_v[i] * h_v[i]);
@@ -648,15 +675,17 @@ void updateVisualizationCPU()
         }
         fieldData = h_pressure.data();
         minVal = 0.0f;
-        maxVal = params.mach * mach_max_ratio;
+        maxVal = mach_max;
         break;
     }
     }
 
-    renderer.updateField(fieldData, params.nx, params.ny, minVal, maxVal, currentField);
+    // CPU -> GPU 上传到纹理
+    renderer.updateFieldCPU(fieldData, params.nx, params.ny, minVal, maxVal, currentField);
 }
 
-// 使用CUDA-OpenGL互操作方式更新可视化（零拷贝）
+// 使用零拷贝方式更新可视化（完全避免GPU-GPU拷贝）
+// 数据流：保守变量(GPU) -> 直接计算到PBO(GPU) -> OpenGL纹理(GPU)
 void updateVisualizationInterop()
 {
     float minVal, maxVal;
@@ -665,54 +694,51 @@ void updateVisualizationInterop()
     switch (currentField)
     {
     case FieldType::TEMPERATURE:
-        minVal = params.T_min;
-        maxVal = params.T_max;
+        minVal = temperature_min;
+        maxVal = temperature_max;
         break;
     case FieldType::PRESSURE:
-        minVal = params.p_inf * p_min_ratio;
-        maxVal = params.p_inf * p_max_ratio;
+        minVal = pressure_min;
+        maxVal = pressure_max;
         break;
     case FieldType::DENSITY:
-        minVal = params.rho_inf * rho_min_ratio;
-        maxVal = params.rho_inf * rho_max_ratio;
+        minVal = density_min;
+        maxVal = density_max;
         break;
     case FieldType::VELOCITY_MAG:
         minVal = 0.0f;
-        maxVal = params.u_inf * v_max_ratio;
+        maxVal = velocity_max;
         break;
     case FieldType::MACH:
         minVal = 0.0f;
-        maxVal = params.mach * mach_max_ratio;
+        maxVal = mach_max;
         break;
     }
 
-    // 设置渲染器的场值范围
     renderer.setFieldRange(minVal, maxVal, currentField);
 
-    // 映射PBO获取设备指针
     float *devPtr = renderer.mapFieldTexture();
     if (!devPtr)
     {
-        // 映射失败，回退到CPU方式
+        std::cerr << "[警告] PBO映射失败，回退到CPU传输路径\n";
         updateVisualizationCPU();
         return;
     }
 
-    // 根据当前显示的物理量，直接在GPU上拷贝/计算数据到PBO
+    // 直接从保守变量计算到PBO，完全避免GPU-GPU拷贝
     switch (currentField)
     {
     case FieldType::TEMPERATURE:
-        solver.copyTemperatureToDevice(devPtr);
+        solver.computeTemperatureToDevice(devPtr);
         break;
     case FieldType::PRESSURE:
-        solver.copyPressureToDevice(devPtr);
+        solver.computePressureToDevice(devPtr);
         break;
     case FieldType::DENSITY:
-        solver.copyDensityToDevice(devPtr);
+        solver.computeDensityToDevice(devPtr);
         break;
     case FieldType::VELOCITY_MAG:
-        solver.copyVelocityMagnitudeToDevice(devPtr);
-        // 速度矢量可视化仍需要CPU数据（箭头绘制在CPU端完成）
+        solver.computeVelocityMagToDevice(devPtr);
         if (renderer.getShowVectors())
         {
             solver.getVelocityField(h_u.data(), h_v.data());
@@ -720,11 +746,10 @@ void updateVisualizationInterop()
         }
         break;
     case FieldType::MACH:
-        solver.copyMachToDevice(devPtr);
+        solver.computeMachToDevice(devPtr);
         break;
     }
 
-    // 取消映射，数据自动传输到纹理
     renderer.unmapFieldTexture();
 }
 
