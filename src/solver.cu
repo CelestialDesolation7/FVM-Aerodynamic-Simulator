@@ -9,6 +9,7 @@ __device__ __constant__ float MIN_DENSITY = 1e-4f;
 __device__ __constant__ float MIN_PRESSURE = 1e-2f;
 __device__ __constant__ float MAX_TEMPERATURE = 5000.0f;
 __device__ __constant__ float MIN_TEMPERATURE = 50.0f;
+__device__ __constant__ float MAX_VELOCITY = 10000.0f;
 constexpr int BLOCK_SIZE = 16;
 #pragma endregion
 
@@ -58,19 +59,6 @@ __device__ float minmod(float a, float b)
         return 0.0f;
     // 否则返回绝对值较小的那个(选择更保守的外推)
     return (fabsf(a) < fabsf(b)) ? a : b;
-}
-
-// 功能:Van Leer 限制器函数，比 minmod 稍微宽松，允许更多重构
-// 输入:斜率比 r = (q_i - q_{i-1}) / (q_{i+1} - q_i)
-// 输出:限制后的通量限制因子，范围[0,1]
-__device__ float vanLeer(float r)
-{
-    // 如果上游是极值点(r<=0)，不外推
-    if (r <= 0.0f)
-        return 0.0f;
-    // Van Leer 公式: phi(r) = (r + |r|) / (1 + |r|)
-    // 这个函数在 r>0 时平滑过渡，避免激波处的数值振荡
-    return (r + fabsf(r)) / (1.0f + fabsf(r));
 }
 
 // 功能:Harten 熵修正，避免跨音速区域的数值不稳定(膨胀激波)
@@ -472,7 +460,6 @@ __global__ void computePrimitivesKernel(const float *rho, const float *rho_u,
         float ratio = p_from_E / p_from_e;
         if (ratio > 1.5f)
         {
-            // Possible shock - blend towards E-method
             float blend = fminf(1.0f, (ratio - 1.0f) / 2.0f);
             p_val = (1.0f - blend) * p_from_e + blend * p_from_E;
         }
@@ -599,27 +586,9 @@ __device__ void hllcFluxX(
     float cL = sqrtf(GAMMA * pL / rhoL);
     float cR = sqrtf(GAMMA * pR / rhoR);
 
-    // Roe 平均(用于更准确的波速估计)
-    // Roe平均密度权重
-    float sqrtRhoL = sqrtf(rhoL);
-    float sqrtRhoR = sqrtf(rhoR);
-    float denom = sqrtRhoL + sqrtRhoR + 1e-10f;
-
-    // Roe平均速度
-    float u_roe = (sqrtRhoL * uL + sqrtRhoR * uR) / denom;
-
-    // Roe平均比焓: H = (E + p) / rho
-    float H_L = (EL + pL) / rhoL;
-    float H_R = (ER + pR) / rhoR;
-    float H_roe = (sqrtRhoL * H_L + sqrtRhoR * H_R) / denom;
-
-    // 从Roe平均量计算声速: c^2 = (gamma-1) * (H - 0.5*u^2)
-    float c_roe_sq = (GAMMA - 1.0f) * (H_roe - 0.5f * u_roe * u_roe);
-    float c_roe = (c_roe_sq > 0.0f) ? sqrtf(c_roe_sq) : 0.5f * (cL + cR);
-
-    // Davis 波速估计(结合左右和Roe平均)
-    float SL = fminf(uL - cL, u_roe - c_roe);
-    float SR = fmaxf(uR + cR, u_roe + c_roe);
+    // Davis 波速估计(简化版本，直接使用左右状态)
+    float SL = fminf(uL - cL, uR - cR);
+    float SR = fmaxf(uL + cL, uR + cR);
 
     // 熵修正，防止膨胀激波
     float delta = 0.1f * fmaxf(cL, cR);
@@ -785,22 +754,9 @@ __device__ void hllcFluxY(
     float cB = sqrtf(GAMMA * pB / rhoB);
     float cT = sqrtf(GAMMA * pT / rhoT);
 
-    // Roe 平均(Y方向，用v代替u)
-    float sqrtRhoB = sqrtf(rhoB);
-    float sqrtRhoT = sqrtf(rhoT);
-    float denom = sqrtRhoB + sqrtRhoT + 1e-10f;
-
-    float v_roe = (sqrtRhoB * vB + sqrtRhoT * vT) / denom;
-    float H_B = (EB + pB) / rhoB;
-    float H_T = (ET + pT) / rhoT;
-    float H_roe = (sqrtRhoB * H_B + sqrtRhoT * H_T) / denom;
-
-    float c_roe_sq = (GAMMA - 1.0f) * (H_roe - 0.5f * v_roe * v_roe);
-    float c_roe = (c_roe_sq > 0.0f) ? sqrtf(c_roe_sq) : 0.5f * (cB + cT);
-
-    // 波速估计
-    float SB = fminf(vB - cB, v_roe - c_roe);
-    float ST = fmaxf(vT + cT, v_roe + c_roe);
+    // 波速估计(简化版本，直接使用上下状态)
+    float SB = fminf(vB - cB, vT - cT);
+    float ST = fmaxf(vB + cB, vT + cT);
 
     // 熵修正
     float delta = 0.1f * fmaxf(cB, cT);
@@ -1373,7 +1329,7 @@ __global__ void applyBoundaryConditionsKernel(
     // ========== 流入边界(左侧) ==========
     if (ctype == CELL_INFLOW || i == 0)
     {
-        // 直接设置为来流条件(Dirichlet边界条件)
+        // 直接设置为来流条件
         rho[idx] = rho_inf;
         rho_u[idx] = rho_inf * u_inf;
         rho_v[idx] = rho_inf * v_inf;
@@ -1385,7 +1341,7 @@ __global__ void applyBoundaryConditionsKernel(
     // ========== 流出边界(右侧) ==========
     if (ctype == CELL_OUTFLOW || i == nx - 1)
     {
-        // 零梯度外推(Neumann边界条件)
+        // 零梯度外推
         // 假设流出处的流场已经充分发展，物理量沿流向不变
         int idx_im1 = j * nx + (i - 1);
         rho[idx] = rho[idx_im1];
@@ -1403,7 +1359,7 @@ __global__ void applyBoundaryConditionsKernel(
         int idx_jp1 = (j + 1) * nx + i;
         int idx_jp2 = (j + 2) * nx + i;
 
-        // 二阶外推(Richardson外推): q(0) = 2*q(1) - q(2)
+        // 二阶外推: q(0) = 2*q(1) - q(2)
         float rho_ext = 2.0f * rho[idx_jp1] - rho[idx_jp2];
         float rho_u_ext = 2.0f * rho_u[idx_jp1] - rho_u[idx_jp2];
         float rho_v_ext = 2.0f * rho_v[idx_jp1] - rho_v[idx_jp2];
@@ -1555,25 +1511,6 @@ __global__ void applyBoundaryConditionsKernel(
                     {
                         best_dot = dot;
                         best_idx = nidx;
-                    }
-                }
-            }
-        }
-
-        // 如果没找到最佳邻居，退化为任意流体邻居
-        if (best_idx < 0)
-        {
-            for (int n = 0; n < 8; n++)
-            {
-                int ni = i + neighbors[n][0];
-                int nj = j + neighbors[n][1];
-                if (ni >= 0 && ni < nx && nj >= 0 && nj < ny)
-                {
-                    int nidx = nj * nx + ni;
-                    if (sdf[nidx] > 0.0f && rho[nidx] >= MIN_DENSITY)
-                    {
-                        best_idx = nidx;
-                        break;
                     }
                 }
             }

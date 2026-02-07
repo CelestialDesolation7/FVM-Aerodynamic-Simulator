@@ -84,7 +84,7 @@ private:
     float *d_rho_u_ = nullptr; // 网格空气水平速度
     float *d_rho_v_ = nullptr; // 网格空气垂直速度
     float *d_E_ = nullptr;     // 网格内空气总能量（内能+动能）
-    float *d_rho_e_ = nullptr; // 网格内空气
+    float *d_rho_e_ = nullptr; // 网格内空气内能密度（用于双能量法）
 
     // 为实现双缓冲需要再保存下一个状态的保守量
     float *d_rho_new_ = nullptr;
