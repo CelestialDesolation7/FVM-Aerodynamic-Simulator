@@ -364,8 +364,8 @@ void renderUI()
                            (T_REF + S_SUTHERLAND) / (params.T_inf + S_SUTHERLAND);
             // 雷诺值，惯性力与粘性力之比
             float Re = params.rho_inf * params.u_inf * (2.0f * params.obstacle_r) / mu_inf;
-            ImGui::Text(u8"雷诺数 Re ≈ %.0f", Re);
-            ImGui::Text(u8"来流粘性 μ = %.2e Pa·s", mu_inf);
+            ImGui::Text(u8"雷诺数 Re = %.0f", Re);
+            ImGui::Text(u8"来流粘性 mu = %.2e Pa·s", mu_inf);
 
             ImGui::Separator();
             ImGui::TextWrapped(u8"注意：启用粘性后，计算量增加约50%%。粘性CFL通常比对流CFL更严格。");
