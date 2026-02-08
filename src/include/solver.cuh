@@ -144,13 +144,12 @@ private:
                                        int nx, int ny);
 
     // 功能:启动通量计算核函数，使用MUSCL重构和HLLC Riemann求解器
-    // 输入:守恒变量场，原始变量场，网格类型，仿真参数
+    // 输入:密度(rho)和原始变量(u,v,p)，网格类型，仿真参数
     // 输出:X和Y方向的数值通量(flux_*_x/y)，包括质量/动量/能量/内能通量
-    void launchComputeFluxesKernel(const float *rho, const float *rho_u,
-                                   const float *rho_v, const float *E,
-                                   const float *rho_e,
+    // 注意:仅需rho和原始变量，守恒量(rho_u,rho_v,E,rho_e)和T在内核中未使用
+    void launchComputeFluxesKernel(const float *rho,
                                    const float *u, const float *v,
-                                   const float *p, const float *T,
+                                   const float *p,
                                    const uint8_t *cell_type,
                                    float *flux_rho_x, float *flux_rho_u_x,
                                    float *flux_rho_v_x, float *flux_E_x,
@@ -161,10 +160,12 @@ private:
                                    const SimParams &params, int nx, int ny);
 
     // 功能:启动更新核函数，使用有限体积法和双能量法更新守恒变量
-    // 输入:当前守恒变量，X/Y方向通量，网格类型，时间步长和网格间距
+    // 输入:当前守恒变量，已计算的原始变量(u,v,p)，X/Y方向通量，网格类型
     // 输出:下一时间步的守恒变量(rho_new, rho_u_new等)，通过双缓冲实现
+    // 注意:直接复用原始变量避免重复的除法(rho_u/rho)和压强反算
     void launchUpdateKernel(const float *rho, const float *rho_u,
                             const float *rho_v, const float *E, const float *rho_e,
+                            const float *u, const float *v, const float *p,
                             const float *flux_rho_x, const float *flux_rho_u_x,
                             const float *flux_rho_v_x, const float *flux_E_x,
                             const float *flux_rho_e_x,
@@ -207,26 +208,20 @@ private:
     float launchComputeMaxWaveSpeed(const float *u, const float *v, const float *p,
                                     const float *rho, int nx, int ny);
 
-    // 功能:启动粘性计算核函数，使用Sutherland公式
+    // 功能:启动粘性计算核函数，使用Sutherland公式(独立版本，仅用于初始化)
     // 输入:温度场，网格尺寸
-    // 输出:动力粘性系数场 mu 和热导率场 k (用于Navier-Stokes粘性项)
+    // 输出:动力粘性系数场 mu 和热导率场 k
     void launchComputeViscosityKernel(const float *T, float *mu, float *k, int nx, int ny);
 
-    // 功能:启动应力张量计算核函数，基于Stokes假设
-    // 输入:速度场(u,v)，粘性系数场，网格类型，网格间距
-    // 输出:应力张量分量(tau_xx, tau_yy, tau_xy)，用于粘性力计算
-    void launchComputeStressTensorKernel(const float *u, const float *v, const float *mu,
-                                         float *tau_xx, float *tau_yy, float *tau_xy,
-                                         const uint8_t *cell_type,
-                                         float dx, float dy, int nx, int ny);
-
-    // 功能:启动热通量计算核函数，使用Fourier定律
-    // 输入:温度场，热导率场，网格类型，网格间距
-    // 输出:热通量分量(qx, qy)，q = -k * grad(T)，用于热传导计算
-    void launchComputeHeatFluxKernel(const float *T, const float *k,
-                                     float *qx, float *qy,
-                                     const uint8_t *cell_type,
-                                     float dx, float dy, int nx, int ny);
+    // 功能:启动融合粘性项核函数(替代上述三个独立核函数的调用)
+    // 输入:速度场(u,v)，温度场(T)，网格类型，网格间距
+    // 输出:粘性系数(mu)，应力张量(tau_xx/yy/xy)，热通量(qx/qy)
+    // 优势:单次内核启动完成全部粘性计算，省去k的全局读写和重复的邻居索引计算
+    void launchComputeViscousTermsKernel(const float *u, const float *v, const float *T,
+                                          float *mu, float *tau_xx, float *tau_yy, float *tau_xy,
+                                          float *qx, float *qy,
+                                          const uint8_t *cell_type,
+                                          float dx, float dy, int nx, int ny);
 
     // 功能:启动粘性扩散步核函数，积分粘性力和热传导项
     // 输入:守恒变量，应力张量，热通量，速度场，时间步长，网格间距

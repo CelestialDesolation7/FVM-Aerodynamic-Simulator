@@ -1017,9 +1017,8 @@ __device__ void hllcFluxY(
 // 输出:X方向和Y方向的通量数组(包括内能通量)
 // 说明:这是求解器的核心，实现了二阶精度的空间离散
 __global__ void computeFluxesKernel(
-    const float *rho, const float *rho_u, const float *rho_v, const float *E,
-    const float *rho_e, // 内能密度(用于双能量法)
-    const float *u, const float *v, const float *p, const float *T,
+    const float *rho, // 密度(守恒量，用于MUSCL重构)
+    const float *u, const float *v, const float *p, // 原始变量(用于MUSCL+Riemann)
     const uint8_t *cell_type,
     float *flux_rho_x, float *flux_rho_u_x, float *flux_rho_v_x, float *flux_E_x,
     float *flux_rho_e_x, // 内能通量
@@ -1286,6 +1285,7 @@ __global__ void computeFluxesKernel(
 __global__ void updateKernel(
     const float *rho, const float *rho_u, const float *rho_v, const float *E,
     const float *rho_e,
+    const float *u, const float *v, const float *p, // 已计算的原始变量(避免重复除法)
     const float *flux_rho_x, const float *flux_rho_u_x, const float *flux_rho_v_x, const float *flux_E_x,
     const float *flux_rho_e_x,
     const float *flux_rho_y, const float *flux_rho_u_y, const float *flux_rho_v_y, const float *flux_E_y,
@@ -1350,24 +1350,15 @@ __global__ void updateKernel(
     int idx_ip1 = (i < nx - 1) ? (j * nx + (i + 1)) : idx;
     int idx_jp1 = (j < ny - 1) ? ((j + 1) * nx + i) : idx;
 
-    // 当前网格的状态
-    float rho_c = fmaxf(rho[idx], MIN_DENSITY);
-    float u_c = rho_u[idx] / rho_c;
-    float v_c = rho_v[idx] / rho_c;
-
-    // 计算速度梯度(中心差分)
-    float u_ip1 = rho_u[idx_ip1] / fmaxf(rho[idx_ip1], MIN_DENSITY);
-    float u_im1 = rho_u[idx_im1] / fmaxf(rho[idx_im1], MIN_DENSITY);
-    float v_jp1 = rho_v[idx_jp1] / fmaxf(rho[idx_jp1], MIN_DENSITY);
-    float v_jm1 = rho_v[idx_jm1] / fmaxf(rho[idx_jm1], MIN_DENSITY);
-
-    float du_dx = (u_ip1 - u_im1) / (2.0f * dx);
-    float dv_dy = (v_jp1 - v_jm1) / (2.0f * dy);
+    // 直接使用已计算的原始变量:
+    // - 避免 5 次除法 (rho_u/rho) 和 5 次 fmaxf 操作
+    // - 避免 8 次额外的全局内存读取 (rho_u/rho_v/rho 在邻居处)
+    // - 压强使用双能量法选取的值(比 E-KE 更精确)
+    float du_dx = (u[idx_ip1] - u[idx_im1]) / (2.0f * dx);
+    float dv_dy = (v[idx_jp1] - v[idx_jm1]) / (2.0f * dy);
     float div_v = du_dx + dv_dy;
 
-    // 当前压强(用于源项)
-    float ke_c = 0.5f * rho_c * (u_c * u_c + v_c * v_c);
-    float p_c = fmaxf((GAMMA - 1.0f) * (E[idx] - ke_c), MIN_PRESSURE);
+    float p_c = p[idx];
 
     // 内能方程源项: d(rho*e)/dt = -p * div(v) + ... (这里只包含压力做功)
     float source_rho_e = -p_c * div_v;
@@ -1820,7 +1811,7 @@ __global__ void applyBoundaryConditionsKernel(
 #pragma endregion
 
 #pragma region 有粘性逻辑
-// 功能:使用Sutherland公式计算粘性系数和热导率
+// 功能:使用Sutherland公式计算粘性系数和热导率(独立版本，用于初始化)
 // 输入:温度场 T, 网格尺寸 nx, ny
 // 输出:动力粘性系数场 mu, 热导率场 k
 __global__ void computeViscosityKernel(const float *T, float *mu, float *k, int nx, int ny)
@@ -1833,100 +1824,22 @@ __global__ void computeViscosityKernel(const float *T, float *mu, float *k, int 
 
     int idx = j * nx + i;
 
-    // 将温度限制在物理范围内
     float T_val = fmaxf(T[idx], MIN_TEMPERATURE);
     T_val = fminf(T_val, MAX_TEMPERATURE);
 
-    // Sutherland公式计算动力粘性系数:
     float mu_val = MU_REF * powf(T_val / T_REF, 1.5f) * (T_REF + S_SUTHERLAND) / (T_val + S_SUTHERLAND);
     mu[idx] = mu_val;
-
-    // 由普朗特数计算热导率: k = mu * C_p / Pr
-    // 其中 C_p 是定压比热, Pr 是普朗特数(对空气约为0.72)
     k[idx] = mu_val * CP / PRANDTL_NUMBER;
 }
 
-// 功能:计算粘性应力张量分量
-// 输入:速度场 u,v, 粘性系数场 mu, 网格类型，网格间距 dx,dy
-// 输出:应力张量分量 tau_xx, tau_yy, tau_xy
-// 说明:基于Stokes假设(体积粘性为零)的牛顿流体本构关系
-__global__ void computeStressTensorKernel(
-    const float *u, const float *v, const float *mu,
-    float *tau_xx, float *tau_yy, float *tau_xy,
-    const uint8_t *cell_type,
-    float dx, float dy, int nx, int ny)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (i >= nx || j >= ny)
-        return;
-
-    int idx = j * nx + i;
-
-    // 固体单元不计算应力
-    if (cell_type[idx] == CELL_SOLID)
-    {
-        tau_xx[idx] = 0.0f;
-        tau_yy[idx] = 0.0f;
-        tau_xy[idx] = 0.0f;
-        return;
-    }
-
-    // 邻居索引(带边界限制)
-    int idx_im1 = (i > 0) ? (j * nx + (i - 1)) : idx;
-    int idx_ip1 = (i < nx - 1) ? (j * nx + (i + 1)) : idx;
-    int idx_jm1 = (j > 0) ? ((j - 1) * nx + i) : idx;
-    int idx_jp1 = (j < ny - 1) ? ((j + 1) * nx + i) : idx;
-
-    // 使用中心差分计算速度梯度
-    // du/dx = (u_{i+1} - u_{i-1}) / (2*dx)
-    float du_dx = (u[idx_ip1] - u[idx_im1]) / (2.0f * dx);
-    float du_dy = (u[idx_jp1] - u[idx_jm1]) / (2.0f * dy);
-    float dv_dx = (v[idx_ip1] - v[idx_im1]) / (2.0f * dx);
-    float dv_dy = (v[idx_jp1] - v[idx_jm1]) / (2.0f * dy);
-
-    // 边界处使用单侧差分
-    if (i == 0)
-        du_dx = (u[idx_ip1] - u[idx]) / dx;
-    else if (i == nx - 1)
-        du_dx = (u[idx] - u[idx_im1]) / dx;
-
-    if (j == 0)
-        du_dy = (u[idx_jp1] - u[idx]) / dy;
-    else if (j == ny - 1)
-        du_dy = (u[idx] - u[idx_jm1]) / dy;
-
-    if (i == 0)
-        dv_dx = (v[idx_ip1] - v[idx]) / dx;
-    else if (i == nx - 1)
-        dv_dx = (v[idx] - v[idx_im1]) / dx;
-
-    if (j == 0)
-        dv_dy = (v[idx_jp1] - v[idx]) / dy;
-    else if (j == ny - 1)
-        dv_dy = (v[idx] - v[idx_jm1]) / dy;
-
-    // 速度散度: div(v) = du/dx + dv/dy
-    float div_v = du_dx + dv_dy;
-
-    // 当前网格的粘性系数
-    float mu_local = mu[idx];
-
-    // 计算应力张量分量(Stokes假设: 体积粘性 = 0)
-    // 正应力: tau_ii = mu * (2 * du_i/dx_i - 2/3 * div(v))
-    // 剪切应力: tau_ij = mu * (du_i/dx_j + du_j/dx_i)
-    tau_xx[idx] = mu_local * (2.0f * du_dx - (2.0f / 3.0f) * div_v);
-    tau_yy[idx] = mu_local * (2.0f * dv_dy - (2.0f / 3.0f) * div_v);
-    tau_xy[idx] = mu_local * (du_dy + dv_dx);
-}
-
-// 功能:使用Fourier定律计算热通量
-// 输入:温度场 T, 热导率场 k, 网格类型，网格间距 dx,dy
-// 输出:热通量分量 qx, qy
-// 说明:Fourier定律 q = -k * grad(T)，热量从高温流向低温
-__global__ void computeHeatFluxKernel(
-    const float *T, const float *k,
+// 功能:融合核函数 - 一次性计算粘性系数、应力张量和热通量
+// 输入:速度场 u,v, 温度场 T, 网格类型, 网格间距 dx,dy
+// 输出:粘性系数 mu(供CFL使用), 应力张量 tau_xx/yy/xy, 热通量 qx/qy
+// 说明:将原来的 computeViscosity + computeStressTensor + computeHeatFlux 三次内核启动
+//       合并为单次启动，消除中间场(k)的全局内存读写和重复的邻居索引计算
+__global__ void computeViscousTermsKernel(
+    const float *u, const float *v, const float *T,
+    float *mu_out, float *tau_xx, float *tau_yy, float *tau_xy,
     float *qx, float *qy,
     const uint8_t *cell_type,
     float dx, float dy, int nx, int ny)
@@ -1939,25 +1852,69 @@ __global__ void computeHeatFluxKernel(
 
     int idx = j * nx + i;
 
-    // 固体单元不计算热通量
+    // 固体单元: 所有粘性量为零
     if (cell_type[idx] == CELL_SOLID)
     {
+        mu_out[idx] = 0.0f;
+        tau_xx[idx] = 0.0f;
+        tau_yy[idx] = 0.0f;
+        tau_xy[idx] = 0.0f;
         qx[idx] = 0.0f;
         qy[idx] = 0.0f;
         return;
     }
 
-    // 邻居索引
+    // ===== 1. Sutherland粘性 + 热导率 (就地计算，无需中间存储k) =====
+    float T_val = fmaxf(T[idx], MIN_TEMPERATURE);
+    T_val = fminf(T_val, MAX_TEMPERATURE);
+    float mu_val = MU_REF * powf(T_val / T_REF, 1.5f) * (T_REF + S_SUTHERLAND) / (T_val + S_SUTHERLAND);
+    float k_val = mu_val * CP / PRANDTL_NUMBER;
+    mu_out[idx] = mu_val; // 写出 mu 供CFL条件使用
+
+    // ===== 2. 共享的邻居索引 (只计算一次) =====
     int idx_im1 = (i > 0) ? (j * nx + (i - 1)) : idx;
     int idx_ip1 = (i < nx - 1) ? (j * nx + (i + 1)) : idx;
     int idx_jm1 = (j > 0) ? ((j - 1) * nx + i) : idx;
     int idx_jp1 = (j < ny - 1) ? ((j + 1) * nx + i) : idx;
 
-    // 中心差分计算温度梯度
+    // ===== 3. 速度梯度 → 应力张量 =====
+    float du_dx = (u[idx_ip1] - u[idx_im1]) / (2.0f * dx);
+    float du_dy = (u[idx_jp1] - u[idx_jm1]) / (2.0f * dy);
+    float dv_dx = (v[idx_ip1] - v[idx_im1]) / (2.0f * dx);
+    float dv_dy = (v[idx_jp1] - v[idx_jm1]) / (2.0f * dy);
+
+    // 边界单侧差分
+    if (i == 0)
+    {
+        du_dx = (u[idx_ip1] - u[idx]) / dx;
+        dv_dx = (v[idx_ip1] - v[idx]) / dx;
+    }
+    else if (i == nx - 1)
+    {
+        du_dx = (u[idx] - u[idx_im1]) / dx;
+        dv_dx = (v[idx] - v[idx_im1]) / dx;
+    }
+
+    if (j == 0)
+    {
+        du_dy = (u[idx_jp1] - u[idx]) / dy;
+        dv_dy = (v[idx_jp1] - v[idx]) / dy;
+    }
+    else if (j == ny - 1)
+    {
+        du_dy = (u[idx] - u[idx_jm1]) / dy;
+        dv_dy = (v[idx] - v[idx_jm1]) / dy;
+    }
+
+    float div_v = du_dx + dv_dy;
+    tau_xx[idx] = mu_val * (2.0f * du_dx - (2.0f / 3.0f) * div_v);
+    tau_yy[idx] = mu_val * (2.0f * dv_dy - (2.0f / 3.0f) * div_v);
+    tau_xy[idx] = mu_val * (du_dy + dv_dx);
+
+    // ===== 4. 温度梯度 → 热通量 (复用邻居索引) =====
     float dT_dx = (T[idx_ip1] - T[idx_im1]) / (2.0f * dx);
     float dT_dy = (T[idx_jp1] - T[idx_jm1]) / (2.0f * dy);
 
-    // 边界处使用单侧差分
     if (i == 0)
         dT_dx = (T[idx_ip1] - T[idx]) / dx;
     else if (i == nx - 1)
@@ -1968,10 +1925,8 @@ __global__ void computeHeatFluxKernel(
     else if (j == ny - 1)
         dT_dy = (T[idx] - T[idx_jm1]) / dy;
 
-    // Fourier定律: q = -k * grad(T)
-    // 负号表示热量从高温流向低温
-    qx[idx] = -k[idx] * dT_dx;
-    qy[idx] = -k[idx] * dT_dy;
+    qx[idx] = -k_val * dT_dx;
+    qy[idx] = -k_val * dT_dy;
 }
 
 // 功能:粘性扩散步，积分粘性和热传导项
@@ -2164,11 +2119,10 @@ void CFDSolver::launchComputePrimitivesKernel(const float *rho, const float *rho
 
 // 功能:启动通量计算核函数
 // 说明:使用MUSCL重构和HLLC Riemann求解器计算数值通量
-void CFDSolver::launchComputeFluxesKernel(const float *rho, const float *rho_u,
-                                          const float *rho_v, const float *E,
-                                          const float *rho_e,
+//       仅需密度(rho)和原始变量(u,v,p)，不再传入未使用的守恒量指针
+void CFDSolver::launchComputeFluxesKernel(const float *rho,
                                           const float *u, const float *v,
-                                          const float *p, const float *T,
+                                          const float *p,
                                           const uint8_t *cell_type,
                                           float *flux_rho_x, float *flux_rho_u_x,
                                           float *flux_rho_v_x, float *flux_E_x,
@@ -2181,7 +2135,7 @@ void CFDSolver::launchComputeFluxesKernel(const float *rho, const float *rho_u,
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
-    computeFluxesKernel<<<grid, block>>>(rho, rho_u, rho_v, E, rho_e, u, v, p, T, cell_type,
+    computeFluxesKernel<<<grid, block>>>(rho, u, v, p, cell_type,
                                          flux_rho_x, flux_rho_u_x, flux_rho_v_x, flux_E_x, flux_rho_e_x,
                                          flux_rho_y, flux_rho_u_y, flux_rho_v_y, flux_E_y, flux_rho_e_y,
                                          params.dx, params.dy, nx, ny);
@@ -2189,9 +2143,10 @@ void CFDSolver::launchComputeFluxesKernel(const float *rho, const float *rho_u,
 }
 
 // 功能:启动更新核函数
-// 说明:使用有限体积法和双能量法更新守恒变量
+// 说明:使用有限体积法和双能量法更新守恒变量，复用已计算的原始变量(u,v,p)
 void CFDSolver::launchUpdateKernel(const float *rho, const float *rho_u,
                                    const float *rho_v, const float *E, const float *rho_e,
+                                   const float *u, const float *v, const float *p,
                                    const float *flux_rho_x, const float *flux_rho_u_x,
                                    const float *flux_rho_v_x, const float *flux_E_x,
                                    const float *flux_rho_e_x,
@@ -2207,6 +2162,7 @@ void CFDSolver::launchUpdateKernel(const float *rho, const float *rho_u,
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     updateKernel<<<grid, block>>>(rho, rho_u, rho_v, E, rho_e,
+                                  u, v, p,
                                   flux_rho_x, flux_rho_u_x, flux_rho_v_x, flux_E_x, flux_rho_e_x,
                                   flux_rho_y, flux_rho_u_y, flux_rho_v_y, flux_E_y, flux_rho_e_y,
                                   cell_type,
@@ -2245,30 +2201,25 @@ void CFDSolver::launchComputeViscosityKernel(const float *T, float *mu, float *k
     CUDA_CHECK(cudaGetLastError());
 }
 
-// 功能:启动应力张量计算核函数
-void CFDSolver::launchComputeStressTensorKernel(const float *u, const float *v, const float *mu,
-                                                float *tau_xx, float *tau_yy, float *tau_xy,
-                                                const uint8_t *cell_type,
-                                                float dx, float dy, int nx, int ny)
+// 注意: 原来独立的 launchComputeStressTensorKernel 和 launchComputeHeatFluxKernel
+//       已被下面的融合版本完全取代，不再需要单独调用
+
+// 功能:启动融合粘性项核函数(替代 Viscosity+StressTensor+HeatFlux 三次调用)
+// 说明:单次内核启动完成 Sutherland粘性 + 应力张量 + 热通量 的全部计算
+void CFDSolver::launchComputeViscousTermsKernel(
+    const float *u, const float *v, const float *T,
+    float *mu, float *tau_xx, float *tau_yy, float *tau_xy,
+    float *qx, float *qy,
+    const uint8_t *cell_type,
+    float dx, float dy, int nx, int ny)
 {
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
-    computeStressTensorKernel<<<grid, block>>>(u, v, mu, tau_xx, tau_yy, tau_xy,
-                                               cell_type, dx, dy, nx, ny);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-// 功能:启动热通量计算核函数
-void CFDSolver::launchComputeHeatFluxKernel(const float *T, const float *k,
-                                            float *qx, float *qy,
-                                            const uint8_t *cell_type,
-                                            float dx, float dy, int nx, int ny)
-{
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
-
-    computeHeatFluxKernel<<<grid, block>>>(T, k, qx, qy, cell_type, dx, dy, nx, ny);
+    computeViscousTermsKernel<<<grid, block>>>(u, v, T, mu,
+                                                tau_xx, tau_yy, tau_xy,
+                                                qx, qy, cell_type,
+                                                dx, dy, nx, ny);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -2761,11 +2712,11 @@ void CFDSolver::step(SimParams &params)
         // 这样做二阶精度且保持稳定性
 
         // 步骤1: 扩散半步(使用已有的原始变量)
-        launchComputeViscosityKernel(d_T_, d_mu_, d_k_, _nx, _ny);
-        launchComputeStressTensorKernel(d_u_, d_v_, d_mu_, d_tau_xx_, d_tau_yy_, d_tau_xy_,
-                                        d_cell_type_, params.dx, params.dy, _nx, _ny);
-        launchComputeHeatFluxKernel(d_T_, d_k_, d_qx_, d_qy_,
-                                    d_cell_type_, params.dx, params.dy, _nx, _ny);
+        // 融合核函数: 一次启动完成 Sutherland粘性 + 应力张量 + 热通量
+        launchComputeViscousTermsKernel(d_u_, d_v_, d_T_,
+                                         d_mu_, d_tau_xx_, d_tau_yy_, d_tau_xy_,
+                                         d_qx_, d_qy_, d_cell_type_,
+                                         params.dx, params.dy, _nx, _ny);
         launchDiffusionStepKernel(d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                   d_tau_xx_, d_tau_yy_, d_tau_xy_, d_qx_, d_qy_,
                                   d_u_, d_v_, d_cell_type_,
@@ -2774,12 +2725,12 @@ void CFDSolver::step(SimParams &params)
         // 步骤2: 对流全步(扩散半步修改了守恒变量，需重新计算原始变量)
         launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                       d_u_, d_v_, d_p_, d_T_, _nx, _ny);
-        launchComputeFluxesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
-                                  d_u_, d_v_, d_p_, d_T_, d_cell_type_,
+        launchComputeFluxesKernel(d_rho_, d_u_, d_v_, d_p_, d_cell_type_,
                                   d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
                                   d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
                                   params, _nx, _ny);
         launchUpdateKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+                           d_u_, d_v_, d_p_,
                            d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
                            d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
                            d_cell_type_,
@@ -2795,11 +2746,11 @@ void CFDSolver::step(SimParams &params)
         // 步骤3: 扩散半步(对流步修改了守恒变量，需重新计算原始变量)
         launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                       d_u_, d_v_, d_p_, d_T_, _nx, _ny);
-        launchComputeViscosityKernel(d_T_, d_mu_, d_k_, _nx, _ny);
-        launchComputeStressTensorKernel(d_u_, d_v_, d_mu_, d_tau_xx_, d_tau_yy_, d_tau_xy_,
-                                        d_cell_type_, params.dx, params.dy, _nx, _ny);
-        launchComputeHeatFluxKernel(d_T_, d_k_, d_qx_, d_qy_,
-                                    d_cell_type_, params.dx, params.dy, _nx, _ny);
+        // 融合核函数: 一次启动完成 Sutherland粘性 + 应力张量 + 热通量
+        launchComputeViscousTermsKernel(d_u_, d_v_, d_T_,
+                                         d_mu_, d_tau_xx_, d_tau_yy_, d_tau_xy_,
+                                         d_qx_, d_qy_, d_cell_type_,
+                                         params.dx, params.dy, _nx, _ny);
         launchDiffusionStepKernel(d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                   d_tau_xx_, d_tau_yy_, d_tau_xy_, d_qx_, d_qy_,
                                   d_u_, d_v_, d_cell_type_,
@@ -2811,14 +2762,14 @@ void CFDSolver::step(SimParams &params)
         // 原始变量已由上一步结尾计算完毕，直接使用
 
         // 1. 计算通量(包括内能通量)
-        launchComputeFluxesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
-                                  d_u_, d_v_, d_p_, d_T_, d_cell_type_,
+        launchComputeFluxesKernel(d_rho_, d_u_, d_v_, d_p_, d_cell_type_,
                                   d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
                                   d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
                                   params, _nx, _ny);
 
         // 2. 更新守恒变量(包括内能)
         launchUpdateKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+                           d_u_, d_v_, d_p_,
                            d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
                            d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
                            d_cell_type_,
