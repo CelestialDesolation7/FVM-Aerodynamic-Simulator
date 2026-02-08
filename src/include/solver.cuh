@@ -116,8 +116,10 @@ private:
     float *d_flux_E_y_ = nullptr;     // y轴-能量-通量场
     float *d_flux_rho_e_y_ = nullptr; // y轴-内能-通量场
 
-    // 归约缓冲区
-    float *d_reduction_buffer_ = nullptr;
+    // 归约缓冲区及其大小
+    float *d_reduction_buffer_ = nullptr; // CUB临时存储空间
+    float *d_reduction_output_ = nullptr; // 归约结果输出（单个float）
+    size_t reduction_buffer_size_ = 0;    // 动态计算的缓冲区字节数
 
     // 粘性相关中间量 (Navier-Stokes方程)
     float *d_mu_ = nullptr;     // 动态更新的粘度值场
@@ -194,17 +196,20 @@ private:
     // 功能:使用CUB库归约计算全场最大温度
     // 输入:温度场数组，网格尺寸
     // 输出:最大温度值(用于监控激波强度和数值稳定性)
+    // 实现:使用CUB库直接对温度数组归约，最高效的方式
     float launchComputeMaxTemperature(const float *T, int nx, int ny);
 
     // 功能:归约计算全场最大马赫数
     // 输入:速度场(u,v)，压强场，密度场，网格尺寸
-    // 输出:最大马赫数 Ma = |v| / c (用于判断流动类型：亚音速/超音速)
+    // 输出:最大马赫数 Ma = |v| / c_local (用于判断流动类型：亚音速/超音速)
+    // 实现:使用CUB库高效归约，单阶段GPU完成（已替换旧的两阶段手写实现）
     float launchComputeMaxMach(const float *u, const float *v, const float *p,
                                const float *rho, int nx, int ny);
 
     // 功能:归约计算全场最大波速(速度+声速)
     // 输入:速度场(u,v)，压强场，密度场，网格尺寸
     // 输出:最大波速 = |v| + c (用于CFL条件的时间步长限制)
+    // 实现:使用CUB库高效归约，单阶段GPU完成
     float launchComputeMaxWaveSpeed(const float *u, const float *v, const float *p,
                                     const float *rho, int nx, int ny);
 
@@ -218,10 +223,10 @@ private:
     // 输出:粘性系数(mu)，应力张量(tau_xx/yy/xy)，热通量(qx/qy)
     // 优势:单次内核启动完成全部粘性计算，省去k的全局读写和重复的邻居索引计算
     void launchComputeViscousTermsKernel(const float *u, const float *v, const float *T,
-                                          float *mu, float *tau_xx, float *tau_yy, float *tau_xy,
-                                          float *qx, float *qy,
-                                          const uint8_t *cell_type,
-                                          float dx, float dy, int nx, int ny);
+                                         float *mu, float *tau_xx, float *tau_yy, float *tau_xy,
+                                         float *qx, float *qy,
+                                         const uint8_t *cell_type,
+                                         float dx, float dy, int nx, int ny);
 
     // 功能:启动粘性扩散步核函数，积分粘性力和热传导项
     // 输入:守恒变量，应力张量，热通量，速度场，时间步长，网格间距
@@ -236,5 +241,6 @@ private:
     // 功能:归约计算全场最大运动粘性系数 nu = mu / rho
     // 输入:动力粘性系数场，密度场，网格尺寸
     // 输出:最大运动粘性系数(用于粘性CFL条件: dt <= dx^2 / nu)
+    // 实现:使用CUB库高效归约，单阶段GPU完成
     float launchComputeMaxViscousNumber(const float *mu, const float *rho, int nx, int ny);
 };

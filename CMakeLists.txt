@@ -266,9 +266,10 @@ message(STATUS "  - C++: UTF-8 支持, 警告级别 3")
 
 if(MSVC)
     # 解决静态 CUDA 运行时与 vcpkg 动态运行时的冲突
+    # 使用 LINKER: 前缀确保选项只传递给链接器，而不是编译器
     target_link_options(${PROJECT_NAME} PRIVATE 
-        /NODEFAULTLIB:LIBCMT
-        /NODEFAULTLIB:LIBCMTD
+        "LINKER:/NODEFAULTLIB:LIBCMT"
+        "LINKER:/NODEFAULTLIB:LIBCMTD"
     )
     message(STATUS "MSVC 链接器选项: 忽略默认 LIBCMT(D)")
 endif()

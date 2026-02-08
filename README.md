@@ -18,7 +18,7 @@
 
 ![image-20260204211222307](img/image-20260204211222307.png)
 
-![img](img/resize,m_lfit,limit_1,h_1080.jpeg)
+![image-20260208174423648](assets/image-20260208174423648.png)
 
 支持更复杂的障碍物：
 
