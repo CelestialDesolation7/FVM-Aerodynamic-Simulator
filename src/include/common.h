@@ -31,10 +31,10 @@ struct SimParams{
     float mach = 3.0f;          // 来流马赫数
     float T_inf = 300.0f;       // 来流温度，单位 K
     float p_inf = 101325.0f;    // 来流静压，单位 Pa
-    float rho_inf;     // 来流密度，单位 kg/m³
-    float u_inf;       // 来流水平速度，单位 m/s
-    float v_inf;         // 来流垂直速度，单位 m/s
-    float c_inf;       // 来流声速，单位 m/s
+    float rho_inf = 0.0f;  // 来流密度，单位 kg/m³（由 computeDerived 计算）
+    float u_inf = 0.0f;    // 来流水平速度，单位 m/s（由 computeDerived 计算）
+    float v_inf = 0.0f;    // 来流垂直速度，单位 m/s（水平来流，默认为零）
+    float c_inf = 0.0f;    // 来流声速，单位 m/s（由 computeDerived 计算）
 
     // 障碍物参数
     float obstacle_x = 2.5f;    // 障碍物中心X坐标，单位米

@@ -89,6 +89,26 @@ __device__ float musclSlope(float qm1, float q0, float qp1)
     return minmod(dL, dR);
 }
 
+// 功能: 计算x方向的Riemann不变量（用于左右边界）
+// 输入: 原始变量(rho, u, v, p)
+// 输出: 四个Riemann不变量(R1, R2, R3, R4)
+__device__ __forceinline__ void computeRiemannInvarFromPrimitiveX(float rho, float u, float v, float p,
+                                                                  float &R1, float &R2, float &R3, float &R4)
+{
+    // 声速
+    float c = sqrtf(GAMMA * p / rho);
+    // Riemann不变量（X方向）
+    // 优化：使用 exp(-GAMMA * log(rho)) 代替 pow(rho, -GAMMA)
+    float log_rho = logf(rho);
+    R1 = expf(-GAMMA * log_rho) * p; // 熵波（特征速度 = u）
+    R2 = v;                          // 剪切波（特征速度 = u）
+
+    // 预计算常数以减少除法
+    constexpr float two_over_gamma_minus_1 = 2.0f / (GAMMA - 1.0f); // 对于 GAMMA=1.4，这是 5.0
+    R3 = u + c * two_over_gamma_minus_1;                            // 向右声波（特征速度 = u + c）
+    R4 = u - c * two_over_gamma_minus_1;                            // 向左声波（特征速度 = u - c）
+}
+
 // 功能: 计算y方向的Riemann不变量（用于上下边界）
 // 输入: 原始变量(rho, u, v, p)
 // 输出: 四个Riemann不变量(R1, R2, R3, R4)
@@ -109,8 +129,33 @@ __device__ __forceinline__ void computeRiemannInvarFromPrimitiveY(float rho, flo
     R4 = v - c * two_over_gamma_minus_1;                            // 向下声波
 }
 
-// 功能: 从Riemann不变量重构原始变量
-// 输入: Riemann不变量(R1, R2, R3, R4), 熵(s = p/rho^gamma)
+// 功能: 从X方向Riemann不变量重构原始变量
+// 输入: Riemann不变量(R1, R2, R3, R4)
+// 输出: 原始变量(rho, u, v, p)
+__device__ __forceinline__ void computePrimitiveFromRiemannInvarX(float R1, float R2, float R3, float R4,
+                                                                  float &rho, float &u, float &v, float &p)
+{
+    v = R2;               // 剪切波不变量直接给出垂直速度
+    u = (R3 + R4) * 0.5f; // 水平速度（优化：乘法比除法快）
+
+    // 预计算常数
+    constexpr float gamma_minus_1_over_4 = (GAMMA - 1.0f) * 0.25f; // 0.1
+    constexpr float inv_gamma_minus_1 = 1.0f / (GAMMA - 1.0f);     // 2.5 (对于 GAMMA=1.4)
+    constexpr float inv_gamma = 1.0f / GAMMA;                      // 0.714286
+
+    float c = (R3 - R4) * gamma_minus_1_over_4; // 本地声速
+    float c_sq = c * c;                         // 声速平方
+
+    // 优化：使用 exp 和 log 代替 pow
+    // rho = ((c^2) / (GAMMA * R1))^(1/(GAMMA-1))
+    float log_arg = c_sq * inv_gamma / R1;
+    rho = expf(inv_gamma_minus_1 * logf(log_arg));
+
+    p = rho * c_sq * inv_gamma; // 压强
+}
+
+// 功能: 从Y方向Riemann不变量重构原始变量
+// 输入: Riemann不变量(R1, R2, R3, R4)
 // 输出: 原始变量(rho, u, v, p)
 __device__ __forceinline__ void computePrimitiveFromRiemannInvarY(float R1, float R2, float R3, float R4,
                                                                   float &rho, float &u, float &v, float &p)
@@ -436,6 +481,24 @@ __global__ void initializeKernel(float *rho, float *rho_u, float *rho_v, float *
 #pragma endregion
 
 #pragma region 无粘性逻辑
+__device__ __forceinline__ void computeFarfieldRiemannInvarX(float rho_inf, float u_inf, float v_inf, float p_inf,
+                                                             float &R1_inf, float &R2_inf, float &R3_inf, float &R4_inf)
+{
+    // 计算来流的声速
+    float c_inf = sqrtf(GAMMA * p_inf / rho_inf);
+
+    // 优化：使用 exp(-GAMMA * log(rho)) 代替 pow(rho, -GAMMA)
+    float log_rho_inf = logf(rho_inf);
+    R1_inf = expf(-GAMMA * log_rho_inf) * p_inf; // 熵波不变量
+
+    R2_inf = v_inf; // 剪切波不变量（X方向是v）
+
+    // 预计算常数
+    constexpr float two_over_gamma_minus_1 = 2.0f / (GAMMA - 1.0f);
+    R3_inf = u_inf + c_inf * two_over_gamma_minus_1; // 向右声波不变量
+    R4_inf = u_inf - c_inf * two_over_gamma_minus_1; // 向左声波不变量
+}
+
 __device__ __forceinline__ void computeFarfieldRiemannInvarY(float rho_inf, float u_inf, float v_inf, float p_inf,
                                                              float &R1_inf, float &R2_inf, float &R3_inf, float &R4_inf)
 {
@@ -640,9 +703,29 @@ __device__ void hllcFluxX(
     float cL = sqrtf(GAMMA * pL / rhoL);
     float cR = sqrtf(GAMMA * pR / rhoR);
 
-    // Davis 波速估计(简化版本，直接使用左右状态)
-    float SL = fminf(uL - cL, uR - cR);
-    float SR = fmaxf(uL + cL, uR + cR);
+    // Roe 平均(用于更准确的波速估计)
+    // Roe平均密度权重
+    float sqrtRhoL = sqrtf(rhoL);
+    float sqrtRhoR = sqrtf(rhoR);
+    float denom = sqrtRhoL + sqrtRhoR + 1e-10f;
+
+    // Roe平均速度(两个分量都需要)
+    float u_roe = (sqrtRhoL * uL + sqrtRhoR * uR) / denom;
+    float v_roe = (sqrtRhoL * vL + sqrtRhoR * vR) / denom;
+
+    // Roe平均比焓: H = (E + p) / rho
+    float H_L = (EL + pL) / rhoL;
+    float H_R = (ER + pR) / rhoR;
+    float H_roe = (sqrtRhoL * H_L + sqrtRhoR * H_R) / denom;
+
+    // 从Roe平均量计算声速: c^2 = (gamma-1) * (H - 0.5*|v|^2)
+    // 注意: 必须减去完整的动能(u^2+v^2)，否则声速被高估导致多余数值耗散
+    float c_roe_sq = (GAMMA - 1.0f) * (H_roe - 0.5f * (u_roe * u_roe + v_roe * v_roe));
+    float c_roe = (c_roe_sq > 0.0f) ? sqrtf(c_roe_sq) : 0.5f * (cL + cR);
+
+    // Davis 波速估计(结合左右和Roe平均)
+    float SL = fminf(uL - cL, u_roe - c_roe);
+    float SR = fmaxf(uR + cR, u_roe + c_roe);
 
     // 熵修正，防止膨胀激波
     float delta = 0.1f * fmaxf(cL, cR);
@@ -743,13 +826,34 @@ __device__ void hllFluxY(
     float rhoT, float uT, float vT, float pT, float ET,
     float &g_rho, float &g_rho_u, float &g_rho_v, float &g_E)
 {
-    // 计算下方(Bottom)和上方(Top)的声速
-    float cB = sqrtf(GAMMA * pB / (rhoB + 1e-10f));
-    float cT = sqrtf(GAMMA * pT / (rhoT + 1e-10f));
+    // 强制物理约束
+    rhoB = fmaxf(rhoB, MIN_DENSITY);
+    rhoT = fmaxf(rhoT, MIN_DENSITY);
+    pB = fmaxf(pB, MIN_PRESSURE);
+    pT = fmaxf(pT, MIN_PRESSURE);
 
-    // 波速估计(Y方向，用v代替u)
-    float SB = fminf(vB - cB, vT - cT); // 向下传播的波速
-    float ST = fmaxf(vB + cB, vT + cT); // 向上传播的波速
+    // 计算声速
+    float cB = sqrtf(GAMMA * pB / rhoB);
+    float cT = sqrtf(GAMMA * pT / rhoT);
+
+    // Roe 平均(Y方向，主方向用v，但两个分量都需要)
+    float sqrtRhoB = sqrtf(rhoB);
+    float sqrtRhoT = sqrtf(rhoT);
+    float denom = sqrtRhoB + sqrtRhoT + 1e-10f;
+
+    float u_roe = (sqrtRhoB * uB + sqrtRhoT * uT) / denom;
+    float v_roe = (sqrtRhoB * vB + sqrtRhoT * vT) / denom;
+    float H_B = (EB + pB) / rhoB;
+    float H_T = (ET + pT) / rhoT;
+    float H_roe = (sqrtRhoB * H_B + sqrtRhoT * H_T) / denom;
+
+    // 注意: 必须减去完整的动能(u^2+v^2)，否则声速被高估导致多余数值耗散
+    float c_roe_sq = (GAMMA - 1.0f) * (H_roe - 0.5f * (u_roe * u_roe + v_roe * v_roe));
+    float c_roe = (c_roe_sq > 0.0f) ? sqrtf(c_roe_sq) : 0.5f * (cB + cT);
+
+    // 波速估计
+    float SB = fminf(vB - cB, v_roe - c_roe);
+    float ST = fmaxf(vT + cT, v_roe + c_roe);
 
     // 熵修正
     float delta = 0.1f * fmaxf(cB, cT);
@@ -808,9 +912,24 @@ __device__ void hllcFluxY(
     float cB = sqrtf(GAMMA * pB / rhoB);
     float cT = sqrtf(GAMMA * pT / rhoT);
 
-    // 波速估计(简化版本，直接使用上下状态)
-    float SB = fminf(vB - cB, vT - cT);
-    float ST = fmaxf(vB + cB, vT + cT);
+    // Roe 平均(与X方向一致，用于更准确的波速估计)
+    float sqrtRhoB = sqrtf(rhoB);
+    float sqrtRhoT = sqrtf(rhoT);
+    float denom_roe = sqrtRhoB + sqrtRhoT + 1e-10f;
+
+    float u_roe = (sqrtRhoB * uB + sqrtRhoT * uT) / denom_roe;
+    float v_roe = (sqrtRhoB * vB + sqrtRhoT * vT) / denom_roe;
+
+    float H_B = (EB + pB) / rhoB;
+    float H_T = (ET + pT) / rhoT;
+    float H_roe = (sqrtRhoB * H_B + sqrtRhoT * H_T) / denom_roe;
+
+    float c_roe_sq = (GAMMA - 1.0f) * (H_roe - 0.5f * (u_roe * u_roe + v_roe * v_roe));
+    float c_roe = (c_roe_sq > 0.0f) ? sqrtf(c_roe_sq) : 0.5f * (cB + cT);
+
+    // Davis 波速估计(结合左右和Roe平均)
+    float SB = fminf(vB - cB, v_roe - c_roe);
+    float ST = fmaxf(vT + cT, v_roe + c_roe);
 
     // 熵修正
     float delta = 0.1f * fmaxf(cB, cT);
@@ -1215,7 +1334,8 @@ __global__ void updateKernel(
     float dFy_rho_e = (flux_rho_e_y[idx] - flux_rho_e_y[idx_jm1]) / dy;
 
     // 处理边界通量(域边界处单侧通量为零)
-    if (i == 0)
+    // i==0: 左边界面通量未定义; i==nx-1: 右边界面(i+1/2)通量未计算
+    if (i == 0 || i == nx - 1)
     {
         dFx_rho = dFx_rho_u = dFx_rho_v = dFx_E = dFx_rho_e = 0.0f;
     }
@@ -1392,17 +1512,45 @@ __global__ void applyBoundaryConditionsKernel(
         return;
     }
 
-    // ========== 流出边界(右侧) ==========
+    // ========== 流出边界(右侧) - 非反射特征边界条件 ==========
     if (ctype == CELL_OUTFLOW || i == nx - 1)
     {
-        // 零梯度外推
-        // 假设流出处的流场已经充分发展，物理量沿流向不变
-        int idx_im1 = j * nx + (i - 1);
-        rho[idx] = rho[idx_im1];
-        rho_u[idx] = rho_u[idx_im1];
-        rho_v[idx] = rho_v[idx_im1];
-        E[idx] = E[idx_im1];
-        rho_e[idx] = rho_e[idx_im1];
+        float rho_loc = fmaxf(rho[idx], MIN_DENSITY);
+        // 从守恒变量计算原始变量
+        float u_loc, v_loc, p_loc, c_loc, t_loc;
+        computePrimitivesKernelInline(rho[idx], rho_u[idx], rho_v[idx], E[idx], rho_e[idx], u_loc, v_loc, p_loc, t_loc);
+        c_loc = sqrtf(GAMMA * p_loc / rho_loc); // 局部声速
+
+        // 判断X方向的特征波是否流出（右边界）
+        // 对于右边界，流出意味着特征速度 > 0
+        bool is_R1_out = u_loc > 0.0f;         // R1（熵波）特征速度 = u
+        bool is_R2_out = u_loc > 0.0f;         // R2（剪切波）特征速度 = u
+        bool is_R3_out = u_loc + c_loc > 0.0f; // R3（向右声波）特征速度 = u + c
+        bool is_R4_out = u_loc - c_loc > 0.0f; // R4（向左声波）特征速度 = u - c
+
+        // 计算局部的Riemann不变量
+        float R1, R2, R3, R4;
+        computeRiemannInvarFromPrimitiveX(rho[idx], u_loc, v_loc, p_loc, R1, R2, R3, R4);
+        
+        // 计算远场（来流）的Riemann不变量
+        float R1_inf, R2_inf, R3_inf, R4_inf;
+        computeFarfieldRiemannInvarX(rho_inf, u_inf, v_inf, p_inf, R1_inf, R2_inf, R3_inf, R4_inf);
+
+        // 根据特征波方向选择Riemann不变量
+        // 流出的波使用局部值，流入的波使用远场值
+        R1 = is_R1_out ? R1 : R1_inf;
+        R2 = is_R2_out ? R2 : R2_inf;
+        R3 = is_R3_out ? R3 : R3_inf;
+        R4 = is_R4_out ? R4 : R4_inf;
+
+        // 从Riemann不变量重构原始变量
+        computePrimitiveFromRiemannInvarX(R1, R2, R3, R4, rho[idx], u_loc, v_loc, p_loc);
+        
+        // 更新守恒变量
+        rho_u[idx] = rho[idx] * u_loc;
+        rho_v[idx] = rho[idx] * v_loc;
+        rho_e[idx] = p_loc / (GAMMA - 1.0f);
+        E[idx] = rho_e[idx] + 0.5f * rho[idx] * (u_loc * u_loc + v_loc * v_loc);
         return;
     }
 
@@ -1668,55 +1816,7 @@ __global__ void applyBoundaryConditionsKernel(
     }
 }
 
-// 功能:计算最大波速(用于CFL条件的时间步长限制)
-// 输入:速度场 u,v, 压强场 p, 密度场 rho, 网格尺寸 nx, ny
-// 输出:每个块的最大波速(通过原子操作写入全局内存)
-// 说明:波速 = |v| + c，其中 c 是声速
-__global__ void computeMaxWaveSpeedKernel(
-    const float *u, const float *v, const float *p, const float *rho,
-    float *max_speed, int nx, int ny)
-{
-    // 使用共享内存进行块内归约
-    extern __shared__ float sdata[];
-
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int tid = threadIdx.y * blockDim.x + threadIdx.x; // 线程在块内的1D索引
-    int idx = j * nx + i;
-
-    float local_max = 0.0f;
-
-    // 每个线程计算自己负责的网格的波速
-    if (i < nx && j < ny)
-    {
-        // 声速: c = sqrt(gamma * p / rho)
-        float c = sqrtf(GAMMA * p[idx] / (rho[idx] + 1e-10f));
-        // 波速 = 速度大小 + 声速
-        float speed = fabsf(u[idx]) + fabsf(v[idx]) + c;
-        local_max = speed;
-    }
-
-    // 写入共享内存
-    sdata[tid] = local_max;
-    __syncthreads(); // 等待所有线程写入完成
-
-    // 块内归约(树形归约)
-    // 每次迭代将数组大小减半，取较大值
-    for (int s = (blockDim.x * blockDim.y) / 2; s > 0; s >>= 1)
-    {
-        if (tid < s)
-        {
-            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
-        }
-        __syncthreads();
-    }
-
-    // 线程0将块的最大值写入全局内存(使用原子操作保证线程安全)
-    if (tid == 0)
-    {
-        atomicMax((int *)max_speed, __float_as_int(sdata[0]));
-    }
-}
+// [已删除] computeMaxWaveSpeedKernel: 此核函数从未被调用，实际使用 maxWaveSpeedKernel (统计工具区)
 #pragma endregion
 
 #pragma region 有粘性逻辑
@@ -2198,18 +2298,13 @@ float CFDSolver::launchComputeMaxViscousNumber(const float *mu, const float *rho
     int threads = 256;
     int blocks = std::min((n + threads - 1) / threads, 1024);
 
-    // 分配设备内存存储每个块的结果
-    float *d_block_results;
-    cudaMalloc(&d_block_results, blocks * sizeof(float));
-
-    // 启动核函数
+    // 使用预分配的归约缓冲区(避免每次调用的 cudaMalloc/cudaFree 开销)
     maxViscousNumberKernel<<<blocks, threads, threads * sizeof(float)>>>(
-        mu, rho, d_block_results, n);
+        mu, rho, d_reduction_buffer_, n);
 
     // 将块结果拷贝回主机并找到最大值
     std::vector<float> h_block_results(blocks);
-    cudaMemcpy(h_block_results.data(), d_block_results, blocks * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_block_results);
+    cudaMemcpy(h_block_results.data(), d_reduction_buffer_, blocks * sizeof(float), cudaMemcpyDeviceToHost);
 
     float result = 0.0f;
     for (int i = 0; i < blocks; i++)
@@ -2269,15 +2364,12 @@ float CFDSolver::launchComputeMaxWaveSpeed(const float *u, const float *v, const
     int threads = 256;
     int blocks = std::min((n + threads - 1) / threads, 1024);
 
-    float *d_block_results;
-    cudaMalloc(&d_block_results, blocks * sizeof(float));
-
+    // 使用预分配的归约缓冲区(避免每次调用的 cudaMalloc/cudaFree 开销)
     maxWaveSpeedKernel<<<blocks, threads, threads * sizeof(float)>>>(
-        u, v, p, rho, d_block_results, n);
+        u, v, p, rho, d_reduction_buffer_, n);
 
     std::vector<float> h_block_results(blocks);
-    cudaMemcpy(h_block_results.data(), d_block_results, blocks * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_block_results);
+    cudaMemcpy(h_block_results.data(), d_reduction_buffer_, blocks * sizeof(float), cudaMemcpyDeviceToHost);
 
     float result = 0.0f;
     for (int i = 0; i < blocks; i++)
@@ -2288,40 +2380,98 @@ float CFDSolver::launchComputeMaxWaveSpeed(const float *u, const float *v, const
     return result;
 }
 
+// 功能:归约计算全场最大马赫数(每个单元独立计算 Ma = |v| / c_local)
+__global__ void maxMachKernel(const float *u, const float *v,
+                              const float *p, const float *rho,
+                              float *block_results, int n)
+{
+    extern __shared__ float sdata[];
+
+    unsigned int tid = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float local_max = 0.0f;
+    while (i < n)
+    {
+        float rho_val = rho[i] + 1e-10f;
+        float speed = sqrtf(u[i] * u[i] + v[i] * v[i]);
+        float c = sqrtf(GAMMA * fmaxf(p[i], MIN_PRESSURE) / rho_val);
+        float mach = speed / (c + 1e-10f);
+        local_max = fmaxf(local_max, mach);
+        i += blockDim.x * gridDim.x;
+    }
+
+    sdata[tid] = local_max;
+    __syncthreads();
+
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0)
+    {
+        block_results[blockIdx.x] = sdata[0];
+    }
+}
+
 float CFDSolver::launchComputeMaxMach(const float *u, const float *v, const float *p,
                                       const float *rho, int nx, int ny)
 {
-    // 简化实现:估算最大马赫数
-    float max_speed = launchComputeMaxWaveSpeed(u, v, p, rho, nx, ny);
+    int n = nx * ny;
+    int threads = 256;
+    int blocks = std::min((n + threads - 1) / threads, 1024);
 
-    // 使用来流声速作为参考(粗略估计)
-    float c_inf = sqrtf(GAMMA * 101325.0f / 1.225f);
-    return max_speed / c_inf;
+    // 使用预分配的归约缓冲区
+    maxMachKernel<<<blocks, threads, threads * sizeof(float)>>>(
+        u, v, p, rho, d_reduction_buffer_, n);
+
+    std::vector<float> h_block_results(blocks);
+    cudaMemcpy(h_block_results.data(), d_reduction_buffer_, blocks * sizeof(float), cudaMemcpyDeviceToHost);
+
+    float result = 0.0f;
+    for (int i = 0; i < blocks; i++)
+    {
+        result = std::max(result, h_block_results[i]);
+    }
+
+    return result;
 }
 
-// 归约核函数实现(使用CUB库)
+// 归约核函数实现(使用CUB库，复用预分配缓冲区)
 float CFDSolver::launchComputeMaxTemperature(const float *T, int nx, int ny)
 {
-    float *d_out;
-    cudaMalloc(&d_out, sizeof(float));
+    // 使用预分配的归约缓冲区:
+    // d_reduction_buffer_[0] 用于输出结果
+    // d_reduction_buffer_ + 64 及之后 用于CUB临时存储(对齐到256字节)
+    float *d_out = d_reduction_buffer_;
+    void *d_temp = (void *)(d_reduction_buffer_ + 64); // 偏移256字节作为临时存储
+    size_t available_temp = 65536 - 256;                // 可用临时空间
 
-    // 第一次调用确定临时存储大小
-    void *d_temp = nullptr;
+    // 查询CUB所需临时存储大小
     size_t temp_bytes = 0;
-    cub::DeviceReduce::Max(d_temp, temp_bytes, T, d_out, nx * ny);
+    cub::DeviceReduce::Max(nullptr, temp_bytes, T, d_out, nx * ny);
 
-    // 分配临时存储
-    cudaMalloc(&d_temp, temp_bytes);
-
-    // 第二次调用执行归约
-    cub::DeviceReduce::Max(d_temp, temp_bytes, T, d_out, nx * ny);
+    if (temp_bytes > available_temp)
+    {
+        // 极端情况:预分配空间不足，回退到动态分配
+        void *d_temp_alloc;
+        cudaMalloc(&d_temp_alloc, temp_bytes);
+        cub::DeviceReduce::Max(d_temp_alloc, temp_bytes, T, d_out, nx * ny);
+        cudaFree(d_temp_alloc);
+    }
+    else
+    {
+        cub::DeviceReduce::Max(d_temp, temp_bytes, T, d_out, nx * ny);
+    }
 
     // 拷贝结果回主机
     float result;
     cudaMemcpy(&result, d_out, sizeof(float), cudaMemcpyDeviceToHost);
-
-    cudaFree(d_temp);
-    cudaFree(d_out);
 
     return result;
 }
@@ -2388,8 +2538,8 @@ void CFDSolver::allocateMemory()
     CUDA_CHECK(cudaMalloc(&d_flux_E_y_, size));
     CUDA_CHECK(cudaMalloc(&d_flux_rho_e_y_, size));
 
-    // 6. 分配归约缓冲区
-    CUDA_CHECK(cudaMalloc(&d_reduction_buffer_, sizeof(float)));
+    // 6. 分配归约缓冲区(64KB，复用于所有归约操作，避免每次调用时动态分配)
+    CUDA_CHECK(cudaMalloc(&d_reduction_buffer_, 65536));
 
     // 7. 分配粘性相关数组(Navier-Stokes)
     CUDA_CHECK(cudaMalloc(&d_mu_, size));     // 动力粘性系数
@@ -2546,6 +2696,9 @@ void CFDSolver::reset(const SimParams &params)
     launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                   d_u_, d_v_, d_p_, d_T_, _nx, _ny);
 
+    // 5. 初始化粘性场(确保 computeStableTimeStep 首次调用时 d_mu_ 有效)
+    launchComputeViscosityKernel(d_T_, d_mu_, d_k_, _nx, _ny);
+
     // 同步确保完成
     CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -2558,9 +2711,9 @@ void CFDSolver::reset(const SimParams &params)
 // 说明:同时考虑对流CFL和扩散CFL条件
 float CFDSolver::computeStableTimeStep(const SimParams &params)
 {
-    // 先计算原始变量
-    launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
-                                  d_u_, d_v_, d_p_, d_T_, _nx, _ny);
+    // 原始变量(d_u_, d_v_, d_p_, d_T_)已在 reset() 或上一步 step() 结尾计算完毕
+    // 粘性场(d_mu_)同样已在 reset() 或上一步 step() 中计算完毕
+    // 因此这里无需重复计算，直接使用已有数据
 
     // 使用归约找到最大波速
     float max_speed = launchComputeMaxWaveSpeed(d_u_, d_v_, d_p_, d_rho_, _nx, _ny);
@@ -2575,10 +2728,7 @@ float CFDSolver::computeStableTimeStep(const SimParams &params)
     // 如果启用粘性，还需检查扩散CFL条件
     if (params.enable_viscosity)
     {
-        // 计算粘性场
-        launchComputeViscosityKernel(d_T_, d_mu_, d_k_, _nx, _ny);
-
-        // 找到最大运动粘性系数 nu = mu/rho
+        // 找到最大运动粘性系数 nu = mu/rho (使用已有的 d_mu_)
         float max_nu = launchComputeMaxViscousNumber(d_mu_, d_rho_, _nx, _ny);
 
         // 扩散CFL条件: dt <= CFL_visc * dx^2 / nu
@@ -2597,6 +2747,10 @@ float CFDSolver::computeStableTimeStep(const SimParams &params)
 // 说明:根据是否启用粘性选择不同的求解策略
 void CFDSolver::step(SimParams &params)
 {
+    // 注意: 原始变量(d_u_, d_v_, d_p_, d_T_)在进入此函数时已由
+    //       reset() 或上一步 step() 结尾的 computePrimitives 计算完毕，
+    //       因此无需在函数开头重复计算
+
     if (params.enable_viscosity)
     {
         // ========== Navier-Stokes求解器(Strang算子分裂) ==========
@@ -2606,9 +2760,7 @@ void CFDSolver::step(SimParams &params)
         // 3. 扩散半步(dt/2)
         // 这样做二阶精度且保持稳定性
 
-        // 步骤1: 扩散半步
-        launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
-                                      d_u_, d_v_, d_p_, d_T_, _nx, _ny);
+        // 步骤1: 扩散半步(使用已有的原始变量)
         launchComputeViscosityKernel(d_T_, d_mu_, d_k_, _nx, _ny);
         launchComputeStressTensorKernel(d_u_, d_v_, d_mu_, d_tau_xx_, d_tau_yy_, d_tau_xy_,
                                         d_cell_type_, params.dx, params.dy, _nx, _ny);
@@ -2619,7 +2771,7 @@ void CFDSolver::step(SimParams &params)
                                   d_u_, d_v_, d_cell_type_,
                                   params.dt * 0.5f, params.dx, params.dy, _nx, _ny);
 
-        // 步骤2: 对流全步(与欧拉求解器相同)
+        // 步骤2: 对流全步(扩散半步修改了守恒变量，需重新计算原始变量)
         launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                       d_u_, d_v_, d_p_, d_T_, _nx, _ny);
         launchComputeFluxesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
@@ -2640,7 +2792,7 @@ void CFDSolver::step(SimParams &params)
         std::swap(d_E_, d_E_new_);
         std::swap(d_rho_e_, d_rho_e_new_);
 
-        // 步骤3: 扩散半步
+        // 步骤3: 扩散半步(对流步修改了守恒变量，需重新计算原始变量)
         launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                       d_u_, d_v_, d_p_, d_T_, _nx, _ny);
         launchComputeViscosityKernel(d_T_, d_mu_, d_k_, _nx, _ny);
@@ -2656,18 +2808,16 @@ void CFDSolver::step(SimParams &params)
     else
     {
         // ========== 原始欧拉求解器(无粘性) ==========
-        // 1. 计算原始变量(使用双能量法)
-        launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
-                                      d_u_, d_v_, d_p_, d_T_, _nx, _ny);
+        // 原始变量已由上一步结尾计算完毕，直接使用
 
-        // 2. 计算通量(包括内能通量)
+        // 1. 计算通量(包括内能通量)
         launchComputeFluxesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                   d_u_, d_v_, d_p_, d_T_, d_cell_type_,
                                   d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
                                   d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
                                   params, _nx, _ny);
 
-        // 3. 更新守恒变量(包括内能)
+        // 2. 更新守恒变量(包括内能)
         launchUpdateKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                            d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
                            d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
@@ -2675,7 +2825,7 @@ void CFDSolver::step(SimParams &params)
                            d_rho_new_, d_rho_u_new_, d_rho_v_new_, d_E_new_, d_rho_e_new_,
                            params, _nx, _ny);
 
-        // 4. 交换缓冲区指针(双缓冲技术，避免数据拷贝)
+        // 3. 交换缓冲区指针(双缓冲技术，避免数据拷贝)
         std::swap(d_rho_, d_rho_new_);
         std::swap(d_rho_u_, d_rho_u_new_);
         std::swap(d_rho_v_, d_rho_v_new_);
@@ -2686,6 +2836,11 @@ void CFDSolver::step(SimParams &params)
     // 应用边界条件
     launchApplyBoundaryConditionsKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                         d_cell_type_, d_sdf_, params, _nx, _ny);
+
+    // 计算原始变量：为下一次 computeStableTimeStep 和可视化准备最新的原始变量
+    // 这样 computeStableTimeStep 和 step() 之间不再有冗余的 computePrimitives 调用
+    launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+                                  d_u_, d_v_, d_p_, d_T_, _nx, _ny);
 
     // 更新时间和步数
     params.t_current += params.dt;
@@ -2778,7 +2933,7 @@ size_t CFDSolver::getSimulationMemoryUsage()
                                               // flux_rho_y, flux_rho_u_y, flux_rho_v_y, flux_E_y, flux_rho_e_y
 
     // 归约缓冲区
-    totalMemory += sizeof(float); // reduction_buffer (单个float)
+    totalMemory += 65536; // reduction_buffer (64KB，复用于所有归约操作)
 
     // 粘性相关数组 - 7个数组
     totalMemory += gridSize * floatSize * 7; // mu, k, tau_xx, tau_yy, tau_xy, qx, qy
