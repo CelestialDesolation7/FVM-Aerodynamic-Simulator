@@ -217,6 +217,7 @@ bool Renderer::initialize(int width, int height)
     // 创建物理场纹理
     glGenTextures(1, &fieldTexture_);
     glBindTexture(GL_TEXTURE_2D, fieldTexture_);
+    
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -424,6 +425,15 @@ void Renderer::unmapFieldTexture()
     // 这个传输在GPU内部进行，非常快
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_[readIndex]);
     glBindTexture(GL_TEXTURE_2D, fieldTexture_);
+    // 参数1-纹理目标：由上面这个函数绑定
+    // 参数2-mipmap层级（即是否使用缩略图）：0（不使用）
+    // 参数3-内部格式：GL_R32F（单通道32位浮点数）
+    // 参数4-宽度：nx
+    // 参数5-高度：ny
+    // 参数6-历史包袱：0（不使用）
+    // 参数7-格式：GL_RED（红色通道/单通道）
+    // 参数8-源数据的类型：GL_FLOAT（浮点数）
+    // 参数9-数据：nullptr（因为数据已经在PBO中，不需要提供CPU指针）
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx_, ny_, GL_RED, GL_FLOAT, nullptr);
     // 解绑
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -467,8 +477,6 @@ bool Renderer::createShaders()
 
     return shaderProgram_ != 0;
 }
-
-
 
 bool Renderer::createObstacleShader()
 {
