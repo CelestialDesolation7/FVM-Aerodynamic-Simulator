@@ -203,15 +203,10 @@ private:
     GLuint VAO_ = 0;
     GLuint VBO_ = 0;
 
-    // 网格线叠加层的着色器和缓冲区（现用于矢量箭头）
-    GLuint gridShaderProgram_ = 0;
-    GLuint gridVAO_ = 0;
-    GLuint gridVBO_ = 0;
-
     // 障碍物轮廓叠加层的着色器和缓冲区
-    GLuint circleShaderProgram_ = 0;
-    GLuint circleVAO_ = 0;
-    GLuint circleVBO_ = 0;
+    GLuint obstacleShaderProgram_ = 0;
+    GLuint obstacleVAO_ = 0;
+    GLuint obstacleVBO_ = 0;
 
     // 矢量箭头叠加层的着色器和缓冲区
     GLuint vectorShaderProgram_ = 0;

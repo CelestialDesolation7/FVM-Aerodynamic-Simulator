@@ -76,35 +76,6 @@ void main() {
 }
 )";
 
-// -----------------------------------------------------------
-// 网格线叠加层的顶点着色器
-// 作用：绘制网格线条（现用于矢量箭头）
-// -----------------------------------------------------------
-const char *gridVertexShader = R"(
-#version 330 core
-layout (location = 0) in vec2 aPos;
-
-uniform mat4 projection;
-
-void main() {
-    gl_Position = projection * vec4(aPos, 0.0, 1.0);
-}
-)";
-
-// -----------------------------------------------------------
-// 网格线叠加层的片元着色器
-// 作用：绘制半透明的网格线（现用于矢量箭头）
-// -----------------------------------------------------------
-const char *gridFragmentShader = R"(
-#version 330 core
-out vec4 FragColor;
-
-uniform vec4 gridColor;
-
-void main() {
-    FragColor = gridColor;
-}
-)";
 
 // -----------------------------------------------------------
 // 矢量箭头的顶点着色器
@@ -188,12 +159,6 @@ bool Renderer::initialize(int width, int height)
         return false;
     }
 
-    // 创建网格着色器程序
-    if (!createGridShader())
-    {
-        fprintf(stderr, "创建网格着色器失败\n");
-        return false;
-    }
 
     // 创建障碍物轮廓着色器程序
     if (!createCircleShader())
@@ -256,13 +221,10 @@ bool Renderer::initialize(int width, int height)
     // 创建色图纹理
     createColormapTexture();
 
-    // 创建网格线的 VAO/VBO（稍后填充数据）
-    glGenVertexArrays(1, &gridVAO_);
-    glGenBuffers(1, &gridVBO_);
 
     // 创建障碍物轮廓的 VAO/VBO
-    glGenVertexArrays(1, &circleVAO_);
-    glGenBuffers(1, &circleVBO_);
+    glGenVertexArrays(1, &obstacleVAO_);
+    glGenBuffers(1, &obstacleVBO_);
 
     // 创建矢量箭头的 VAO/VBO
     glGenVertexArrays(1, &vectorVAO_);
@@ -285,18 +247,12 @@ void Renderer::cleanup()
         glDeleteVertexArrays(1, &VAO_);
     if (VBO_)
         glDeleteBuffers(1, &VBO_);
-    if (gridShaderProgram_)
-        glDeleteProgram(gridShaderProgram_);
-    if (gridVAO_)
-        glDeleteVertexArrays(1, &gridVAO_);
-    if (gridVBO_)
-        glDeleteBuffers(1, &gridVBO_);
-    if (circleShaderProgram_)
-        glDeleteProgram(circleShaderProgram_);
-    if (circleVAO_)
-        glDeleteVertexArrays(1, &circleVAO_);
-    if (circleVBO_)
-        glDeleteBuffers(1, &circleVBO_);
+    if (obstacleShaderProgram_)
+        glDeleteProgram(obstacleShaderProgram_);
+    if (obstacleVAO_)
+        glDeleteVertexArrays(1, &obstacleVAO_);
+    if (obstacleVBO_)
+        glDeleteBuffers(1, &obstacleVBO_);
     if (vectorShaderProgram_)
         glDeleteProgram(vectorShaderProgram_);
     if (vectorVAO_)
@@ -483,21 +439,7 @@ bool Renderer::createShaders()
     return shaderProgram_ != 0;
 }
 
-bool Renderer::createGridShader()
-{
-    GLuint vertShader = compileShader(gridVertexShader, GL_VERTEX_SHADER);
-    GLuint fragShader = compileShader(gridFragmentShader, GL_FRAGMENT_SHADER);
 
-    if (!vertShader || !fragShader)
-        return false;
-
-    gridShaderProgram_ = linkProgram(vertShader, fragShader);
-
-    glDeleteShader(vertShader);
-    glDeleteShader(fragShader);
-
-    return gridShaderProgram_ != 0;
-}
 
 bool Renderer::createCircleShader()
 {
@@ -507,12 +449,12 @@ bool Renderer::createCircleShader()
     if (!vertShader || !fragShader)
         return false;
 
-    circleShaderProgram_ = linkProgram(vertShader, fragShader);
+    obstacleShaderProgram_ = linkProgram(vertShader, fragShader);
 
     glDeleteShader(vertShader);
     glDeleteShader(fragShader);
 
-    return circleShaderProgram_ != 0;
+    return obstacleShaderProgram_ != 0;
 }
 
 bool Renderer::createVectorShader()
@@ -856,8 +798,8 @@ void Renderer::render(const SimParams &params)
     // 第二层：渲染障碍物轮廓
     if (showObstacle_ && nx_ > 0 && ny_ > 0)
     {
-        glUseProgram(circleShaderProgram_);
-        glUniform4f(glGetUniformLocation(circleShaderProgram_, "circleColor"),
+        glUseProgram(obstacleShaderProgram_);
+        glUniform4f(glGetUniformLocation(obstacleShaderProgram_, "circleColor"),
                     0.0f, 0.0f, 0.0f, 1.0f); // 黑色轮廓
 
         // 生成障碍物顶点（在 NDC 坐标系中）
@@ -963,8 +905,8 @@ void Renderer::render(const SimParams &params)
         }
 
         // 上传障碍物顶点数据
-        glBindVertexArray(circleVAO_);
-        glBindBuffer(GL_ARRAY_BUFFER, circleVBO_);
+        glBindVertexArray(obstacleVAO_);
+        glBindBuffer(GL_ARRAY_BUFFER, obstacleVBO_);
         glBufferData(GL_ARRAY_BUFFER, obstacleVerts.size() * sizeof(float),
                      obstacleVerts.data(), GL_DYNAMIC_DRAW);
 
