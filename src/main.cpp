@@ -39,10 +39,7 @@ int stepsPerFrame = 1;       // 进行多少步仿真计算后再渲染一帧
 SimParams params;
 CFDSolver solver;
 
-// 主机存储缓冲区
-std::vector<float> h_temperature;
-std::vector<float> h_pressure;
-std::vector<float> h_density;
+// 主机存储缓冲区（仅保留矢量可视化和网格类型所需的缓冲区）
 std::vector<float> h_u;
 std::vector<float> h_v;
 std::vector<uint8_t> h_cellTypes;
@@ -72,10 +69,6 @@ constexpr float DENSITY_MIN_LIMIT = 0.01f;
 constexpr float DENSITY_MAX_LIMIT = 10.0f;
 constexpr float VELOCITY_MAX_LIMIT = 2000.0f;
 constexpr float MACH_MAX_LIMIT = 10.0f;
-
-// CUDA-OpenGL互操作控制
-bool enableCudaInterop = false;      // 是否启用互操作加速
-bool cudaInteropInitialized = false; // 互操作是否已初始化
 
 #pragma endregion
 
@@ -130,13 +123,9 @@ void setupImGuiFont(ImGuiIO &io, const std::string &fontPath, float fontSize)
 #pragma endregion
 
 #pragma region 求解器设定
-// 临时。后续应当改用互操作
 void resizeBuffers()
 {
     size_t size = params.nx * params.ny;
-    h_temperature.resize(size);
-    h_pressure.resize(size);
-    h_density.resize(size);
     h_u.resize(size);
     h_v.resize(size);
     h_cellTypes.resize(size);
@@ -151,6 +140,14 @@ bool initializeSimulation()
     // Get initial cell types
     solver.getCellTypes(h_cellTypes.data());
     renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
+
+    // 初始化GPU零拷贝互操作
+    if (!renderer.initCudaInterop(params.nx, params.ny))
+    {
+        std::cerr << "[错误] CUDA-OpenGL互操作初始化失败" << std::endl;
+        return false;
+    }
+
     return true;
 }
 #pragma endregion
@@ -201,37 +198,8 @@ void renderUI()
 
         ImGui::Separator();
 
-        // CUDA-OpenGL 互操作开关
-        if (ImGui::Checkbox(u8"启用GPU零拷贝加速", &enableCudaInterop))
-        {
-            if (enableCudaInterop && !cudaInteropInitialized)
-            {
-                // 尝试初始化互操作
-                if (renderer.initCudaInterop(params.nx, params.ny))
-                {
-                    cudaInteropInitialized = true;
-                    std::cout << "[主程序] CUDA-OpenGL互操作已启用" << std::endl;
-                }
-                else
-                {
-                    enableCudaInterop = false;
-                    std::cerr << "[主程序] CUDA-OpenGL互操作初始化失败" << std::endl;
-                }
-            }
-            else if (!enableCudaInterop && cudaInteropInitialized)
-            {
-                // 清理互操作资源
-                renderer.cleanupCudaInterop();
-                cudaInteropInitialized = false;
-                std::cout << "[主程序] CUDA-OpenGL互操作已禁用" << std::endl;
-            }
-        }
-        if (cudaInteropInitialized)
-        {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), u8"(已激活)");
-        }
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"零拷贝: GPU直接写入显示纹理，跳过所有中间传输");
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), u8"GPU零拷贝加速已启用");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), u8"GPU直接写入显示纹理，跳过所有中间传输");
     }
 
     ImGui::Separator();
@@ -289,12 +257,6 @@ void renderUI()
             // 重置时间记录
             params.t_current = 0.0f;
             params.step = 0;
-
-            // 如果互操作已启用，需要重新初始化互操作缓冲区
-            if (cudaInteropInitialized)
-            {
-                renderer.resizeCudaInterop(params.nx, params.ny);
-            }
         }
 
         ImGui::Text(u8"dx = %.4f m, dy = %.4f m", params.dx, params.dy);
@@ -609,84 +571,9 @@ void renderUI()
 #pragma endregion
 
 #pragma region 可视化函数
-// 使用传统CPU拷贝方式更新可视化（非零拷贝模式）
-// 数据流：GPU -> CPU -> GPU
-// 性能开销：两次PCIe总线传输
-void updateVisualizationCPU()
-{
-    float *fieldData = nullptr;
-    float minVal, maxVal;
-
-    switch (currentField)
-    {
-    case FieldType::TEMPERATURE:
-        // GPU -> CPU 拷贝
-        solver.getTemperatureField(h_temperature.data());
-        fieldData = h_temperature.data();
-        minVal = temperature_min;
-        maxVal = temperature_max;
-        break;
-
-    case FieldType::PRESSURE:
-        // GPU -> CPU 拷贝
-        solver.getPressureField(h_pressure.data());
-        fieldData = h_pressure.data();
-        minVal = pressure_min;
-        maxVal = pressure_max;
-        break;
-
-    case FieldType::DENSITY:
-        // GPU -> CPU 拷贝
-        solver.getDensityField(h_density.data());
-        fieldData = h_density.data();
-        minVal = density_min;
-        maxVal = density_max;
-        break;
-
-    case FieldType::VELOCITY_MAG:
-    {
-        // GPU -> CPU 拷贝
-        solver.getVelocityField(h_u.data(), h_v.data());
-        // CPU端计算速度大小
-        for (int i = 0; i < params.nx * params.ny; i++)
-        {
-            h_temperature[i] = sqrtf(h_u[i] * h_u[i] + h_v[i] * h_v[i]);
-        }
-        fieldData = h_temperature.data();
-        minVal = 0.0f;
-        maxVal = velocity_max;
-
-        // 更新速度场数据用于矢量可视化（CPU端缓存）
-        renderer.updateVelocityField(h_u.data(), h_v.data(), params.nx, params.ny, params.u_inf);
-        break;
-    }
-
-    case FieldType::MACH:
-    {
-        // GPU -> CPU 拷贝
-        solver.getVelocityField(h_u.data(), h_v.data());
-        solver.getTemperatureField(h_temperature.data());
-        // CPU端计算马赫数
-        for (int i = 0; i < params.nx * params.ny; i++)
-        {
-            float speed = sqrtf(h_u[i] * h_u[i] + h_v[i] * h_v[i]);
-            float c = sqrtf(GAMMA * R_GAS * h_temperature[i]);
-            h_pressure[i] = speed / (c + 1e-10f);
-        }
-        fieldData = h_pressure.data();
-        minVal = 0.0f;
-        maxVal = mach_max;
-        break;
-    }
-    }
-
-    // CPU -> GPU 上传到纹理
-    renderer.updateFieldCPU(fieldData, params.nx, params.ny, minVal, maxVal, currentField);
-}
-
-// 使用零拷贝方式更新可视化（完全避免GPU-GPU拷贝）
+// GPU零拷贝可视化更新
 // 数据流：保守变量(GPU) -> 直接计算到PBO(GPU) -> OpenGL纹理(GPU)
-void updateVisualizationInterop()
+void updateVisualization()
 {
     float minVal, maxVal;
 
@@ -720,8 +607,7 @@ void updateVisualizationInterop()
     float *devPtr = renderer.mapFieldTexture();
     if (!devPtr)
     {
-        std::cerr << "[警告] PBO映射失败，回退到CPU传输路径\n";
-        updateVisualizationCPU();
+        std::cerr << "[错误] PBO映射失败\n";
         return;
     }
 
@@ -751,19 +637,6 @@ void updateVisualizationInterop()
     }
 
     renderer.unmapFieldTexture();
-}
-
-// 统一的可视化更新函数
-void updateVisualization()
-{
-    if (enableCudaInterop && cudaInteropInitialized)
-    {
-        updateVisualizationInterop();
-    }
-    else
-    {
-        updateVisualizationCPU();
-    }
 }
 #pragma endregion
 

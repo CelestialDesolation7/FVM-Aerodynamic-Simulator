@@ -17,7 +17,7 @@ constexpr int BLOCK_SIZE = 16;
 // 功能:计算点到线段的最短距离(用于多边形SDF)
 // 输入:点坐标(px, py), 线段端点A(ax, ay)和B(bx, by)
 // 输出:点到线段的欧几里得距离
-__device__ float distToSegment(float px, float py, float ax, float ay, float bx, float by)
+__device__ __forceinline__ float distToSegment(float px, float py, float ax, float ay, float bx, float by)
 {
     // 线段向量 AB = B - A
     float abx = bx - ax, aby = by - ay;
@@ -44,7 +44,7 @@ __device__ float distToSegment(float px, float py, float ax, float ay, float bx,
 // 功能:计算二维向量的叉积(用于判断点的相对位置和环绕数)
 // 输入:两个二维向量 A(ax, ay) 和 B(bx, by)
 // 输出:叉积标量值 = ax*by - ay*bx (正值表示B在A的左侧)
-__device__ float cross2d(float ax, float ay, float bx, float by)
+__device__ __forceinline__ float cross2d(float ax, float ay, float bx, float by)
 {
     return ax * by - ay * bx;
 }
@@ -64,7 +64,7 @@ __device__ __forceinline__ float minmod(float a, float b)
 // 功能:Harten 熵修正，避免跨音速区域的数值不稳定(膨胀激波)
 // 输入:波速 lambda 和修正阈值 delta
 // 输出:修正后的波速绝对值
-__device__ float entropyFix(float lambda, float delta)
+__device__ __forceinline__ float entropyFix(float lambda, float delta)
 {
     // 当波速接近零时(亚音速区域)，使用二次插值避免除零
     if (fabsf(lambda) < delta)
@@ -94,7 +94,7 @@ __device__ __forceinline__ float musclSlope(float qm1, float q0, float qp1)
 // 功能:计算点到圆形的带符号距离
 // 输入:点坐标(px, py), 圆心(cx, cy), 半径 r
 // 输出:带符号距离(负值表示在圆内，正值表示在圆外)
-__device__ float sdfCircle(float px, float py, float cx, float cy, float r)
+__device__ __forceinline__ float sdfCircle(float px, float py, float cx, float cy, float r)
 {
     // SDF(圆) = |点到圆心距离| - 半径
     return sqrtf((px - cx) * (px - cx) + (py - cy) * (py - cy)) - r;
@@ -103,7 +103,7 @@ __device__ float sdfCircle(float px, float py, float cx, float cy, float r)
 // 功能:计算点到五角星的带符号距离
 // 输入:点坐标(px, py), 中心(cx, cy), 外接圆半径 r, 旋转角度 rotation
 // 输出:带符号距离
-__device__ float sdfStar(float px, float py, float cx, float cy, float r, float rotation)
+__device__ __forceinline__ float sdfStar(float px, float py, float cx, float cy, float r, float rotation)
 {
     const float PI = 3.14159265359f;
     const int N = 5;                // 5个尖角
@@ -170,7 +170,7 @@ __device__ float sdfStar(float px, float py, float cx, float cy, float r, float 
 // 功能:计算点到菱形(旋转正方形)的带符号距离
 // 输入:点坐标(px, py), 中心(cx, cy), 半边长 r, 旋转角度 rotation
 // 输出:带符号距离
-__device__ float sdfDiamond(float px, float py, float cx, float cy, float r, float rotation)
+__device__ __forceinline__ float sdfDiamond(float px, float py, float cx, float cy, float r, float rotation)
 {
     // 转换到局部坐标
     float lx = px - cx;
@@ -195,7 +195,7 @@ __device__ float sdfDiamond(float px, float py, float cx, float cy, float r, flo
 // 功能:计算点到胶囊形(圆角矩形)的带符号距离
 // 输入:点坐标(px, py), 中心(cx, cy), 长度 r, 旋转角度 rotation
 // 输出:带符号距离
-__device__ float sdfCapsule(float px, float py, float cx, float cy, float r, float rotation)
+__device__ __forceinline__ float sdfCapsule(float px, float py, float cx, float cy, float r, float rotation)
 {
     // 转换到局部坐标
     float lx = px - cx;
@@ -227,7 +227,7 @@ __device__ float sdfCapsule(float px, float py, float cx, float cy, float r, flo
 // 功能:计算点到三角形(等边，尖端向右)的带符号距离
 // 输入:点坐标(px, py), 中心(cx, cy), 外接圆半径 r, 旋转角度 rotation
 // 输出:带符号距离
-__device__ float sdfTriangle(float px, float py, float cx, float cy, float r, float rotation)
+__device__ __forceinline__ float sdfTriangle(float px, float py, float cx, float cy, float r, float rotation)
 {
     // 转换到局部坐标
     float lx = px - cx;
@@ -271,8 +271,8 @@ __device__ float sdfTriangle(float px, float py, float cx, float cy, float r, fl
 // 功能:统一的SDF计算接口，根据形状类型调用相应的SDF函数
 // 输入:点坐标(px, py), 形状中心(cx, cy), 尺寸参数 r, 旋转角度 rotation, 形状类型 shapeType
 // 输出:带符号距离
-__device__ float computeShapeSDF(float px, float py, float cx, float cy, float r,
-                                 float rotation, int shapeType)
+__device__ __forceinline__ float computeShapeSDF(float px, float py, float cx, float cy, float r,
+                                                 float rotation, int shapeType)
 {
     // 根据形状类型分发到具体的SDF函数
     switch (shapeType)
@@ -2887,34 +2887,11 @@ float CFDSolver::getMaxMach()
     return launchComputeMaxMach(d_u_, d_v_, d_p_, d_rho_, _nx, _ny);
 }
 
-// 功能:获取温度场(从GPU拷贝到CPU)
-// 输出:主机端温度数组 host_T
-// CPU路径：获取温度场（GPU->CPU拷贝）
-// 注意：此函数仅在非零拷贝模式下使用
-// 假设step()已经计算了最新的原始变量，因此不需要重复计算
-void CFDSolver::getTemperatureField(float *host_T)
-{
-    // 直接拷贝到主机（原始变量已在step()中计算）
-    CUDA_CHECK(cudaMemcpy(host_T, d_T_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToHost));
-}
-
-// 功能:获取压强场
-void CFDSolver::getPressureField(float *host_p)
-{
-    CUDA_CHECK(cudaMemcpy(host_p, d_p_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToHost));
-}
-
 // 功能:获取速度场
 void CFDSolver::getVelocityField(float *host_u, float *host_v)
 {
     CUDA_CHECK(cudaMemcpy(host_u, d_u_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(host_v, d_v_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToHost));
-}
-
-// 功能:获取密度场
-void CFDSolver::getDensityField(float *host_rho)
-{
-    CUDA_CHECK(cudaMemcpy(host_rho, d_rho_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToHost));
 }
 
 // 功能:获取网格类型

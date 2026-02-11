@@ -35,11 +35,8 @@ public:
     // 按照当前参数重置求解器状态
     void reset(const SimParams &params);
 
-    // CPU数据传输路径（非零拷贝模式）
-    void getTemperatureField(float *host_T);
-    void getPressureField(float *host_p);
+    // 主机端数据传输（矢量可视化和网格类型更新用）
     void getVelocityField(float *host_u, float *host_v);
-    void getDensityField(float *host_rho);
     void getCellTypes(uint8_t *host_types);
 
     // GPU零拷贝路径（CUDA-OpenGL互操作）

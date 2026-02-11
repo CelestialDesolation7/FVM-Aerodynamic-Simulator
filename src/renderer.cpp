@@ -110,7 +110,7 @@ void main() {
 // 障碍物轮廓线的顶点着色器
 // 作用：绘制障碍物的外形轮廓
 // -----------------------------------------------------------
-const char *circleVertexShader = R"(
+const char *obstacleVertexShader = R"(
 #version 330 core
 layout (location = 0) in vec2 aPos;
 
@@ -123,14 +123,14 @@ void main() {
 // 障碍物轮廓线的片元着色器
 // 作用：绘制障碍物的颜色
 // -----------------------------------------------------------
-const char *circleFragmentShader = R"(
+const char *obstacleFragmentShader = R"(
 #version 330 core
 out vec4 FragColor;
 
-uniform vec4 circleColor;
+uniform vec4 obstacleColor;
 
 void main() {
-    FragColor = circleColor;
+    FragColor = obstacleColor;
 }
 )";
 #pragma endregion
@@ -159,9 +159,8 @@ bool Renderer::initialize(int width, int height)
         return false;
     }
 
-
     // 创建障碍物轮廓着色器程序
-    if (!createCircleShader())
+    if (!createObstacleShader())
     {
         fprintf(stderr, "创建障碍物着色器失败\n");
         return false;
@@ -176,6 +175,7 @@ bool Renderer::initialize(int width, int height)
     }
 
     // 创建全屏四边形的 VAO 和 VBO
+    // NDC坐标范围是 [-1, 1]，纹理坐标范围是 [0, 1]
     float quadVertices[] = {
         // 位置          // 纹理坐标
         -1.0f, 1.0f, 0.0f, 1.0f,
@@ -194,13 +194,25 @@ bool Renderer::initialize(int width, int height)
     glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
 
     // 属性 0: 位置 (vec2)
+    // 参数 1: 要配置的顶点属性位置值,与顶点着色器中的 layout(location = 0) 对应
+    // 参数 2: 属性的组件数量，这里是 vec2，所以是 2
+    // 参数 3: 数据类型，这里是 GL_FLOAT
+    // 参数 4: 是否归一化，这里是 GL_FALSE
+    // 参数 5: 步长，即每个顶点的字节数，这里是 4 * sizeof(float)
+    // 参数 6: 偏移量，这里是 0，因为位置数据在每个顶点的开始
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
-    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(0);   // 启用位置属性
     // 属性 1: 纹理坐标 (vec2)
+    // 参数 1: 要配置的顶点属性位置值,与顶点着色器中的 layout(location = 1) 对应
+    // 参数 2: 属性的组件数量，这里是 vec2，所以是 2
+    // 参数 3: 数据类型，这里是 GL_FLOAT
+    // 参数 4: 是否归一化，这里是 GL_FALSE
+    // 参数 5: 步长，即每个顶点的字节数，这里是 4 * sizeof(float)
+    // 参数 6: 偏移量，这里是 2 * sizeof(float)，因为纹理坐标在每个顶点的第二个位置
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
-    glEnableVertexAttribArray(1);
+    glEnableVertexAttribArray(1);   // 启用纹理坐标属性
 
-    glBindVertexArray(0);
+    glBindVertexArray(0);   // 解绑VAO
 
     // 创建物理场纹理
     glGenTextures(1, &fieldTexture_);
@@ -221,7 +233,7 @@ bool Renderer::initialize(int width, int height)
     // 创建色图纹理
     createColormapTexture();
 
-
+    // 以下属性的值在这里无法确定，会在第一次渲染时更新
     // 创建障碍物轮廓的 VAO/VBO
     glGenVertexArrays(1, &obstacleVAO_);
     glGenBuffers(1, &obstacleVBO_);
@@ -229,6 +241,21 @@ bool Renderer::initialize(int width, int height)
     // 创建矢量箭头的 VAO/VBO
     glGenVertexArrays(1, &vectorVAO_);
     glGenBuffers(1, &vectorVBO_);
+
+    // 缓存uniform位置并设置常量 uniform（仅需设置一次）
+    loc_minVal_ = glGetUniformLocation(shaderProgram_, "minVal");
+    loc_maxVal_ = glGetUniformLocation(shaderProgram_, "maxVal");
+
+    glUseProgram(shaderProgram_);
+    glUniform1i(glGetUniformLocation(shaderProgram_, "fieldTexture"), 0);
+    glUniform1i(glGetUniformLocation(shaderProgram_, "colormapTexture"), 1);
+    glUniform1i(glGetUniformLocation(shaderProgram_, "cellTypeTexture"), 2);
+
+    glUseProgram(obstacleShaderProgram_);
+    glUniform4f(glGetUniformLocation(obstacleShaderProgram_, "obstacleColor"),
+                0.0f, 0.0f, 0.0f, 1.0f);
+
+    glUseProgram(0);
 
     return true;
 }
@@ -357,7 +384,7 @@ float *Renderer::mapFieldTexture()
         return nullptr;
     }
 
-    // 映射当前写入PBO
+    // 映射当前writeIndex_对应的CUDA PBO资源，使得OpenGL无法访问它，CUDA可以写入
     cudaError_t err = cudaGraphicsMapResources(1, &cudaPBOResource_[writeIndex_], 0);
     if (err != cudaSuccess)
     {
@@ -365,13 +392,14 @@ float *Renderer::mapFieldTexture()
         return nullptr;
     }
 
-    // 获取设备指针
+    // 获取设备指针（显卡内部地址）和大小
     float *devPtr = nullptr;
     size_t size = 0;
     err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void **>(&devPtr), &size, cudaPBOResource_[writeIndex_]);
     if (err != cudaSuccess)
     {
         fprintf(stderr, "[CUDA互操作] 获取设备指针失败: %s\n", cudaGetErrorString(err));
+        // 避免资源泄漏导致死锁，立即取消映射
         cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
         return nullptr;
     }
@@ -385,7 +413,7 @@ void Renderer::unmapFieldTexture()
     if (!cudaPBOResource_[writeIndex_])
         return;
 
-    // 取消当前写入PBO的CUDA映射
+    // 取消当前writeIndex_对应的CUDA PBO资源映射，这将允许OpenGL访问它
     cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
 
     // 交换缓冲区索引：下一帧CUDA写入另一个PBO
@@ -397,6 +425,7 @@ void Renderer::unmapFieldTexture()
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_[readIndex]);
     glBindTexture(GL_TEXTURE_2D, fieldTexture_);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx_, ny_, GL_RED, GL_FLOAT, nullptr);
+    // 解绑
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
@@ -441,10 +470,10 @@ bool Renderer::createShaders()
 
 
 
-bool Renderer::createCircleShader()
+bool Renderer::createObstacleShader()
 {
-    GLuint vertShader = compileShader(circleVertexShader, GL_VERTEX_SHADER);
-    GLuint fragShader = compileShader(circleFragmentShader, GL_FRAGMENT_SHADER);
+    GLuint vertShader = compileShader(obstacleVertexShader, GL_VERTEX_SHADER);
+    GLuint fragShader = compileShader(obstacleFragmentShader, GL_FRAGMENT_SHADER);
 
     if (!vertShader || !fragShader)
         return false;
@@ -700,37 +729,6 @@ void Renderer::setColormap(ColormapType cmap)
 #pragma endregion
 
 #pragma region 数据更新
-// 更新物理场数据（CPU路径 - 仅在非零拷贝模式下使用）
-// 此函数会产生CPU->GPU的数据传输（通过PCIe总线）
-void Renderer::updateFieldCPU(const float *data, int nx, int ny,
-                              float minVal, float maxVal, FieldType type)
-{
-    // 零拷贝模式下不应调用此函数
-    if (cudaInteropEnabled_)
-    {
-        fprintf(stderr, "[警告] 零拷贝模式下调用了CPU数据传输路径，这会产生不必要的开销！\n");
-    }
-
-    nx_ = nx;
-    ny_ = ny;
-    minVal_ = minVal;
-    maxVal_ = maxVal;
-    fieldType_ = type;
-
-    // 上传数据到纹理（CPU -> GPU传输）
-    glBindTexture(GL_TEXTURE_2D, fieldTexture_);
-    // 参数1-纹理目标：由上面这个函数绑定
-    // 参数2-mipmap层级（即是否使用缩略图）：0（不使用）
-    // 参数3-内部格式：GL_R32F（单通道32位浮点数）
-    // 参数4-宽度：nx
-    // 参数5-高度：ny
-    // 参数6-历史包袱：0（不使用）
-    // 参数7-格式：GL_RED（红色通道/单通道）
-    // 参数8-源数据的类型：GL_FLOAT（浮点数）
-    // 参数9-数据：data（物理场数据指针）
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, nx, ny, 0, GL_RED, GL_FLOAT, data);
-}
-
 // 更新网格类型数据
 void Renderer::updateCellTypes(const uint8_t *types, int nx, int ny)
 {
@@ -775,21 +773,18 @@ void Renderer::render(const SimParams &params)
     // 绑定物理场纹理到纹理单元 0
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, fieldTexture_);
-    glUniform1i(glGetUniformLocation(shaderProgram_, "fieldTexture"), 0);
 
     // 绑定色图纹理到纹理单元 1
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_1D, colormapTexture_);
-    glUniform1i(glGetUniformLocation(shaderProgram_, "colormapTexture"), 1);
 
     // 绑定网格类型纹理到纹理单元 2
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, cellTypeTexture_);
-    glUniform1i(glGetUniformLocation(shaderProgram_, "cellTypeTexture"), 2);
 
-    // 传递归一化所需的最小值和最大值
-    glUniform1f(glGetUniformLocation(shaderProgram_, "minVal"), minVal_);
-    glUniform1f(glGetUniformLocation(shaderProgram_, "maxVal"), maxVal_);
+    // 传递归一化所需的最小值和最大值（使用缓存的uniform位置）
+    glUniform1f(loc_minVal_, minVal_);
+    glUniform1f(loc_maxVal_, maxVal_);
 
     // 绘制全屏四边形
     glBindVertexArray(VAO_);
@@ -799,8 +794,7 @@ void Renderer::render(const SimParams &params)
     if (showObstacle_ && nx_ > 0 && ny_ > 0)
     {
         glUseProgram(obstacleShaderProgram_);
-        glUniform4f(glGetUniformLocation(obstacleShaderProgram_, "circleColor"),
-                    0.0f, 0.0f, 0.0f, 1.0f); // 黑色轮廓
+        // obstacleColor 已在初始化时设置
 
         // 生成障碍物顶点（在 NDC 坐标系中）
         std::vector<float> obstacleVerts;

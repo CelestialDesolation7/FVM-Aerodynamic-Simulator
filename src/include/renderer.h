@@ -112,16 +112,6 @@ public:
     // 清理所有已分配的 OpenGL 资源
     void cleanup();
 
-    // 更新物理场数据到 GPU 纹理（CPU路径 - 非零拷贝模式）
-    // 参数:
-    //   data - 主机端物理场数据指针
-    //   nx, ny - 网格尺寸
-    //   minVal, maxVal - 物理量的最小值和最大值（用于归一化）
-    //   type - 要显示的物理场类型
-    // 注意：此函数仅在非零拷贝模式下使用，会产生CPU->GPU数据传输
-    void updateFieldCPU(const float *data, int nx, int ny,
-                        float minVal, float maxVal, FieldType type);
-
     // 更新网格类型数据（用于显示障碍物和边界）
     void updateCellTypes(const uint8_t *types, int nx, int ny);
 
@@ -199,6 +189,10 @@ private:
     // OpenGL 着色器程序
     GLuint shaderProgram_ = 0; // 主渲染着色器
 
+    // 缓存的uniform位置（避免每帧字符串查找）
+    GLint loc_minVal_ = -1;
+    GLint loc_maxVal_ = -1;
+
     // OpenGL 顶点数组对象和缓冲区对象（主四边形）
     GLuint VAO_ = 0;
     GLuint VBO_ = 0;
@@ -229,9 +223,6 @@ private:
     float maxVal_ = 1.0f;
     FieldType fieldType_ = FieldType::TEMPERATURE;
 
-    // 主机端归一化数据缓冲区
-    std::vector<float> normalizedData_;
-
     // CUDA-OpenGL 互操作相关（双缓冲PBO）
     bool cudaInteropEnabled_ = false; // 互操作是否启用
 
@@ -246,7 +237,7 @@ private:
     // 着色器创建和编译的工具函数
     bool createShaders();                                     // 创建主渲染着色器
     bool createGridShader();                                  // 创建网格线着色器（现用于矢量箭头）
-    bool createCircleShader();                                // 创建障碍物轮廓着色器
+    bool createObstacleShader();                                // 创建障碍物轮廓着色器
     bool createVectorShader();                                // 创建矢量箭头着色器
     GLuint compileShader(const char *source, GLenum type);    // 编译单个着色器
     GLuint linkProgram(GLuint vertShader, GLuint fragShader); // 链接着色器程序
