@@ -239,9 +239,9 @@ bool Renderer::initialize(int width, int height)
     glGenVertexArrays(1, &obstacleVAO_);
     glGenBuffers(1, &obstacleVBO_);
 
-    // 创建矢量箭头的 VAO/VBO
+    // 创建矢量箭头的 VAO/VBO（双缓冲）
     glGenVertexArrays(1, &vectorVAO_);
-    glGenBuffers(1, &vectorVBO_);
+    glGenBuffers(2, vectorVBO_);
 
     // 缓存uniform位置并设置常量 uniform（仅需设置一次）
     loc_minVal_ = glGetUniformLocation(shaderProgram_, "minVal");
@@ -285,8 +285,8 @@ void Renderer::cleanup()
         glDeleteProgram(vectorShaderProgram_);
     if (vectorVAO_)
         glDeleteVertexArrays(1, &vectorVAO_);
-    if (vectorVBO_)
-        glDeleteBuffers(1, &vectorVBO_);
+    if (vectorVBO_[0] || vectorVBO_[1])
+        glDeleteBuffers(2, &vectorVBO_[0]);
 
     // 清理CUDA互操作资源
     cleanupCudaInterop();
@@ -372,9 +372,24 @@ void Renderer::cleanupCudaInterop()
         glDeleteBuffers(2, fieldPBO_);
         fieldPBO_[0] = fieldPBO_[1] = 0;
     }
+    
+    // 清理矢量箭头VBO的CUDA资源（双缓冲）
+    for (int i = 0; i < 2; i++)
+    {
+        if (cudaVectorVBOResource_[i])
+        {
+            cudaGraphicsUnregisterResource(cudaVectorVBOResource_[i]);
+            cudaVectorVBOResource_[i] = nullptr;
+        }
+    }
+    
     cudaInteropEnabled_ = false;
     mappedSize_ = 0;
     writeIndex_ = 0;
+    vectorVBOCapacity_ = 0;
+    vectorVertexCount_[0] = vectorVertexCount_[1] = 0;
+    vectorWriteIndex_ = 0;
+    vectorVBOMapped_ = false;
 }
 
 // 映射当前写入PBO以供CUDA写入，返回设备指针
@@ -752,19 +767,125 @@ void Renderer::updateCellTypes(const uint8_t *types, int nx, int ny)
 }
 
 // 更新速度场数据（用于矢量可视化）
-void Renderer::updateVelocityField(const float *u, const float *v, int nx, int ny, float u_inf)
+// 确保矢量VBO有足够的容量
+void Renderer::ensureVectorVBOCapacity(int requiredVertices)
 {
-    if (nx <= 0 || ny <= 0)
+    if (!cudaInteropEnabled_ || vectorVBO_[0] == 0 || vectorVBO_[1] == 0)
+    {
         return;
+    }
+    
+    // 如果容量足够，直接返回
+    if (vectorVBOCapacity_ >= static_cast<size_t>(requiredVertices))
+    {
+        return;
+    }
+    
+    // 取消旧的CUDA注册（两个VBO）
+    for (int i = 0; i < 2; i++)
+    {
+        if (cudaVectorVBOResource_[i])
+        {
+            cudaGraphicsUnregisterResource(cudaVectorVBOResource_[i]);
+            cudaVectorVBOResource_[i] = nullptr;
+        }
+    }
+    
+    // 重新分配两个VBO（每个顶点5个float：x, y, r, g, b）
+    size_t requiredBytes = requiredVertices * 5 * sizeof(float);
+    for (int i = 0; i < 2; i++)
+    {
+        glBindBuffer(GL_ARRAY_BUFFER, vectorVBO_[i]);
+        glBufferData(GL_ARRAY_BUFFER, requiredBytes, nullptr, GL_DYNAMIC_DRAW);
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    
+    vectorVBOCapacity_ = requiredVertices;
+    vectorVertexCount_[0] = vectorVertexCount_[1] = 0;
+    
+    std::cout << "[信息] 矢量VBO双缓冲重新分配: " << requiredVertices << " 顶点 ("
+              << (requiredBytes / 1024.0f / 1024.0f) << " MB × 2)\n";
+}
 
-    size_t size = static_cast<size_t>(nx) * ny;
-    velocityU_.resize(size);
-    velocityV_.resize(size);
+// 映射矢量VBO以供CUDA写入（双缓冲：映射当前writeIndex的VBO）
+float *Renderer::mapVectorVBO(int &outMaxVertices)
+{
+    if (!cudaInteropEnabled_ || vectorVBO_[vectorWriteIndex_] == 0)
+    {
+        outMaxVertices = 0;
+        return nullptr;
+    }
+    
+    if (vectorVBOMapped_)
+    {
+        std::cerr << "[警告] 矢量VBO已经处于映射状态\n";
+        outMaxVertices = 0;
+        return nullptr;
+    }
+    
+    // 确保当前writeIndex的VBO已注册
+    if (!cudaVectorVBOResource_[vectorWriteIndex_])
+    {
+        cudaError_t err = cudaGraphicsGLRegisterBuffer(
+            &cudaVectorVBOResource_[vectorWriteIndex_],
+            vectorVBO_[vectorWriteIndex_],
+            cudaGraphicsRegisterFlagsWriteDiscard);
+        
+        if (err != cudaSuccess)
+        {
+            std::cerr << "[错误] 注册矢量VBO[" << vectorWriteIndex_ << "]失败: " 
+                      << cudaGetErrorString(err) << "\n";
+            outMaxVertices = 0;
+            return nullptr;
+        }
+    }
+    
+    // 映射当前writeIndex的VBO资源
+    cudaError_t err = cudaGraphicsMapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "[错误] 映射矢量VBO[" << vectorWriteIndex_ << "]失败: " 
+                  << cudaGetErrorString(err) << "\n";
+        outMaxVertices = 0;
+        return nullptr;
+    }
+    
+    // 获取设备指针
+    float *devPtr = nullptr;
+    size_t mappedBytes = 0;
+    err = cudaGraphicsResourceGetMappedPointer((void **)&devPtr, &mappedBytes,
+                                               cudaVectorVBOResource_[vectorWriteIndex_]);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "[错误] 获取矢量VBO[" << vectorWriteIndex_ << "]设备指针失败: " 
+                  << cudaGetErrorString(err) << "\n";
+        cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
+        outMaxVertices = 0;
+        return nullptr;
+    }
+    
+    vectorVBOMapped_ = true;
+    outMaxVertices = static_cast<int>(vectorVBOCapacity_);
+    return devPtr;
+}
 
-    std::copy(u, u + size, velocityU_.begin());
-    std::copy(v, v + size, velocityV_.begin());
-
-    u_inf_ = u_inf;
+// 取消映射矢量VBO，交换缓冲区索引
+void Renderer::unmapVectorVBO(int actualVertices)
+{
+    if (!vectorVBOMapped_)
+    {
+        return;
+    }
+    
+    // 取消当前writeIndex的VBO映射
+    cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
+    vectorVBOMapped_ = false;
+    
+    // 保存当前VBO的顶点数量
+    vectorVertexCount_[vectorWriteIndex_] = actualVertices;
+    
+    // 交换缓冲区索引：下一次CUDA写入另一个VBO
+    vectorWriteIndex_ = 1 - vectorWriteIndex_;
 }
 #pragma endregion
 
@@ -920,109 +1041,29 @@ void Renderer::render(const SimParams &params)
         glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(obstacleVerts.size() / 2));
     }
 
-    // 第三层：渲染速度矢量箭头
-    if (showVectors_ && nx_ > 0 && ny_ > 0 && !velocityU_.empty() && !velocityV_.empty())
+    // 第三层：渲染速度矢量箭头（双缓冲）
+    // 注意：箭头顶点数据由solver生成，此处仅负责绘制
+    // 绘制readIndex的VBO（CUDA正在写入另一个VBO）
+    if (showVectors_)
     {
-        glUseProgram(vectorShaderProgram_);
-
-        // 生成矢量箭头顶点数据
-        // 格式: x, y, r, g, b (位置 + 颜色)
-        std::vector<float> vectorVerts;
-
-        // 计算屏幕宽高比，用于调整箭头显示
-        float aspectRatio = (float)width_ / (float)height_;
-        float domainAspect = (float)nx_ / (float)ny_;
-
-        // 箭头参数
-        const float arrowHeadAngle = 0.5f;  // 箭头头部张角（弧度）
-        const float arrowHeadLength = 0.3f; // 箭头头部相对于箭身的长度比例
-
-        // 根据密度设置计算步长
-        int step = vectorDensity_;
-
-        // 计算单个格子在NDC中的尺寸
-        float cellWidth = 2.0f / nx_;
-        float cellHeight = 2.0f / ny_;
-
-        // 箭头最大长度（相对于格子尺寸）
-        float maxArrowLength = std::min(cellWidth, cellHeight) * (step * 0.8f);
-
-        // 遍历网格，在每隔step个格子处绘制一个箭头
-        for (int j = step / 2; j < ny_; j += step)
+        int readIndex = 1 - vectorWriteIndex_;
+        int vertexCount = vectorVertexCount_[readIndex];
+        
+        if (vertexCount > 0)
         {
-            for (int i = step / 2; i < nx_; i += step)
-            {
-                int idx = j * nx_ + i;
-
-                // 获取该点的速度分量
-                float u = velocityU_[idx];
-                float v = velocityV_[idx];
-
-                // 计算速度大小
-                float speed = sqrtf(u * u + v * v);
-                if (speed < 1e-6f * u_inf_)
-                    continue; // 跳过速度接近零的点
-
-                // 归一化速度
-                float normalizedSpeed = std::min(speed / (u_inf_ * 1.5f), 1.0f);
-
-                // 计算箭头起点（NDC坐标）
-                float startX = (float)i / nx_ * 2.0f - 1.0f;
-                float startY = (float)j / ny_ * 2.0f - 1.0f;
-
-                // 计算箭头方向和长度
-                float dirX = u / speed;
-                float dirY = v / speed;
-                float arrowLength = maxArrowLength * normalizedSpeed;
-
-                // 箭头终点
-                float endX = startX + dirX * arrowLength;
-                float endY = startY + dirY * arrowLength;
-
-                // 使用黑色箭头，更加醒目
-                float r = 0.0f, g = 0.0f, b = 0.0f;
-
-                // 添加箭身线段
-                vectorVerts.insert(vectorVerts.end(), {startX, startY, r, g, b});
-                vectorVerts.insert(vectorVerts.end(), {endX, endY, r, g, b});
-
-                // 计算箭头头部的两个点
-                float headLen = arrowLength * arrowHeadLength;
-                float cosA = cosf(arrowHeadAngle);
-                float sinA = sinf(arrowHeadAngle);
-
-                // 旋转箭头方向得到头部两个边
-                float head1X = endX - headLen * (dirX * cosA - dirY * sinA);
-                float head1Y = endY - headLen * (dirX * sinA + dirY * cosA);
-                float head2X = endX - headLen * (dirX * cosA + dirY * sinA);
-                float head2Y = endY - headLen * (-dirX * sinA + dirY * cosA);
-
-                // 添加箭头头部两条线段
-                vectorVerts.insert(vectorVerts.end(), {endX, endY, r, g, b});
-                vectorVerts.insert(vectorVerts.end(), {head1X, head1Y, r, g, b});
-                vectorVerts.insert(vectorVerts.end(), {endX, endY, r, g, b});
-                vectorVerts.insert(vectorVerts.end(), {head2X, head2Y, r, g, b});
-            }
-        }
-
-        if (!vectorVerts.empty())
-        {
-            // 上传矢量箭头顶点数据
+            glUseProgram(vectorShaderProgram_);
             glBindVertexArray(vectorVAO_);
-            glBindBuffer(GL_ARRAY_BUFFER, vectorVBO_);
-            glBufferData(GL_ARRAY_BUFFER, vectorVerts.size() * sizeof(float),
-                         vectorVerts.data(), GL_DYNAMIC_DRAW);
-
-            // 位置属性
+            glBindBuffer(GL_ARRAY_BUFFER, vectorVBO_[readIndex]);
+            
+            // 配置顶点属性（位置和颜色）
             glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void *)0);
             glEnableVertexAttribArray(0);
-            // 颜色属性
             glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void *)(2 * sizeof(float)));
             glEnableVertexAttribArray(1);
 
-            // 绘制箭头（使用较粗的线条）
+            // 绘制箭头
             glLineWidth(2.0f);
-            glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(vectorVerts.size() / 5));
+            glDrawArrays(GL_LINES, 0, vertexCount);
         }
     }
 

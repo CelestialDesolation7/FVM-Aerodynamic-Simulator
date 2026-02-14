@@ -130,8 +130,16 @@ public:
     void setVectorDensity(int density) { vectorDensity_ = std::max(2, density); }
     int getVectorDensity() const { return vectorDensity_; }
 
-    // 更新速度场数据（用于矢量可视化）
-    void updateVelocityField(const float *u, const float *v, int nx, int ny, float u_inf);
+    // 确保矢量VBO有足够的容量
+    // 如果当前容量不足，会重新分配VBO并重新注册CUDA资源
+    void ensureVectorVBOCapacity(int requiredVertices);
+    
+    // 映射矢量VBO以供CUDA写入，返回设备指针和实际顶点容量
+    // 返回nullptr表示失败或未启用
+    float *mapVectorVBO(int &outMaxVertices);
+    
+    // 取消映射矢量VBO，设置实际使用的顶点数量
+    void unmapVectorVBO(int actualVertices);
 
     // 设置障碍物显示开关
     void setShowObstacle(bool show) { showObstacle_ = show; }
@@ -205,7 +213,16 @@ private:
     // 矢量箭头叠加层的着色器和缓冲区
     GLuint vectorShaderProgram_ = 0;
     GLuint vectorVAO_ = 0;
-    GLuint vectorVBO_ = 0;
+    GLuint vectorVBO_[2] = {0, 0};     // 双缓冲VBO
+    
+    // CUDA-OpenGL互操作：矢量箭头VBO（双缓冲）
+    // - 一个用于CUDA写入（vectorWriteIndex_指向）
+    // - 另一个用于OpenGL读取（1-vectorWriteIndex_指向）
+    cudaGraphicsResource *cudaVectorVBOResource_[2] = {nullptr, nullptr};
+    size_t vectorVBOCapacity_ = 0;     // 每个VBO容量（顶点数）
+    int vectorVertexCount_[2] = {0, 0}; // 每个VBO实际使用的顶点数
+    int vectorWriteIndex_ = 0;          // 当前CUDA写入的VBO索引（0或1）
+    bool vectorVBOMapped_ = false;     // VBO是否已映射
 
     // 渲染设置
     ColormapType colormap_ = ColormapType::JET; // 当前色图类型
@@ -213,10 +230,6 @@ private:
     int vectorDensity_ = 20;                    // 矢量箭头密度（每多少格子显示一个）
     bool showObstacle_ = true;                  // 是否显示障碍物轮廓
 
-    // 速度场数据（用于矢量可视化）
-    std::vector<float> velocityU_;
-    std::vector<float> velocityV_;
-    float u_inf_ = 1.0f; // 来流速度，用于归一化箭头长度
 
     // 当前物理场的值域范围
     float minVal_ = 0.0f;

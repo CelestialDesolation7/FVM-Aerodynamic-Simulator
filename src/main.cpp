@@ -18,6 +18,7 @@
 #include "renderer.h"
 
 #ifdef _WIN32
+#define NOMINMAX  // 防止Windows.h定义min/max宏
 #include <windows.h>
 #endif
 // clang-format on
@@ -39,9 +40,7 @@ int stepsPerFrame = 1;       // 进行多少步仿真计算后再渲染一帧
 SimParams params;
 CFDSolver solver;
 
-// 主机存储缓冲区（仅保留矢量可视化和网格类型所需的缓冲区）
-std::vector<float> h_u;
-std::vector<float> h_v;
+// 主机存储缓冲区（仅保留网格类型所需的缓冲区）
 std::vector<uint8_t> h_cellTypes;
 
 // 可视化
@@ -126,8 +125,6 @@ void setupImGuiFont(ImGuiIO &io, const std::string &fontPath, float fontSize)
 void resizeBuffers()
 {
     size_t size = params.nx * params.ny;
-    h_u.resize(size);
-    h_v.resize(size);
     h_cellTypes.resize(size);
 }
 
@@ -625,11 +622,6 @@ void updateVisualization()
         break;
     case FieldType::VELOCITY_MAG:
         solver.computeVelocityMagToDevice(devPtr);
-        if (renderer.getShowVectors())
-        {
-            solver.getVelocityField(h_u.data(), h_v.data());
-            renderer.updateVelocityField(h_u.data(), h_v.data(), params.nx, params.ny, params.u_inf);
-        }
         break;
     case FieldType::MACH:
         solver.computeMachToDevice(devPtr);
@@ -637,6 +629,44 @@ void updateVisualization()
     }
 
     renderer.unmapFieldTexture();
+    
+    // 生成矢量箭头（如果启用）
+    if (renderer.getShowVectors())
+    {
+        int step = renderer.getVectorDensity();
+        
+        // 计算箭头参数
+        const float arrowHeadAngle = 0.5f;
+        const float arrowHeadLength = 0.3f;
+        
+        // 计算单个格子在NDC中的尺寸
+        float cellWidth = 2.0f / params.nx;
+        float cellHeight = 2.0f / params.ny;
+        float maxArrowLength = std::min(cellWidth, cellHeight) * (step * 0.8f);
+        
+        // 计算最大可能的箭头数量（每个箭头8个顶点）
+        int numArrowsX = (params.nx + step - 1) / step;
+        int numArrowsY = (params.ny + step - 1) / step;
+        int maxVertices = numArrowsX * numArrowsY * 8;
+        
+        // 确保VBO有足够容量
+        renderer.ensureVectorVBOCapacity(maxVertices);
+        
+        // 映射VBO
+        int vboCapacity;
+        float *devVertexData = renderer.mapVectorVBO(vboCapacity);
+        if (devVertexData)
+        {
+            // 调用solver生成箭头
+            int numVertices = solver.generateVectorArrows(
+                devVertexData, vboCapacity,
+                step, params.u_inf,
+                maxArrowLength, arrowHeadAngle, arrowHeadLength);
+            
+            // 取消映射
+            renderer.unmapVectorVBO(numVertices);
+        }
+    }
 }
 #pragma endregion
 

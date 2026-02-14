@@ -45,6 +45,12 @@ public:
     void computeDensityToDevice(float *dev_dst);
     void computeVelocityMagToDevice(float *dev_dst);
     void computeMachToDevice(float *dev_dst);
+    
+    // 生成速度矢量箭头，直接写入OpenGL VBO
+    // 返回实际生成的顶点数，失败返回-1
+    int generateVectorArrows(float *dev_vertexData, int maxVertices,
+                            int step, float u_inf,
+                            float maxArrowLength, float arrowHeadAngle, float arrowHeadLength);
 
     // 获取网格尺寸
     int getNx() const { return _nx; }

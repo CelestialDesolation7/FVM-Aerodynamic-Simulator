@@ -3069,3 +3069,160 @@ void CFDSolver::computeMachToDevice(float *dev_dst)
     CUDA_CHECK(cudaGetLastError());
 }
 #pragma endregion
+
+#pragma region 矢量箭头生成（CUDA-OpenGL互操作）
+// CUDA kernel：GPU并行生成速度矢量箭头的顶点数据
+// 输入：速度场 u, v；网格尺寸 nx, ny；箭头参数
+// 输出：直接写入映射的OpenGL VBO
+__global__ void generateVectorArrowsKernel(
+    const float *u, const float *v,
+    float *vertexData,
+    int *atomicCounter,
+    int nx, int ny,
+    int step,
+    float u_inf,
+    float maxArrowLength,
+    float arrowHeadAngle,
+    float arrowHeadLength)
+{
+    // 计算当前线程对应的网格位置
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // 应用步长偏移，使箭头从网格中心位置开始
+    i = i * step + step / 2;
+    j = j * step + step / 2;
+
+    if (i >= nx || j >= ny)
+        return;
+
+    int idx = j * nx + i;
+
+    // 获取该点的速度分量
+    float u_val = u[idx];
+    float v_val = v[idx];
+
+    // 计算速度大小
+    float speed = sqrtf(u_val * u_val + v_val * v_val);
+    if (speed < 1e-6f * u_inf)
+        return; // 跳过速度接近零的点
+
+    // 归一化速度
+    float normalizedSpeed = fminf(speed / (u_inf * 1.5f), 1.0f);
+
+    // 计算箭头起点（NDC坐标）
+    float cellWidth = 2.0f / nx;
+    float cellHeight = 2.0f / ny;
+    float startX = (float)i / nx * 2.0f - 1.0f;
+    float startY = (float)j / ny * 2.0f - 1.0f;
+
+    // 计算箭头方向和长度
+    float dirX = u_val / speed;
+    float dirY = v_val / speed;
+    float arrowLength = maxArrowLength * normalizedSpeed;
+
+    // 箭头终点
+    float endX = startX + dirX * arrowLength;
+    float endY = startY + dirY * arrowLength;
+
+    // 使用黑色箭头
+    float r = 0.0f, g = 0.0f, b = 0.0f;
+
+    // 计算箭头头部的两个点
+    float headLen = arrowLength * arrowHeadLength;
+    float cosA = cosf(arrowHeadAngle);
+    float sinA = sinf(arrowHeadAngle);
+
+    // 旋转箭头方向得到头部两个边
+    float head1X = endX - headLen * (dirX * cosA - dirY * sinA);
+    float head1Y = endY - headLen * (dirX * sinA + dirY * cosA);
+    float head2X = endX - headLen * (dirX * cosA + dirY * sinA);
+    float head2Y = endY - headLen * (-dirX * sinA + dirY * cosA);
+
+    // 原子地获取顶点写入位置（每个箭头需要8个顶点：箭身2个 + 头部4个）
+    int vertexOffset = atomicAdd(atomicCounter, 8);
+
+    // 写入顶点数据（格式：x, y, r, g, b）
+    int baseIdx = vertexOffset * 5;
+
+    // 箭身线段
+    vertexData[baseIdx + 0] = startX;
+    vertexData[baseIdx + 1] = startY;
+    vertexData[baseIdx + 2] = r;
+    vertexData[baseIdx + 3] = g;
+    vertexData[baseIdx + 4] = b;
+
+    vertexData[baseIdx + 5] = endX;
+    vertexData[baseIdx + 6] = endY;
+    vertexData[baseIdx + 7] = r;
+    vertexData[baseIdx + 8] = g;
+    vertexData[baseIdx + 9] = b;
+
+    // 箭头头部第一条线段
+    vertexData[baseIdx + 10] = endX;
+    vertexData[baseIdx + 11] = endY;
+    vertexData[baseIdx + 12] = r;
+    vertexData[baseIdx + 13] = g;
+    vertexData[baseIdx + 14] = b;
+
+    vertexData[baseIdx + 15] = head1X;
+    vertexData[baseIdx + 16] = head1Y;
+    vertexData[baseIdx + 17] = r;
+    vertexData[baseIdx + 18] = g;
+    vertexData[baseIdx + 19] = b;
+
+    // 箭头头部第二条线段
+    vertexData[baseIdx + 20] = endX;
+    vertexData[baseIdx + 21] = endY;
+    vertexData[baseIdx + 22] = r;
+    vertexData[baseIdx + 23] = g;
+    vertexData[baseIdx + 24] = b;
+
+    vertexData[baseIdx + 25] = head2X;
+    vertexData[baseIdx + 26] = head2Y;
+    vertexData[baseIdx + 27] = r;
+    vertexData[baseIdx + 28] = g;
+    vertexData[baseIdx + 29] = b;
+}
+
+// 生成速度矢量箭头，直接写入OpenGL VBO
+int CFDSolver::generateVectorArrows(float *dev_vertexData, int maxVertices,
+                                   int step, float u_inf,
+                                   float maxArrowLength, float arrowHeadAngle, float arrowHeadLength)
+{
+    // 分配原子计数器（用于顶点索引）
+    int *d_counter;
+    CUDA_CHECK(cudaMalloc(&d_counter, sizeof(int)));
+    CUDA_CHECK(cudaMemset(d_counter, 0, sizeof(int)));
+
+    // 计算线程块和网格尺寸
+    // 每个线程负责一个可能的箭头位置
+    int numArrowsX = (_nx + step - 1) / step;
+    int numArrowsY = (_ny + step - 1) / step;
+
+    dim3 block(16, 16);
+    dim3 grid((numArrowsX + block.x - 1) / block.x,
+              (numArrowsY + block.y - 1) / block.y);
+
+    // 启动kernel
+    generateVectorArrowsKernel<<<grid, block>>>(
+        d_u_, d_v_,
+        dev_vertexData,
+        d_counter,
+        _nx, _ny,
+        step,
+        u_inf,
+        maxArrowLength,
+        arrowHeadAngle,
+        arrowHeadLength);
+
+    CUDA_CHECK(cudaGetLastError());
+
+    // 获取实际生成的顶点数量
+    int h_counter;
+    CUDA_CHECK(cudaMemcpy(&h_counter, d_counter, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_counter));
+
+    return h_counter; // 返回生成的顶点数量
+}
+#pragma endregion
