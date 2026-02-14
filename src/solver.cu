@@ -3111,8 +3111,6 @@ __global__ void generateVectorArrowsKernel(
     float normalizedSpeed = fminf(speed / (u_inf * 1.5f), 1.0f);
 
     // 计算箭头起点（NDC坐标）
-    float cellWidth = 2.0f / nx;
-    float cellHeight = 2.0f / ny;
     float startX = (float)i / nx * 2.0f - 1.0f;
     float startY = (float)j / ny * 2.0f - 1.0f;
 
