@@ -403,17 +403,25 @@ void renderUI()
         }
         if (params.obstacle_shape == ObstacleShape::STARSHIP)
         {
-            float wingRotationDeg = params.wing_rotation * PI / 180.0f;
+            bool wingChanged = false;
+            float wingRotationDeg = params.wing_rotation * 180.0f / PI;
             if (ImGui::SliderFloat(u8"襟翼旋转角度 (度)", &wingRotationDeg, 0.0f, 90.0f))
             {
                 params.wing_rotation = wingRotationDeg * PI / 180.0f;
-                changed = true;
+                wingChanged = true;
             }
             if (ImGui::InputFloat(u8"襟翼精确旋转角度 (度)", &wingRotationDeg))
             {
                 wingRotationDeg = std::clamp(wingRotationDeg, 0.0f, 90.0f);
                 params.wing_rotation = wingRotationDeg * PI / 180.0f;
-                changed = true;
+                wingChanged = true;
+            }
+            // 襟翼角度变化：动态更新，不重置仿真
+            if (wingChanged && !changed)
+            {
+                solver.updateWingRotation(params);
+                solver.getCellTypes(h_cellTypes.data());
+                renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
             }
         }
         if (changed)

@@ -34,6 +34,9 @@ public:
 
     // 按照当前参数重置求解器状态
     void reset(const SimParams &params);
+    
+    // 动态更新襟翼角度（不重置仿真，仅更新SDF/网格类型并修正新暴露区域）
+    void updateWingRotation(const SimParams &params);
 
     // 主机端数据传输（矢量可视化和网格类型更新用）
     void getVelocityField(float *host_u, float *host_v);

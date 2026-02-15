@@ -459,6 +459,73 @@ __global__ void computeSDFKernel(float *sdf, uint8_t *cell_type,
         cell_type[idx] = CELL_OUTFLOW;
     }
 }
+
+// 功能:重新计算SDF和网格类型（用于动态襟翼旋转），并对类型变化的网格做物理修正
+// 与 computeSDFKernel 不同，此核函数读取旧的 cell_type，对比新类型：
+// - 固体/Ghost → 流体：用来流条件初始化守恒变量（新暴露的流体区域）
+// - 流体 → 固体/Ghost：保持守恒变量不变（边界条件内核会在之后正确处理）
+// 输入:障碍物参数, 来流参数(rho_inf, u_inf, v_inf, p_inf), 守恒变量指针
+// 输出:更新后的SDF、cell_type，以及新暴露区域的守恒变量
+__global__ void updateSDFWithFixupKernel(
+    float *sdf, uint8_t *cell_type,
+    float *rho, float *rho_u, float *rho_v, float *E, float *rho_e,
+    float obs_x, float obs_y, float obs_r,
+    float rotation, ObstacleShape shapeType,
+    float dx, float dy, int nx, int ny, float wingRotation,
+    float rho_inf, float u_inf, float v_inf, float p_inf)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i >= nx || j >= ny)
+        return;
+
+    int idx = j * nx + i;
+
+    // 保存旧的网格类型
+    uint8_t oldType = cell_type[idx];
+
+    // 计算新的SDF
+    float x = (i + 0.5f) * dx;
+    float y = (j + 0.5f) * dy;
+    float dist = computeShapeSDF(x, y, obs_x, obs_y, obs_r, rotation, shapeType, wingRotation);
+    sdf[idx] = dist;
+
+    // 计算新的网格类型
+    float band = 1.5f * fmaxf(dx, dy);
+    uint8_t newType;
+
+    if (dist < -band)
+        newType = CELL_SOLID;
+    else if (dist < band && dist >= -band)
+        newType = CELL_GHOST;
+    else
+        newType = CELL_FLUID;
+
+    // 计算域边界条件覆盖
+    if (i == 0)
+        newType = CELL_INFLOW;
+    else if (i == nx - 1)
+        newType = CELL_OUTFLOW;
+
+    cell_type[idx] = newType;
+
+    // 物理修正：如果网格从固体/Ghost变为流体，用来流条件填充
+    // 这样做的物理意义是：襟翼收起后，暴露的区域被新鲜来流填充
+    bool wasObstacle = (oldType == CELL_SOLID || oldType == CELL_GHOST);
+    bool nowFluid = (newType == CELL_FLUID);
+
+    if (wasObstacle && nowFluid)
+    {
+        rho[idx] = rho_inf;
+        rho_u[idx] = rho_inf * u_inf;
+        rho_v[idx] = rho_inf * v_inf;
+        float ke = 0.5f * rho_inf * (u_inf * u_inf + v_inf * v_inf);
+        float e_internal = p_inf / (GAMMA - 1.0f);
+        E[idx] = e_internal + ke;
+        rho_e[idx] = e_internal;
+    }
+}
 #pragma endregion
 
 #pragma region 物理逻辑操作核函数
@@ -2836,6 +2903,36 @@ void CFDSolver::reset(const SimParams &params)
     launchComputeViscosityKernel(d_T_, d_mu_, d_k_, _nx, _ny);
 
     // 同步确保完成
+    CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+// 功能:动态更新襟翼角度（不重置仿真状态）
+// 输入:仿真参数 params（包含新的 wing_rotation）
+// 说明:重新计算SDF和网格类型，对新暴露的流体区域用来流条件填充，
+//      然后重新应用边界条件和计算原始变量，确保下一步仿真正常进行
+void CFDSolver::updateWingRotation(const SimParams &params)
+{
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grid((_nx + block.x - 1) / block.x, (_ny + block.y - 1) / block.y);
+
+    // 1. 重新计算SDF和网格类型，同时修正新暴露区域的守恒变量
+    updateSDFWithFixupKernel<<<grid, block>>>(
+        d_sdf_, d_cell_type_,
+        d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+        params.obstacle_x, params.obstacle_y, params.obstacle_r,
+        params.obstacle_rotation, params.obstacle_shape,
+        params.dx, params.dy, _nx, _ny, params.wing_rotation,
+        params.rho_inf, params.u_inf, params.v_inf, params.p_inf);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 2. 重新应用边界条件（Ghost Cell等需要使用新的SDF和cell_type）
+    launchApplyBoundaryConditionsKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+                                        d_cell_type_, d_sdf_, params, _nx, _ny);
+
+    // 3. 重新计算原始变量（确保 u, v, p, T 与新的守恒变量一致）
+    launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+                                  d_u_, d_v_, d_p_, d_T_, _nx, _ny);
+
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 #pragma endregion
