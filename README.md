@@ -6,13 +6,13 @@
 
 本项目可以在低风速（0.3Mach）左右或高风速（大于3Mach）下获得符合流体力学理论的现象：
 
-- [卡门涡街](https://zh.wikipedia.org/wiki/%E5%8D%A1%E9%97%A8%E6%B6%A1%E8%A1%97)：
+- 低风速下：[卡门涡街](https://zh.wikipedia.org/wiki/%E5%8D%A1%E9%97%A8%E6%B6%A1%E8%A1%97)：
 
 ![image-20260204210325348](img/image-20260204210325348.png)
 
 ![image-20260204210419061](img/image-20260204210419061.png)
 
-以及高超音速下的[弓形激波](https://en.wikipedia.org/wiki/Bow_shock_(aerodynamics))，[粘性尾流](https://baike.baidu.com/item/%E9%AB%98%E8%B6%85%E5%A3%B0%E9%80%9F%E5%B0%BE%E8%BF%B9/12619692)等：
+- 高超音速下：[弓形激波](https://en.wikipedia.org/wiki/Bow_shock_(aerodynamics))，[粘性尾流](https://baike.baidu.com/item/%E9%AB%98%E8%B6%85%E5%A3%B0%E9%80%9F%E5%B0%BE%E8%BF%B9/12619692)等：
 
 ![image-20260204210701495](img/image-20260204210701495.png)
 

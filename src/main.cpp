@@ -352,31 +352,35 @@ void renderUI()
         ImGui::SameLine();
         if (ImGui::Button(u8"圆形"))
         {
-            params.obstacle_shape = 0;
+            params.obstacle_shape = ObstacleShape::CIRCLE;
             changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"五角星"))
         {
-            params.obstacle_shape = 1;
+            params.obstacle_shape = ObstacleShape::STAR;
             changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"菱形"))
         {
-            params.obstacle_shape = 2;
+            params.obstacle_shape = ObstacleShape::DIAMOND;
             changed = true;
         }
-        ImGui::SameLine();
         if (ImGui::Button(u8"胶囊形"))
         {
-            params.obstacle_shape = 3;
+            params.obstacle_shape = ObstacleShape::CAPSULE;
             changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"三角形"))
         {
-            params.obstacle_shape = 4;
+            params.obstacle_shape = ObstacleShape::TRIANGLE;
+            changed = true;
+        }
+        ImGui::SameLine();
+        if(ImGui::Button(u8"星舰")){
+            params.obstacle_shape = ObstacleShape::STARSHIP;
             changed = true;
         }
 
@@ -386,18 +390,32 @@ void renderUI()
         changed |= ImGui::SliderFloat(u8"大小 (半径)", &params.obstacle_r, 0.1f, 1.5f);
 
         // 障碍物旋转角度
-        float rotationDeg = params.obstacle_rotation * 180.0f / 3.14159265f;
+        float rotationDeg = params.obstacle_rotation * 180.0f / PI;
         if (ImGui::SliderFloat(u8"旋转角度 (度)", &rotationDeg, -180.0f, 180.0f))
         {
-            params.obstacle_rotation = rotationDeg * 3.14159265f / 180.0f;
+            params.obstacle_rotation = rotationDeg * PI / 180.0f;
             changed = true;
         }
         if (ImGui::InputFloat(u8"精确旋转角度 (度)", &rotationDeg))
         {
-            params.obstacle_rotation = rotationDeg * 3.14159265f / 180.0f;
+            params.obstacle_rotation = rotationDeg * PI / 180.0f;
             changed = true;
         }
-
+        if (params.obstacle_shape == ObstacleShape::STARSHIP)
+        {
+            float wingRotationDeg = params.wing_rotation * PI / 180.0f;
+            if (ImGui::SliderFloat(u8"襟翼旋转角度 (度)", &wingRotationDeg, 0.0f, 90.0f))
+            {
+                params.wing_rotation = wingRotationDeg * PI / 180.0f;
+                changed = true;
+            }
+            if (ImGui::InputFloat(u8"襟翼精确旋转角度 (度)", &wingRotationDeg))
+            {
+                wingRotationDeg = std::clamp(wingRotationDeg, 0.0f, 90.0f);
+                params.wing_rotation = wingRotationDeg * PI / 180.0f;
+                changed = true;
+            }
+        }
         if (changed)
         {
             params.obstacle_y = params.domain_height / 2.0f;
@@ -629,29 +647,29 @@ void updateVisualization()
     }
 
     renderer.unmapFieldTexture();
-    
+
     // 生成矢量箭头（如果启用）
     if (renderer.getShowVectors())
     {
         int step = renderer.getVectorDensity();
-        
+
         // 计算箭头参数
         const float arrowHeadAngle = 0.5f;
         const float arrowHeadLength = 0.3f;
-        
+
         // 计算单个格子在NDC中的尺寸
         float cellWidth = 2.0f / params.nx;
         float cellHeight = 2.0f / params.ny;
         float maxArrowLength = std::min(cellWidth, cellHeight) * (step * 0.8f);
-        
+
         // 计算最大可能的箭头数量（每个箭头8个顶点）
         int numArrowsX = (params.nx + step - 1) / step;
         int numArrowsY = (params.ny + step - 1) / step;
         int maxVertices = numArrowsX * numArrowsY * 8;
-        
+
         // 确保VBO有足够容量
         renderer.ensureVectorVBOCapacity(maxVertices);
-        
+
         // 映射VBO
         int vboCapacity;
         float *devVertexData = renderer.mapVectorVBO(vboCapacity);
@@ -662,7 +680,7 @@ void updateVisualization()
                 devVertexData, vboCapacity,
                 step, params.u_inf,
                 maxArrowLength, arrowHeadAngle, arrowHeadLength);
-            
+
             // 取消映射
             renderer.unmapVectorVBO(numVertices);
         }

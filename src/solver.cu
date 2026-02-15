@@ -268,25 +268,135 @@ __device__ __forceinline__ float sdfTriangle(float px, float py, float cx, float
     return inside ? -minDist : minDist;
 }
 
+// 功能:计算点到凸四边形的带符号距离
+// 输入:点坐标(px, py), 四个顶点坐标（要求逆时针绕序）
+// 输出:带符号距离（负值表示在四边形内，正值表示在外）
+__device__ __forceinline__ float sdfQuad(float px, float py,
+                                         float v0x, float v0y,
+                                         float v1x, float v1y,
+                                         float v2x, float v2y,
+                                         float v3x, float v3y)
+{
+    // 计算点到四条边的最短距离
+    float d0 = distToSegment(px, py, v0x, v0y, v1x, v1y);
+    float d1 = distToSegment(px, py, v1x, v1y, v2x, v2y);
+    float d2 = distToSegment(px, py, v2x, v2y, v3x, v3y);
+    float d3 = distToSegment(px, py, v3x, v3y, v0x, v0y);
+
+    float minDist = fminf(fminf(d0, d1), fminf(d2, d3));
+
+    // 使用叉积判断点是否在凸四边形内部
+    // 对于逆时针排列的顶点，如果所有叉积同号，则点在内部
+    float c0 = cross2d(v1x - v0x, v1y - v0y, px - v0x, py - v0y);
+    float c1 = cross2d(v2x - v1x, v2y - v1y, px - v1x, py - v1y);
+    float c2 = cross2d(v3x - v2x, v3y - v2y, px - v2x, py - v2y);
+    float c3 = cross2d(v0x - v3x, v0y - v3y, px - v3x, py - v3y);
+
+    bool inside = (c0 >= 0 && c1 >= 0 && c2 >= 0 && c3 >= 0) ||
+                  (c0 <= 0 && c1 <= 0 && c2 <= 0 && c3 <= 0);
+
+    return inside ? -minDist : minDist;
+}
+
+// 功能:计算点到星舰模型的带符号距离
+// 星舰由三部分组成：圆形主体 + 上下对称的固定襟翼根部 + 上下对称的可旋转襟翼
+// 输入:点坐标(px, py), 中心(cx, cy), 主体半径 r, 全局旋转角度 rotation, 襟翼旋转角度 wingRotation
+// 输出:带符号距离（联合体的SDF = 各部件SDF的最小值）
+__device__ __forceinline__ float sdfStarship(float px, float py, float cx, float cy, float r, float rotation, float wingRotation)
+{
+    // 转换到局部坐标（以星舰中心为原点）
+    float lx = px - cx;
+    float ly = py - cy;
+
+    // 应用全局旋转（将查询点旋转到星舰的参考坐标系）
+    float cosR = cosf(-rotation);
+    float sinR = sinf(-rotation);
+    float qx = lx * cosR - ly * sinR;
+    float qy = lx * sinR + ly * cosR;
+
+    // ===== 第一部分：圆形主体的SDF =====
+    float distToCircle = sqrtf(qx * qx + qy * qy) - r;
+
+    // ===== 第二部分：襟翼SDF =====
+    // 利用上下对称性：取|qy|将查询点镜像到上半平面，只需计算上襟翼
+    // 上襟翼顺时针旋转 ↔ 镜像后的下襟翼向外偏转，对称性天然成立
+    float scale = r / wingRootRadius; // 参考坐标系（wingRootRadius=90）到实际坐标系的缩放因子
+
+    // 将查询点从实际坐标转换到参考坐标系
+    float refX = qx / scale;
+    float refY = fabsf(qy) / scale;
+
+    // --- 固定襟翼根部（四边形，两个底点固定在圆周上）---
+    // 顶点逆时针绕序：LB -> RB -> RT -> LT
+    float distToRoot = sdfQuad(refX, refY,
+                               wingRootLB.x, wingRootLB.y,
+                               wingRootRB.x, wingRootRB.y,
+                               wingRootRT.x, wingRootRT.y,
+                               wingRootLT.x, wingRootLT.y) *
+                       scale;
+
+    // --- 可动襟翼（等腰梯形，绕wingLB顺时针旋转wingRotation弧度）---
+    // 旋转中心 = wingLB = wingRootLT = (-6, 112)
+    float pivotX = wingLB.x;
+    float pivotY = wingLB.y;
+    float cosW = cosf(-wingRotation); // 顺时针旋转 = 数学上的负角度
+    float sinW = sinf(-wingRotation);
+
+    // wingLB 是旋转中心，坐标不变
+    float wv0x = pivotX;
+    float wv0y = pivotY;
+
+    // wingRB 绕旋转中心旋转
+    float dx1 = wingRB.x - pivotX; // = 12
+    float dy1 = wingRB.y - pivotY; // = 0
+    float wv1x = pivotX + dx1 * cosW - dy1 * sinW;
+    float wv1y = pivotY + dx1 * sinW + dy1 * cosW;
+
+    // wingRT 绕旋转中心旋转
+    float dx2 = wingRT.x - pivotX; // = 9
+    float dy2 = wingRT.y - pivotY; // = 74
+    float wv2x = pivotX + dx2 * cosW - dy2 * sinW;
+    float wv2y = pivotY + dx2 * sinW + dy2 * cosW;
+
+    // wingLT 绕旋转中心旋转
+    float dx3 = wingLT.x - pivotX; // = 3
+    float dy3 = wingLT.y - pivotY; // = 74
+    float wv3x = pivotX + dx3 * cosW - dy3 * sinW;
+    float wv3y = pivotY + dx3 * sinW + dy3 * cosW;
+
+    // 顶点逆时针绕序：LB -> RB -> RT -> LT
+    float distToWing = sdfQuad(refX, refY,
+                               wv0x, wv0y,
+                               wv1x, wv1y,
+                               wv2x, wv2y,
+                               wv3x, wv3y) *
+                       scale;
+
+    // ===== 取联合体SDF：各部件SDF的最小值 =====
+    return fminf(distToCircle, fminf(distToRoot, distToWing));
+}
+
 // 功能:统一的SDF计算接口，根据形状类型调用相应的SDF函数
 // 输入:点坐标(px, py), 形状中心(cx, cy), 尺寸参数 r, 旋转角度 rotation, 形状类型 shapeType
 // 输出:带符号距离
 __device__ __forceinline__ float computeShapeSDF(float px, float py, float cx, float cy, float r,
-                                                 float rotation, int shapeType)
+                                                 float rotation, ObstacleShape shapeType, float wingRotation)
 {
     // 根据形状类型分发到具体的SDF函数
     switch (shapeType)
     {
-    case 0: // 圆形
+    case ObstacleShape::CIRCLE: // 圆形
         return sdfCircle(px, py, cx, cy, r);
-    case 1: // 五角星
+    case ObstacleShape::STAR: // 五角星
         return sdfStar(px, py, cx, cy, r, rotation);
-    case 2: // 菱形
+    case ObstacleShape::DIAMOND: // 菱形
         return sdfDiamond(px, py, cx, cy, r, rotation);
-    case 3: // 胶囊形
+    case ObstacleShape::CAPSULE: // 胶囊形
         return sdfCapsule(px, py, cx, cy, r, rotation);
-    case 4: // 三角形
+    case ObstacleShape::TRIANGLE: // 三角形
         return sdfTriangle(px, py, cx, cy, r, rotation);
+    case ObstacleShape::STARSHIP: // 星舰
+        return sdfStarship(px, py, cx, cy, r, rotation, wingRotation);
     default: // 默认返回圆形
         return sdfCircle(px, py, cx, cy, r);
     }
@@ -297,8 +407,8 @@ __device__ __forceinline__ float computeShapeSDF(float px, float py, float cx, f
 // 输出:SDF场 sdf[], 网格类型标记 cell_type[]
 __global__ void computeSDFKernel(float *sdf, uint8_t *cell_type,
                                  float obs_x, float obs_y, float obs_r,
-                                 float rotation, int shapeType,
-                                 float dx, float dy, int nx, int ny)
+                                 float rotation, ObstacleShape shapeType,
+                                 float dx, float dy, int nx, int ny, float wingRotation)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -313,7 +423,7 @@ __global__ void computeSDFKernel(float *sdf, uint8_t *cell_type,
     float y = (j + 0.5f) * dy;
 
     // 根据形状类型计算带符号距离
-    float dist = computeShapeSDF(x, y, obs_x, obs_y, obs_r, rotation, shapeType);
+    float dist = computeShapeSDF(x, y, obs_x, obs_y, obs_r, rotation, shapeType, wingRotation);
 
     sdf[idx] = dist;
 
@@ -2054,7 +2164,7 @@ void CFDSolver::launchComputeSDFKernel(float *sdf, uint8_t *cell_type,
     computeSDFKernel<<<grid, block>>>(sdf, cell_type,
                                       params.obstacle_x, params.obstacle_y, params.obstacle_r,
                                       params.obstacle_rotation, params.obstacle_shape,
-                                      params.dx, params.dy, nx, ny);
+                                      params.dx, params.dy, nx, ny, params.wing_rotation);
     CUDA_CHECK(cudaGetLastError());
 }
 #pragma endregion
@@ -3187,8 +3297,8 @@ __global__ void generateVectorArrowsKernel(
 
 // 生成速度矢量箭头，直接写入OpenGL VBO
 int CFDSolver::generateVectorArrows(float *dev_vertexData, int maxVertices,
-                                   int step, float u_inf,
-                                   float maxArrowLength, float arrowHeadAngle, float arrowHeadLength)
+                                    int step, float u_inf,
+                                    float maxArrowLength, float arrowHeadAngle, float arrowHeadLength)
 {
     // 分配原子计数器（用于顶点索引）
     int *d_counter;
