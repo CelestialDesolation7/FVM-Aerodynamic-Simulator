@@ -517,13 +517,11 @@ __global__ void updateSDFWithFixupKernel(
 
     if (wasObstacle && nowFluid)
     {
-        rho[idx] = rho_inf;
-        rho_u[idx] = rho_inf * u_inf;
-        rho_v[idx] = rho_inf * v_inf;
-        float ke = 0.5f * rho_inf * (u_inf * u_inf + v_inf * v_inf);
-        float e_internal = p_inf / (GAMMA - 1.0f);
-        E[idx] = e_internal + ke;
-        rho_e[idx] = e_internal;
+        rho[idx] = 0;
+        rho_u[idx] = 0;
+        rho_v[idx] = 0;
+        E[idx] = 0;
+        rho_e[idx] = 0;
     }
 }
 #pragma endregion
