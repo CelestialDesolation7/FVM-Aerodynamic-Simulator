@@ -2421,7 +2421,6 @@ __global__ void maxMachKernelDeprecated(const float *u, const float *v,
 }
 */
 
-// ========== 高性能CUB库归约实现 ==========
 // 功能:使用CUB库计算运动粘性系数的最大值(用于粘性CFL条件)
 // 输入:粘性系数场 mu, 密度场 rho, 网格尺寸
 // 输出:最大运动粘性系数 nu_max = max(mu/rho)
@@ -2541,11 +2540,9 @@ float CFDSolver::launchComputeMaxWaveSpeed(const float *u, const float *v, const
     return result;
 }
 
-// ========== 生产环境：CUB库归约实现 ==========
 // 功能:使用CUB库计算最大马赫数
 // 输入:速度场(u,v)，压强场p，密度场rho
 // 输出:最大马赫数 = max(|v|/c)
-// 优化:完全GPU端归约，无CPU-GPU同步，性能最优
 __global__ void computeMachNumberKernel(const float *u, const float *v,
                                         const float *p, const float *rho,
                                         float *mach_out, int n)
@@ -2607,7 +2604,6 @@ float CFDSolver::launchComputeMaxMach(const float *u, const float *v, const floa
 // 功能:使用CUB库计算最大温度(直接对原始数组归约)
 // 输入:温度场T，网格尺寸
 // 输出:最大温度值
-// 优化:直接使用CUB库的高效实现，无需临时转换
 float CFDSolver::launchComputeMaxTemperature(const float *T, int nx, int ny)
 {
     int n = nx * ny;
