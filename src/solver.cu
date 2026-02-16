@@ -2373,11 +2373,10 @@ void CFDSolver::launchDiffusionStepKernel(float *rho_u, float *rho_v, float *E, 
 #pragma endregion
 
 #pragma region 统计工具
-// ========== 已废弃的手写归约实现（保留作为教学参考）==========
-// 功能:计算全场最大马赫数(演示如何手动实现两阶段GPU归约)
+// ========== 已废弃的手写归约实现==========
 // 说明:此函数已被CUB库实现替代，保留仅作为教学示例
-//       展示传统手写归约的实现方法：块内共享内存树形归约 + CPU最终归约
-//       缺点：需要CPU-GPU同步，性能不如CUB的单阶段全GPU归约
+// 展示传统手写归约的实现方法：块内共享内存树形归约 + CPU最终归约
+// 需要CPU-GPU同步，性能不如CUB的单阶段全GPU归约
 /*
 __global__ void maxMachKernelDeprecated(const float *u, const float *v,
                                         const float *p, const float *rho,
@@ -2421,12 +2420,6 @@ __global__ void maxMachKernelDeprecated(const float *u, const float *v,
     }
 }
 */
-// 上述手写归约的问题：
-// 1. 需要两阶段：GPU块归约 + CPU最终归约，增加延迟
-// 2. 需要显式CPU-GPU同步(cudaMemcpy阻塞)，影响并行性
-// 3. CPU串行归约成为瓶颈
-// 4. 代码复杂，需要手动管理共享内存和线程同步
-// CUB库的优势：单阶段全GPU归约，无CPU参与，性能最优且代码简洁
 
 // ========== 高性能CUB库归约实现 ==========
 // 功能:使用CUB库计算运动粘性系数的最大值(用于粘性CFL条件)
