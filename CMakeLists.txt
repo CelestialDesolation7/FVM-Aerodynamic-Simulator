@@ -53,8 +53,6 @@ project(FVM-Aerodynamic-Simulator
     LANGUAGES CXX CUDA
 )
 
-message(STATUS "项目名称: ${PROJECT_NAME}")
-message(STATUS "项目版本: ${PROJECT_VERSION}")
 
 # =========================================================
 # 语言标准设置
