@@ -345,7 +345,8 @@ void renderUI()
     // 障碍物设置
     if (ImGui::CollapsingHeader(u8"障碍物设置", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        bool changed = false;
+        bool shapeChanged = false;
+        bool obstacleChanged = false;
 
         // Quick shape buttons
         ImGui::Text(u8"障碍物形状:");
@@ -353,81 +354,82 @@ void renderUI()
         if (ImGui::Button(u8"圆形"))
         {
             params.obstacle_shape = ObstacleShape::CIRCLE;
-            changed = true;
+            shapeChanged = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"五角星"))
         {
             params.obstacle_shape = ObstacleShape::STAR;
-            changed = true;
+            shapeChanged = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"菱形"))
         {
             params.obstacle_shape = ObstacleShape::DIAMOND;
-            changed = true;
+            shapeChanged = true;
         }
         if (ImGui::Button(u8"胶囊形"))
         {
             params.obstacle_shape = ObstacleShape::CAPSULE;
-            changed = true;
+            shapeChanged = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"三角形"))
         {
             params.obstacle_shape = ObstacleShape::TRIANGLE;
-            changed = true;
+            shapeChanged = true;
         }
         ImGui::SameLine();
-        if(ImGui::Button(u8"星舰")){
+        if (ImGui::Button(u8"星舰"))
+        {
             params.obstacle_shape = ObstacleShape::STARSHIP;
-            changed = true;
+            shapeChanged = true;
         }
 
         ImGui::Separator();
 
-        changed |= ImGui::SliderFloat(u8"中心 X 坐标", &params.obstacle_x, 0.5f, params.domain_width * 0.5f);
-        changed |= ImGui::SliderFloat(u8"大小 (半径)", &params.obstacle_r, 0.1f, 1.5f);
+        obstacleChanged |= ImGui::SliderFloat(u8"中心 X 坐标", &params.obstacle_x, 0.5f, params.domain_width * 0.5f);
+        shapeChanged |= ImGui::SliderFloat(u8"大小 (半径)", &params.obstacle_r, 0.1f, 1.5f);
 
         // 障碍物旋转角度
         float rotationDeg = params.obstacle_rotation * 180.0f / PI;
         if (ImGui::SliderFloat(u8"旋转角度 (度)", &rotationDeg, -180.0f, 180.0f))
         {
             params.obstacle_rotation = rotationDeg * PI / 180.0f;
-            changed = true;
+            obstacleChanged = true;
         }
         if (ImGui::InputFloat(u8"精确旋转角度 (度)", &rotationDeg))
         {
             params.obstacle_rotation = rotationDeg * PI / 180.0f;
-            changed = true;
+            obstacleChanged = true;
         }
+
         if (params.obstacle_shape == ObstacleShape::STARSHIP)
         {
-            bool wingChanged = false;
             float wingRotationDeg = params.wing_rotation * 180.0f / PI;
             if (ImGui::SliderFloat(u8"襟翼旋转角度 (度)", &wingRotationDeg, 0.0f, 90.0f))
             {
                 params.wing_rotation = wingRotationDeg * PI / 180.0f;
-                wingChanged = true;
+                obstacleChanged = true;
             }
             if (ImGui::InputFloat(u8"襟翼精确旋转角度 (度)", &wingRotationDeg))
             {
                 wingRotationDeg = std::clamp(wingRotationDeg, 0.0f, 90.0f);
                 params.wing_rotation = wingRotationDeg * PI / 180.0f;
-                wingChanged = true;
-            }
-            // 襟翼角度变化：动态更新，不重置仿真
-            if (wingChanged && !changed)
-            {
-                solver.updateWingRotation(params);
-                solver.getCellTypes(h_cellTypes.data());
-                renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
+                obstacleChanged = true;
             }
         }
-        if (changed)
+
+        if (shapeChanged)
         {
             params.obstacle_y = params.domain_height / 2.0f;
             solver.reset(params);
+            solver.getCellTypes(h_cellTypes.data());
+            renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
+        }
+        else if (obstacleChanged)
+        {
+            solver.updateObstacleGeometry(params);
             solver.getCellTypes(h_cellTypes.data());
             renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
         }

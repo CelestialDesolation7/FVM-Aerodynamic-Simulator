@@ -141,9 +141,6 @@ public:
     // 取消映射矢量VBO，设置实际使用的顶点数量
     void unmapVectorVBO(int actualVertices);
 
-    // 设置障碍物显示开关
-    void setShowObstacle(bool show) { showObstacle_ = show; }
-
     // 窗口尺寸调整
     void resize(int width, int height);
 
@@ -205,11 +202,6 @@ private:
     GLuint VAO_ = 0;
     GLuint VBO_ = 0;
 
-    // 障碍物轮廓叠加层的着色器和缓冲区
-    GLuint obstacleShaderProgram_ = 0;
-    GLuint obstacleVAO_ = 0;
-    GLuint obstacleVBO_ = 0;
-
     // 矢量箭头叠加层的着色器和缓冲区
     GLuint vectorShaderProgram_ = 0;
     GLuint vectorVAO_ = 0;
@@ -228,7 +220,6 @@ private:
     ColormapType colormap_ = ColormapType::JET; // 当前色图类型
     bool showVectors_ = false;                  // 是否显示速度矢量
     int vectorDensity_ = 20;                    // 矢量箭头密度（每多少格子显示一个）
-    bool showObstacle_ = true;                  // 是否显示障碍物轮廓
 
 
     // 当前物理场的值域范围
@@ -249,8 +240,6 @@ private:
 
     // 着色器创建和编译的工具函数
     bool createShaders();                                     // 创建主渲染着色器
-    bool createGridShader();                                  // 创建网格线着色器（现用于矢量箭头）
-    bool createObstacleShader();                                // 创建障碍物轮廓着色器
     bool createVectorShader();                                // 创建矢量箭头着色器
     GLuint compileShader(const char *source, GLenum type);    // 编译单个着色器
     GLuint linkProgram(GLuint vertShader, GLuint fragShader); // 链接着色器程序

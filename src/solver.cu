@@ -618,6 +618,9 @@ __device__ __forceinline__ void computePrimitiveFromRiemannInvarY(float R1, floa
     p = rho * c_sq * inv_gamma; // 压强
 }
 
+// 功能: 计算远场条件对应的Riemann不变量（X方向边界条件使用）
+// 输入:来流参数(rho_inf, u_inf, v_inf, p_inf)
+// 输出:来流对应的Riemann不变量(R1_inf, R2_inf, R3_inf, R4_inf)
 __device__ __forceinline__ void computeFarfieldRiemannInvarX(float rho_inf, float u_inf, float v_inf, float p_inf,
                                                              float &R1_inf, float &R2_inf, float &R3_inf, float &R4_inf)
 {
@@ -636,6 +639,9 @@ __device__ __forceinline__ void computeFarfieldRiemannInvarX(float rho_inf, floa
     R4_inf = u_inf - c_inf * two_over_gamma_minus_1; // 向左声波不变量
 }
 
+// 功能: 计算远场条件对应的Riemann不变量（Y方向边界条件使用）
+// 输入:来流参数(rho_inf, u_inf, v_inf, p_inf)
+// 输出:来流对应的Riemann不变量(R1_inf, R2_inf, R3_inf, R4_inf)
 __device__ __forceinline__ void computeFarfieldRiemannInvarY(float rho_inf, float u_inf, float v_inf, float p_inf,
                                                              float &R1_inf, float &R2_inf, float &R3_inf, float &R4_inf)
 {
@@ -654,6 +660,9 @@ __device__ __forceinline__ void computeFarfieldRiemannInvarY(float rho_inf, floa
     R4_inf = v_inf - c_inf * two_over_gamma_minus_1; // 向下声波不变量
 }
 
+// 功能: 从守恒变量计算原始变量，并应用双能量法切换以提高数值稳定性
+// 输入:守恒变量(rho, rho_u, rho_v, E, rho_e)，其中 rho_e 是从双能量方程追踪的内能密度
+// 输出:原始变量(u, v, p, T)，其中 T 是温度
 __device__ __forceinline__ void computePrimitivesKernelInline(const float rho, const float rho_u,
                                                               const float rho_v, const float E,
                                                               const float rho_e, // Internal energy from dual-energy equation
@@ -2893,11 +2902,12 @@ void CFDSolver::reset(const SimParams &params)
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-// 功能:动态更新襟翼角度（不重置仿真状态）
-// 输入:仿真参数 params（包含新的 wing_rotation）
-// 说明:重新计算SDF和网格类型，对新暴露的流体区域用来流条件填充，
+// 功能:动态更新障碍物几何（不重置仿真状态）
+// 输入:仿真参数 params（可包含位置、大小、旋转、形状、翼角度的任意变化）
+// 说明:重新计算SDF和网格类型，对新暴露的流体区域填充真空，
+//      原本在障碍物内部的流体区域守恒变量保持不变（边界条件内核会正确处理），
 //      然后重新应用边界条件和计算原始变量，确保下一步仿真正常进行
-void CFDSolver::updateWingRotation(const SimParams &params)
+void CFDSolver::updateObstacleGeometry(const SimParams &params)
 {
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
     dim3 grid((_nx + block.x - 1) / block.x, (_ny + block.y - 1) / block.y);

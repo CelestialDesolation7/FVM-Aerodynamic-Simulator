@@ -106,33 +106,6 @@ void main() {
 }
 )";
 
-// -----------------------------------------------------------
-// 障碍物轮廓线的顶点着色器
-// 作用：绘制障碍物的外形轮廓
-// -----------------------------------------------------------
-const char *obstacleVertexShader = R"(
-#version 330 core
-layout (location = 0) in vec2 aPos;
-
-void main() {
-    gl_Position = vec4(aPos, 0.0, 1.0);
-}
-)";
-
-// -----------------------------------------------------------
-// 障碍物轮廓线的片元着色器
-// 作用：绘制障碍物的颜色
-// -----------------------------------------------------------
-const char *obstacleFragmentShader = R"(
-#version 330 core
-out vec4 FragColor;
-
-uniform vec4 obstacleColor;
-
-void main() {
-    FragColor = obstacleColor;
-}
-)";
 #pragma endregion
 
 #pragma region 构造和析构函数
@@ -156,13 +129,6 @@ bool Renderer::initialize(int width, int height)
     if (!createShaders())
     {
         fprintf(stderr, "创建场渲染着色器失败\n");
-        return false;
-    }
-
-    // 创建障碍物轮廓着色器程序
-    if (!createObstacleShader())
-    {
-        fprintf(stderr, "创建障碍物着色器失败\n");
         return false;
     }
 
@@ -235,9 +201,7 @@ bool Renderer::initialize(int width, int height)
     createColormapTexture();
 
     // 以下属性的值在这里无法确定，会在第一次渲染时更新
-    // 创建障碍物轮廓的 VAO/VBO
-    glGenVertexArrays(1, &obstacleVAO_);
-    glGenBuffers(1, &obstacleVBO_);
+
 
     // 创建矢量箭头的 VAO/VBO（双缓冲）
     glGenVertexArrays(1, &vectorVAO_);
@@ -251,10 +215,6 @@ bool Renderer::initialize(int width, int height)
     glUniform1i(glGetUniformLocation(shaderProgram_, "fieldTexture"), 0);
     glUniform1i(glGetUniformLocation(shaderProgram_, "colormapTexture"), 1);
     glUniform1i(glGetUniformLocation(shaderProgram_, "cellTypeTexture"), 2);
-
-    glUseProgram(obstacleShaderProgram_);
-    glUniform4f(glGetUniformLocation(obstacleShaderProgram_, "obstacleColor"),
-                0.0f, 0.0f, 0.0f, 1.0f);
 
     glUseProgram(0);
 
@@ -275,12 +235,6 @@ void Renderer::cleanup()
         glDeleteVertexArrays(1, &VAO_);
     if (VBO_)
         glDeleteBuffers(1, &VBO_);
-    if (obstacleShaderProgram_)
-        glDeleteProgram(obstacleShaderProgram_);
-    if (obstacleVAO_)
-        glDeleteVertexArrays(1, &obstacleVAO_);
-    if (obstacleVBO_)
-        glDeleteBuffers(1, &obstacleVBO_);
     if (vectorShaderProgram_)
         glDeleteProgram(vectorShaderProgram_);
     if (vectorVAO_)
@@ -493,21 +447,6 @@ bool Renderer::createShaders()
     return shaderProgram_ != 0;
 }
 
-bool Renderer::createObstacleShader()
-{
-    GLuint vertShader = compileShader(obstacleVertexShader, GL_VERTEX_SHADER);
-    GLuint fragShader = compileShader(obstacleFragmentShader, GL_FRAGMENT_SHADER);
-
-    if (!vertShader || !fragShader)
-        return false;
-
-    obstacleShaderProgram_ = linkProgram(vertShader, fragShader);
-
-    glDeleteShader(vertShader);
-    glDeleteShader(fragShader);
-
-    return obstacleShaderProgram_ != 0;
-}
 
 bool Renderer::createVectorShader()
 {
@@ -919,129 +858,7 @@ void Renderer::render(const SimParams &params)
     glBindVertexArray(VAO_);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
-    // 第二层：渲染障碍物轮廓
-    if (showObstacle_ && nx_ > 0 && ny_ > 0)
-    {
-        glUseProgram(obstacleShaderProgram_);
-        // obstacleColor 已在初始化时设置
-
-        // 生成障碍物顶点（在 NDC 坐标系中）
-        std::vector<float> obstacleVerts;
-        const float PI = 3.14159265f;
-
-        // 从参数中获取障碍物的世界空间坐标
-        float obs_cx = params.obstacle_x;
-        float obs_cy = params.obstacle_y;
-        float obs_r = params.obstacle_r;
-        float rotation = params.obstacle_rotation;
-
-        // 辅助函数：将世界坐标转换为 NDC 坐标
-        auto worldToNDC = [&](float wx, float wy, float &nx, float &ny)
-        {
-            nx = (wx / params.domain_width) * 2.0f - 1.0f;
-            ny = (wy / params.domain_height) * 2.0f - 1.0f;
-        };
-
-        // 辅助函数：在世界空间中对点进行旋转，然后转换为 NDC
-        auto addRotatedPoint = [&](float localX, float localY)
-        {
-            // 在世界空间中进行旋转
-            float cosR = cosf(rotation);
-            float sinR = sinf(rotation);
-            float worldX = obs_cx + localX * cosR - localY * sinR;
-            float worldY = obs_cy + localX * sinR + localY * cosR;
-            // 转换为 NDC
-            float ndcX, ndcY;
-            worldToNDC(worldX, worldY, ndcX, ndcY);
-            obstacleVerts.push_back(ndcX);
-            obstacleVerts.push_back(ndcY);
-        };
-
-        // 根据障碍物形状生成顶点
-        switch (params.obstacle_shape)
-        {
-        case 0:
-        { // 圆形
-            int segments = 64;
-            for (int i = 0; i <= segments; i++)
-            {
-                float angle = 2.0f * PI * i / segments;
-                addRotatedPoint(obs_r * cosf(angle), obs_r * sinf(angle));
-            }
-            break;
-        }
-        case 1:
-        { // 五角星
-            int numPoints = 5;
-            float outerR = obs_r;
-            float innerR = obs_r * 0.38f;
-            for (int i = 0; i <= numPoints * 2; i++)
-            {
-                float angle = PI * i / numPoints - PI / 2.0f;
-                float r = (i % 2 == 0) ? outerR : innerR;
-                addRotatedPoint(r * cosf(angle), r * sinf(angle));
-            }
-            // 闭合五角星
-            addRotatedPoint(outerR * cosf(-PI / 2.0f), outerR * sinf(-PI / 2.0f));
-            break;
-        }
-        case 2:
-        { // 菱形
-            float pts[5][2] = {
-                {0, 1}, {1, 0}, {0, -1}, {-1, 0}, {0, 1}};
-            for (int i = 0; i < 5; i++)
-            {
-                addRotatedPoint(obs_r * pts[i][0], obs_r * pts[i][1]);
-            }
-            break;
-        }
-        case 3:
-        { // 胶囊形（圆角矩形）
-            int segments = 16;
-            float halfW = obs_r * 1.5f;
-            float capR = obs_r * 0.5f;
-            // 右侧半圆
-            for (int i = 0; i <= segments; i++)
-            {
-                float angle = -PI / 2 + PI * i / segments;
-                addRotatedPoint(halfW - capR + capR * cosf(angle), capR * sinf(angle));
-            }
-            // 左侧半圆
-            for (int i = 0; i <= segments; i++)
-            {
-                float angle = PI / 2 + PI * i / segments;
-                addRotatedPoint(-halfW + capR + capR * cosf(angle), capR * sinf(angle));
-            }
-            // 闭合
-            addRotatedPoint(halfW - capR, -capR);
-            break;
-        }
-        case 4:
-        { // 三角形（尖端向右）
-            float sqrt3_2 = 0.866025404f;
-            addRotatedPoint(obs_r, 0);
-            addRotatedPoint(-obs_r * 0.5f, obs_r * sqrt3_2);
-            addRotatedPoint(-obs_r * 0.5f, -obs_r * sqrt3_2);
-            addRotatedPoint(obs_r, 0); // 闭合
-            break;
-        }
-        }
-
-        // 上传障碍物顶点数据
-        glBindVertexArray(obstacleVAO_);
-        glBindBuffer(GL_ARRAY_BUFFER, obstacleVBO_);
-        glBufferData(GL_ARRAY_BUFFER, obstacleVerts.size() * sizeof(float),
-                     obstacleVerts.data(), GL_DYNAMIC_DRAW);
-
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
-        glEnableVertexAttribArray(0);
-
-        // 绘制障碍物轮廓
-        glLineWidth(2.0f);
-        glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(obstacleVerts.size() / 2));
-    }
-
-    // 第三层：渲染速度矢量箭头（双缓冲）
+    // 第二层：渲染速度矢量箭头（双缓冲）
     // 注意：箭头顶点数据由solver生成，此处仅负责绘制
     // 绘制readIndex的VBO（CUDA正在写入另一个VBO）
     if (showVectors_)
