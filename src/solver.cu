@@ -5,12 +5,34 @@
 #include <cub/cub.cuh>
 
 #pragma region 常量定义
+// === GPU设备常量（用于CUDA核函数内部的物理约束） ===
 __device__ __constant__ float MIN_DENSITY = 1e-4f;
 __device__ __constant__ float MIN_PRESSURE = 1e-2f;
 __device__ __constant__ float MAX_TEMPERATURE = 5000.0f;
 __device__ __constant__ float MIN_TEMPERATURE = 50.0f;
 __device__ __constant__ float MAX_VELOCITY = 10000.0f;
-constexpr int BLOCK_SIZE = 16;
+
+// === 主机端编译期常量 ===
+constexpr int BLOCK_SIZE = 16;                          // CUDA线程块尺寸（2D）
+
+// 数值方法超参数
+constexpr float ENTROPY_FIX_FACTOR = 0.1f;              // 熵修正系数：delta = factor * max(cL, cR)
+constexpr float DUAL_ENERGY_ETA_THRESHOLD = 0.1f;       // 双能量法切换阈值：eta < threshold 时使用内能法
+constexpr float LOW_DENSITY_THRESHOLD = 0.01f;           // 低密度阈值：低于此值时降级为一阶格式
+constexpr float MAX_VELOCITY_LIMIT = 5000.0f;           // 最大速度限制 [m/s]（防止非物理超高速）
+constexpr float MAX_GHOST_VELOCITY = 2500.0f;            // 虚拟网格最大速度 [m/s]
+
+// SDF几何常量
+constexpr float SDF_BAND_WIDTH_FACTOR = 1.5f;            // Ghost Cell层宽度因子（相对于网格间距）
+constexpr float STAR_INNER_OUTER_RATIO = 0.38f;          // 五角星内外圆半径比（标准比例）
+constexpr float DIAMOND_HALF_SQRT2 = 0.7071f;            // 菱形缩放因子 ≈ 1/√2
+constexpr float CAPSULE_HALF_HEIGHT = 1.5f;               // 胶囊体半高（相对于半径）
+constexpr float CAPSULE_HALF_WIDTH = 0.5f;                // 胶囊体半宽（相对于半径）
+constexpr float TRIANGLE_HALF_SQRT3 = 0.866025404f;      // 三角形高度因子 = √3/2
+
+// 壁面边界条件超参数
+constexpr float SLIP_REFERENCE_VELOCITY = 100.0f;        // 滑移因子参考速度 [m/s]
+constexpr float SLIP_FACTOR_MAX = 0.8f;                   // 最大滑移因子
 #pragma endregion
 
 #pragma region 数学工具函数
@@ -105,10 +127,9 @@ __device__ __forceinline__ float sdfCircle(float px, float py, float cx, float c
 // 输出:带符号距离
 __device__ __forceinline__ float sdfStar(float px, float py, float cx, float cy, float r, float rotation)
 {
-    const float PI = 3.14159265359f;
     const int N = 5;                // 5个尖角
     const float outerR = r;         // 外圆半径(尖角处)
-    const float innerR = r * 0.38f; // 内圆半径(凹陷处，0.38是五角星的标准比例)
+    const float innerR = r * STAR_INNER_OUTER_RATIO; // 内圆半径(凹陷处，0.38是五角星的标准比例)
 
     // 转换到局部坐标系(以中心为原点)
     float lx = px - cx;
@@ -189,7 +210,7 @@ __device__ __forceinline__ float sdfDiamond(float px, float py, float cx, float 
 
     // SDF = (|x| + |y| - 1) * r / sqrt(2)
     // 0.7071 = 1/sqrt(2)，用于将L1距离转换为欧几里得等效距离
-    return (ndx + ndy - 1.0f) * r * 0.7071f;
+    return (ndx + ndy - 1.0f) * r * DIAMOND_HALF_SQRT2;
 }
 
 // 功能:计算点到胶囊形(圆角矩形)的带符号距离
@@ -209,8 +230,8 @@ __device__ __forceinline__ float sdfCapsule(float px, float py, float cx, float 
 
     // 核心思想是，胶囊形可以看作是一个半径为 capRadius 的圆，沿着一条线段“扫过”形成的区域
     // 胶囊参数: 水平方向的伸展
-    float halfWidth = r * 1.5f; // 胶囊的半长(中轴长度的一半)
-    float capRadius = r * 0.5f; // 两端圆弧的半径
+    float halfWidth = r * CAPSULE_HALF_HEIGHT; // 胶囊的半长(中轴长度的一半)
+    float capRadius = r * CAPSULE_HALF_WIDTH; // 两端圆弧的半径
 
     // 将x坐标限制到中轴线段上
     // 中轴线段范围: [-halfWidth + capRadius, halfWidth - capRadius]
@@ -243,7 +264,7 @@ __device__ __forceinline__ float sdfTriangle(float px, float py, float cx, float
     // 顶点0(右尖): (r, 0)
     // 顶点1(左上): (-r/2, r*sqrt(3)/2)
     // 顶点2(左下): (-r/2, -r*sqrt(3)/2)
-    const float sqrt3_2 = 0.866025404f; // sqrt(3)/2
+    const float sqrt3_2 = TRIANGLE_HALF_SQRT3; // sqrt(3)/2
     float v0x = r, v0y = 0.0f;
     float v1x = -r * 0.5f, v1y = r * sqrt3_2;
     float v2x = -r * 0.5f, v2y = -r * sqrt3_2;
@@ -429,7 +450,7 @@ __global__ void computeSDFKernel(float *sdf, uint8_t *cell_type,
 
     // 根据距离分类网格单元
     // band 是边界层的宽度，通常取1-2个网格间距
-    float band = 1.5f * fmaxf(dx, dy);
+    float band = SDF_BAND_WIDTH_FACTOR * fmaxf(dx, dy);
 
     if (dist < -band)
     {
@@ -492,7 +513,7 @@ __global__ void updateSDFWithFixupKernel(
     sdf[idx] = dist;
 
     // 计算新的网格类型
-    float band = 1.5f * fmaxf(dx, dy);
+    float band = SDF_BAND_WIDTH_FACTOR * fmaxf(dx, dy);
     uint8_t newType;
 
     if (dist < -band)
@@ -830,7 +851,7 @@ __device__ __forceinline__ void hllFluxX(
     float SR = fmaxf(uL + cL, uR + cR); // 取左右两侧的最大值
 
     // 熵修正：避免跨音速区域的膨胀激波问题
-    float delta = 0.1f * fmaxf(cL, cR); // 修正阈值取决于声速
+    float delta = ENTROPY_FIX_FACTOR * fmaxf(cL, cR); // 修正阈值取决于声速
     SL = -entropyFix(-SL, delta);       // 对负波速应用修正
     SR = entropyFix(SR, delta);         // 对正波速应用修正
 
@@ -912,7 +933,7 @@ __device__ __forceinline__ void hllcFluxX(
     float SR = fmaxf(uR + cR, u_roe + c_roe);
 
     // 熵修正，防止膨胀激波
-    float delta = 0.1f * fmaxf(cL, cR);
+    float delta = ENTROPY_FIX_FACTOR * fmaxf(cL, cR);
     if (fabsf(SL) < delta)
         SL = -delta;
     if (fabsf(SR) < delta)
@@ -1033,7 +1054,7 @@ __device__ __forceinline__ void hllFluxY(
     float ST = fmaxf(vT + cT, v_roe + c_roe);
 
     // 熵修正
-    float delta = 0.1f * fmaxf(cB, cT);
+    float delta = ENTROPY_FIX_FACTOR * fmaxf(cB, cT);
     SB = -entropyFix(-SB, delta);
     ST = entropyFix(ST, delta);
 
@@ -1109,7 +1130,7 @@ __device__ __forceinline__ void hllcFluxY(
     float ST = fmaxf(vT + cT, v_roe + c_roe);
 
     // 熵修正
-    float delta = 0.1f * fmaxf(cB, cT);
+    float delta = ENTROPY_FIX_FACTOR * fmaxf(cB, cT);
     if (fabsf(SB) < delta)
         SB = -delta;
     if (fabsf(ST) < delta)
@@ -1258,7 +1279,7 @@ __global__ void computeFluxesKernel(
                                  cell_type[idx_ip2] == CELL_SOLID || cell_type[idx_ip2] == CELL_GHOST);
 
             // 在低密度区域(如尾流)也使用一阶格式，防止数值不稳定
-            bool lowDensity = (rho[idx] < 0.01f || rho[idx_ip1] < 0.01f);
+            bool lowDensity = (rho[idx] < LOW_DENSITY_THRESHOLD || rho[idx_ip1] < LOW_DENSITY_THRESHOLD);
 
             float rhoL, uL, vL, pL, EL; // 界面左侧重构状态
             float rhoR, uR, vR, pR, ER; // 界面右侧重构状态
@@ -1375,7 +1396,7 @@ __global__ void computeFluxesKernel(
             bool nearBoundary = (cell_type[idx_jm1] == CELL_SOLID || cell_type[idx_jm1] == CELL_GHOST ||
                                  cell_type[idx_jp2] == CELL_SOLID || cell_type[idx_jp2] == CELL_GHOST);
 
-            bool lowDensity = (rho[idx] < 0.01f || rho[idx_jp1] < 0.01f);
+            bool lowDensity = (rho[idx] < LOW_DENSITY_THRESHOLD || rho[idx_jp1] < LOW_DENSITY_THRESHOLD);
 
             float rhoB, uB, vB, pB, EB; // 界面下方(Bottom)状态
             float rhoT, uT, vT, pT, ET; // 界面上方(Top)状态
@@ -1582,7 +1603,7 @@ __global__ void updateKernel(
     float u_new = new_rho_u / new_rho;
     float v_new = new_rho_v / new_rho;
     float vel_mag = sqrtf(u_new * u_new + v_new * v_new);
-    float max_vel = 5000.0f; // 最大速度限制 [m/s]
+    float max_vel = MAX_VELOCITY_LIMIT; // 最大速度限制 [m/s]
     if (vel_mag > max_vel)
     {
         // 等比例缩放速度到最大值
@@ -1615,7 +1636,7 @@ __global__ void updateKernel(
     // 切换准则: eta = e_internal / E_total
     // 当 eta 小时，KE 占主导，E-KE减法不可靠
     float eta = e_from_e / (new_E + 1e-20f);
-    float eta_threshold = 0.1f; // 阈值以下使用e法
+    float eta_threshold = DUAL_ENERGY_ETA_THRESHOLD; // 阈值以下使用e法
 
     float e_internal;
     if (eta > eta_threshold && e_from_E > 0.0f)
@@ -1925,8 +1946,8 @@ __global__ void applyBoundaryConditionsKernel(
             // 当流体高速撞击壁面时，使用更多滑移减少数值振荡
             if (vn > 0.0f)
             {
-                float vn_ref = 100.0f; // 参考速度
-                slip_factor = fminf(0.8f, vn / (vn + vn_ref));
+                float vn_ref = SLIP_REFERENCE_VELOCITY; // 参考速度
+                slip_factor = fminf(SLIP_FACTOR_MAX, vn / (vn + vn_ref));
             }
 
             // 无滑移条件(镜像)
@@ -1945,7 +1966,7 @@ __global__ void applyBoundaryConditionsKernel(
 
         // 限制虚拟网格速度大小，防止数值不稳定
         float vel_g_mag = sqrtf(u_g * u_g + v_g * v_g);
-        float max_ghost_vel = 2500.0f;
+        float max_ghost_vel = MAX_GHOST_VELOCITY;
         if (vel_g_mag > max_ghost_vel)
         {
             float scale = max_ghost_vel / vel_g_mag;
@@ -1998,27 +2019,6 @@ __global__ void applyBoundaryConditionsKernel(
 #pragma endregion
 
 #pragma region 有粘性逻辑
-// 功能:使用Sutherland公式计算粘性系数和热导率(独立版本，用于初始化)
-// 输入:温度场 T, 网格尺寸 nx, ny
-// 输出:动力粘性系数场 mu, 热导率场 k
-__global__ void computeViscosityKernel(const float *T, float *mu, float *k, int nx, int ny)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (i >= nx || j >= ny)
-        return;
-
-    int idx = j * nx + i;
-
-    float T_val = fmaxf(T[idx], MIN_TEMPERATURE);
-    T_val = fminf(T_val, MAX_TEMPERATURE);
-
-    float mu_val = MU_REF * powf(T_val / T_REF, 1.5f) * (T_REF + S_SUTHERLAND) / (T_val + S_SUTHERLAND);
-    mu[idx] = mu_val;
-    k[idx] = mu_val * CP / PRANDTL_NUMBER;
-}
-
 // 功能:融合核函数 - 一次性计算粘性系数、应力张量和热通量
 // 输入:速度场 u,v, 温度场 T, 网格类型, 网格间距 dx,dy
 // 输出:粘性系数 mu(供CFL使用), 应力张量 tau_xx/yy/xy, 热通量 qx/qy
@@ -2333,16 +2333,6 @@ void CFDSolver::launchApplyBoundaryConditionsKernel(float *rho, float *rho_u, fl
 #pragma endregion
 
 #pragma region 有粘性条件
-// 功能:启动粘性系数计算核函数
-void CFDSolver::launchComputeViscosityKernel(const float *T, float *mu, float *k, int nx, int ny)
-{
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
-
-    computeViscosityKernel<<<grid, block>>>(T, mu, k, nx, ny);
-    CUDA_CHECK(cudaGetLastError());
-}
-
 // 功能:启动融合粘性项核函数(替代 Viscosity+StressTensor+HeatFlux 三次调用)
 // 说明:单次内核启动完成 Sutherland粘性 + 应力张量 + 热通量 的全部计算
 void CFDSolver::launchComputeViscousTermsKernel(
@@ -2624,7 +2614,6 @@ void CFDSolver::allocateMemory()
 
     // 7. 分配粘性相关数组(Navier-Stokes)
     CUDA_CHECK(cudaMalloc(&d_mu_, size));     // 动力粘性系数
-    CUDA_CHECK(cudaMalloc(&d_k_, size));      // 热导率
     CUDA_CHECK(cudaMalloc(&d_tau_xx_, size)); // 应力张量XX分量
     CUDA_CHECK(cudaMalloc(&d_tau_yy_, size)); // 应力张量YY分量
     CUDA_CHECK(cudaMalloc(&d_tau_xy_, size)); // 应力张量XY分量
@@ -2711,8 +2700,6 @@ void CFDSolver::freeMemory()
     // 释放粘性相关数组
     if (d_mu_)
         cudaFree(d_mu_);
-    if (d_k_)
-        cudaFree(d_k_);
     if (d_tau_xx_)
         cudaFree(d_tau_xx_);
     if (d_tau_yy_)
@@ -2740,7 +2727,7 @@ void CFDSolver::freeMemory()
     d_reduction_output_ = nullptr;
     d_scratch_ = nullptr;
     reduction_buffer_size_ = 0; // 重置缓冲区大小
-    d_mu_ = d_k_ = d_tau_xx_ = d_tau_yy_ = d_tau_xy_ = d_qx_ = d_qy_ = nullptr;
+    d_mu_ = d_tau_xx_ = d_tau_yy_ = d_tau_xy_ = d_qx_ = d_qy_ = nullptr;
     d_atomic_counter_ = nullptr;
 }
 
@@ -2793,7 +2780,11 @@ void CFDSolver::reset(const SimParams &params)
                                   d_u_, d_v_, d_p_, d_T_, _nx, _ny);
 
     // 5. 初始化粘性场(确保 computeStableTimeStep 首次调用时 d_mu_ 有效)
-    launchComputeViscosityKernel(d_T_, d_mu_, d_k_, _nx, _ny);
+    //    使用融合核函数: 内部同时计算 mu / tau / q，但此处只需 mu 输出
+    launchComputeViscousTermsKernel(d_u_, d_v_, d_T_,
+                                    d_mu_, d_tau_xx_, d_tau_yy_, d_tau_xy_,
+                                    d_qx_, d_qy_, d_cell_type_,
+                                    params.dx, params.dy, _nx, _ny);
 
     // 同步确保完成
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -2988,13 +2979,6 @@ float CFDSolver::getMaxMach()
     return launchComputeMaxMach(d_u_, d_v_, d_p_, d_rho_, _nx, _ny);
 }
 
-// 功能:获取速度场
-void CFDSolver::getVelocityField(float *host_u, float *host_v)
-{
-    CUDA_CHECK(cudaMemcpy(host_u, d_u_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(host_v, d_v_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToHost));
-}
-
 // 功能:获取网格类型
 void CFDSolver::getCellTypes(uint8_t *host_types)
 {
@@ -3040,8 +3024,8 @@ size_t CFDSolver::getSimulationMemoryUsage()
     // 归约用临时计算缓冲区
     totalMemory += gridSize * floatSize; // d_scratch_
 
-    // 粘性相关数组 - 7个数组
-    totalMemory += gridSize * floatSize * 7; // mu, k, tau_xx, tau_yy, tau_xy, qx, qy
+    // 粘性相关数组 - 6个数组
+    totalMemory += gridSize * floatSize * 6; // mu, tau_xx, tau_yy, tau_xy, qx, qy
 
     // 原子计数器
     totalMemory += sizeof(int); // d_atomic_counter_

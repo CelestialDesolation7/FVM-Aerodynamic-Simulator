@@ -17,8 +17,6 @@
     } while (0)
 #pragma endregion
 
-constexpr size_t MEM_PER_UNIT = 20; // 每个网格单元大约占用的字节数（估算值）
-
 class CFDSolver
 {
 public:
@@ -39,8 +37,7 @@ public:
     // 适用于：障碍物位置、大小、旋转、形状、襟翼角度的任意变化
     void updateObstacleGeometry(const SimParams &params);
 
-    // 主机端数据传输（矢量可视化和网格类型更新用）
-    void getVelocityField(float *host_u, float *host_v);
+    // 主机端数据传输（网格类型更新用）
     void getCellTypes(uint8_t *host_types);
 
     // GPU零拷贝路径（CUDA-OpenGL互操作）
@@ -75,12 +72,6 @@ private:
     // 显存分配器
     void allocateMemory();
     void freeMemory();
-
-    // 基于指定的障碍物几何形状初始化网格类型
-    void updateCellTypes(const SimParams &params);
-
-    // 计算SDF（有符号距离场）以便实现Ghost Cell方法
-    void computeSDF(const SimParams &params);
 
     // 网格维度
     int _nx = 1024;
@@ -136,7 +127,6 @@ private:
 
     // 粘性相关中间量 (Navier-Stokes方程)
     float *d_mu_ = nullptr;     // 动态更新的粘度值场
-    float *d_k_ = nullptr;      // 热导率场
     float *d_tau_xx_ = nullptr; // x轴方向-粘性力动量-通量场
     float *d_tau_yy_ = nullptr; // y轴方向-粘性力动量-通量场
     float *d_tau_xy_ = nullptr; // x和y轴方向-摩擦力动量-通量场
@@ -225,11 +215,6 @@ private:
     // 实现:使用CUB库高效归约，单阶段GPU完成
     float launchComputeMaxWaveSpeed(const float *u, const float *v, const float *p,
                                     const float *rho, int nx, int ny);
-
-    // 功能:启动粘性计算核函数，使用Sutherland公式(独立版本，仅用于初始化)
-    // 输入:温度场，网格尺寸
-    // 输出:动力粘性系数场 mu 和热导率场 k
-    void launchComputeViscosityKernel(const float *T, float *mu, float *k, int nx, int ny);
 
     // 功能:启动融合粘性项核函数(替代上述三个独立核函数的调用)
     // 输入:速度场(u,v)，温度场(T)，网格类型，网格间距

@@ -87,9 +87,6 @@ struct SimParams
     float T_wall = 300.0f;         // 壁面温度，单位 K
 
     // 输出设置
-    float T_min = 250.0f;       // 温度映射最小值，单位 K
-    float T_max = 800.0f;       // 温度映射最大值，单位 K
-    bool show_velocity = false; // 是否显示速度矢量场
     bool paused = true;         // 仿真是否暂停
 
     // 配置更新时调用
@@ -102,25 +99,6 @@ struct SimParams
         dy = domain_height / (float)ny;
         obstacle_y = domain_height / 2.0f; // 障碍物中心y轴坐标放中间
     }
-};
-
-// 保存守恒变量的结构体
-struct ConservedVars
-{
-    float rho;   // 密度
-    float rho_u; // x方向动量
-    float rho_v; // y方向动量
-    float E;     // 总能量
-};
-
-// 保存原始变量的结构体
-struct PrimitiveVars
-{
-    float rho; // 密度
-    float u;   // x方向速度
-    float v;   // y方向速度
-    float p;   // 压强
-    float T;   // 温度
 };
 
 // 单元格分类

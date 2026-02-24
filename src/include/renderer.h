@@ -30,7 +30,6 @@ enum class FieldType
     MACH          // 马赫数场
 };
 #pragma endregion
-#pragma endregion
 
 #pragma region 色图辅助函数
 // 全局辅助函数：根据色图类型和归一化值(0~1)计算RGB颜色
@@ -95,7 +94,6 @@ inline void getColormapColor(ColormapType colormap, float t, float &r, float &g,
         break;
     }
 }
-#pragma endregion
 #pragma endregion
 
 #pragma region 渲染器类定义

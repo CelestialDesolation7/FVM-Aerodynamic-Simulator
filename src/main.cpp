@@ -100,6 +100,20 @@ constexpr float DENSITY_MAX_LIMIT = 10.0f;
 constexpr float VELOCITY_MAX_LIMIT = 2000.0f;
 constexpr float MACH_MAX_LIMIT = 10.0f;
 
+// 矢量箭头渲染常量
+constexpr float ARROW_HEAD_ANGLE = 0.5f;               // 箭头头部张角 [rad]
+constexpr float ARROW_HEAD_LENGTH_RATIO = 0.3f;        // 箭头头部占箭身比例
+constexpr float ARROW_LENGTH_SCALE = 0.8f;             // 箭头长度缩放因子（相对于网格间距）
+constexpr int VERTICES_PER_ARROW = 8;                  // 每箭头顶点数（箭身2+头部6）
+
+// 性能监控节流常量
+constexpr float STATS_THROTTLE_INTERVAL = 0.25f;       // 统计归约节流间隔 [秒]
+constexpr float FPS_UPDATE_INTERVAL = 0.5f;            // FPS显示更新间隔 [秒]
+
+// CUDA环境检测常量
+constexpr int MIN_COMPUTE_CAPABILITY_MAJOR = 7;        // 最低计算能力主版本号
+constexpr int MIN_COMPUTE_CAPABILITY_MINOR = 5;        // 最低计算能力次版本号
+
 #pragma endregion
 
 #pragma region 窗口回调函数
@@ -239,11 +253,9 @@ void solverThreadFunc()
         if (renderer.getShowVectors())
         {
             int step = renderer.getVectorDensity();
-            const float arrowHeadAngle = 0.5f;
-            const float arrowHeadLength = 0.3f;
             float cellWidth = 2.0f / params.nx;
             float cellHeight = 2.0f / params.ny;
-            float maxArrowLength = std::min(cellWidth, cellHeight) * (step * 0.8f);
+            float maxArrowLength = std::min(cellWidth, cellHeight) * (step * ARROW_LENGTH_SCALE);
 
             int vboCapacity = renderer.getMappedVectorCapacity();
             float *devVertexData = renderer.getMappedVectorPtr();
@@ -252,7 +264,7 @@ void solverThreadFunc()
                 int numVertices = solver.generateVectorArrows(
                     devVertexData, vboCapacity,
                     step, params.u_inf,
-                    maxArrowLength, arrowHeadAngle, arrowHeadLength);
+                    maxArrowLength, ARROW_HEAD_ANGLE, ARROW_HEAD_LENGTH_RATIO);
                 g_solverResults.vectorVertexCount = numVertices;
             }
         }
@@ -261,7 +273,7 @@ void solverThreadFunc()
         {
             static auto lastStatsTime = std::chrono::high_resolution_clock::now();
             auto statsNow = std::chrono::high_resolution_clock::now();
-            if (std::chrono::duration<float>(statsNow - lastStatsTime).count() >= 0.25f)
+            if (std::chrono::duration<float>(statsNow - lastStatsTime).count() >= STATS_THROTTLE_INTERVAL)
             {
                 g_solverResults.maxTemp = solver.getMaxTemperature();
                 g_solverResults.maxMach = solver.getMaxMach();
@@ -703,8 +715,8 @@ void renderUI()
 
         // Labels
         const char *unit = "";
-        float minVal = params.T_min;
-        float maxVal = params.T_max;
+        float minVal = 0.0f;
+        float maxVal = 1.0f;
 
         switch (currentField)
         {
@@ -816,13 +828,11 @@ void updateVisualization()
         int step = renderer.getVectorDensity();
 
         // 计算箭头参数
-        const float arrowHeadAngle = 0.5f;
-        const float arrowHeadLength = 0.3f;
 
         // 计算单个格子在NDC中的尺寸
         float cellWidth = 2.0f / params.nx;
         float cellHeight = 2.0f / params.ny;
-        float maxArrowLength = std::min(cellWidth, cellHeight) * (step * 0.8f);
+        float maxArrowLength = std::min(cellWidth, cellHeight) * (step * ARROW_LENGTH_SCALE);
 
         // 计算最大可能的箭头数量（每个箭头8个顶点）
         int numArrowsX = (params.nx + step - 1) / step;
@@ -840,7 +850,7 @@ void updateVisualization()
             int numVertices = solver.generateVectorArrows(
                 devVertexData, vboCapacity,
                 step, params.u_inf,
-                maxArrowLength, arrowHeadAngle, arrowHeadLength);
+                maxArrowLength, ARROW_HEAD_ANGLE, ARROW_HEAD_LENGTH_RATIO);
 
             // 提交VBO：unmap → swap → remap
             renderer.submitVectors(numVertices);
@@ -949,7 +959,7 @@ bool checkCudaAvailability()
 
         // 检查计算能力是否足够（至少需要 7.5，对应 RTX 20 系列）
         int computeCapability = prop.major * 10 + prop.minor;
-        if (computeCapability < 75)
+        if (computeCapability < MIN_COMPUTE_CAPABILITY_MAJOR * 10 + MIN_COMPUTE_CAPABILITY_MINOR)
         {
             std::cerr << "========================================" << std::endl;
             std::cerr << "[警告] GPU 计算能力较低 (" << prop.major << "." << prop.minor << ")" << std::endl;
@@ -1139,7 +1149,7 @@ int main(int argc, char *argv[])
             int step = renderer.getVectorDensity();
             int numArrowsX = (params.nx + step - 1) / step;
             int numArrowsY = (params.ny + step - 1) / step;
-            int maxVertices = numArrowsX * numArrowsY * 8;
+            int maxVertices = numArrowsX * numArrowsY * VERTICES_PER_ARROW;
             renderer.ensureVectorVBOCapacity(maxVertices);
         }
 
@@ -1174,7 +1184,7 @@ int main(int argc, char *argv[])
         auto currentTime = std::chrono::high_resolution_clock::now();
         float elapsed = std::chrono::duration<float>(currentTime - lastTime).count();
 
-        if (elapsed >= 0.5f)
+        if (elapsed >= FPS_UPDATE_INTERVAL)
         {
             fps = frameCount / elapsed;
             frameCount = 0;
