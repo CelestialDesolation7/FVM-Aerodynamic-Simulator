@@ -300,6 +300,15 @@ bool Renderer::initCudaInterop(int nx, int ny)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, nx, ny, 0, GL_RED, GL_FLOAT, nullptr);
     glBindTexture(GL_TEXTURE_2D, 0);
 
+    // 分配物理场暂存缓冲区（纯CUDA设备内存，不依赖GL上下文）
+    if (d_fieldStaging_) { cudaFree(d_fieldStaging_); d_fieldStaging_ = nullptr; }
+    cudaError_t stagingErr = cudaMalloc(&d_fieldStaging_, bufferSize);
+    if (stagingErr != cudaSuccess)
+    {
+        fprintf(stderr, "[CUDA互操作] 分配物理场暂存缓冲区失败: %s\n", cudaGetErrorString(stagingErr));
+        d_fieldStaging_ = nullptr;
+    }
+
     mappedSize_ = bufferSize;
     writeIndex_ = 0;
     cudaInteropEnabled_ = true;
@@ -337,6 +346,12 @@ void Renderer::cleanupCudaInterop()
         }
     }
     
+    // 释放暂存缓冲区
+    if (d_fieldStaging_) { cudaFree(d_fieldStaging_); d_fieldStaging_ = nullptr; }
+    if (d_vectorStaging_) { cudaFree(d_vectorStaging_); d_vectorStaging_ = nullptr; }
+    vectorStagingCapacity_ = 0;
+    vectorStagingVertexCount_ = 0;
+
     cudaInteropEnabled_ = false;
     mappedSize_ = 0;
     writeIndex_ = 0;
@@ -407,6 +422,87 @@ void Renderer::unmapFieldTexture()
     // 解绑
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+}
+
+// GL线程：从暂存缓冲区提交到PBO/纹理
+// 流程：map PBO → memcpy(staging→PBO) → unmap PBO → PBO→纹理 → 交换索引
+void Renderer::commitFieldFromStaging()
+{
+    if (!cudaInteropEnabled_ || !d_fieldStaging_ || !cudaPBOResource_[writeIndex_])
+        return;
+
+    // 映射PBO（GL线程有OpenGL上下文，可以安全调用）
+    cudaError_t err = cudaGraphicsMapResources(1, &cudaPBOResource_[writeIndex_], 0);
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "[CUDA互操作] commitField: 映射PBO[%d]失败: %s\n", writeIndex_, cudaGetErrorString(err));
+        return;
+    }
+
+    float *devPtr = nullptr;
+    size_t size = 0;
+    err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void **>(&devPtr), &size, cudaPBOResource_[writeIndex_]);
+    if (err != cudaSuccess)
+    {
+        cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
+        return;
+    }
+
+    // 设备到设备拷贝：暂存 → PBO（GPU内部带宽，~4μs for 2MB）
+    cudaMemcpy(devPtr, d_fieldStaging_, mappedSize_, cudaMemcpyDeviceToDevice);
+
+    // 取消映射
+    cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
+
+    // PBO → 纹理（GPU内部DMA）
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_[writeIndex_]);
+    glBindTexture(GL_TEXTURE_2D, fieldTexture_);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx_, ny_, GL_RED, GL_FLOAT, nullptr);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+    // 交换写入索引
+    writeIndex_ = 1 - writeIndex_;
+}
+
+// GL线程：从暂存缓冲区提交到VBO
+void Renderer::commitVectorsFromStaging()
+{
+    if (!cudaInteropEnabled_ || !d_vectorStaging_ || vectorStagingVertexCount_ <= 0)
+        return;
+
+    if (!cudaVectorVBOResource_[vectorWriteIndex_])
+        return;
+
+    cudaError_t err = cudaGraphicsMapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
+    if (err != cudaSuccess)
+        return;
+
+    float *devPtr = nullptr;
+    size_t size = 0;
+    err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void **>(&devPtr), &size,
+                                               cudaVectorVBOResource_[vectorWriteIndex_]);
+    if (err != cudaSuccess)
+    {
+        cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
+        return;
+    }
+
+    size_t copyBytes = vectorStagingVertexCount_ * 5 * sizeof(float);
+    cudaMemcpy(devPtr, d_vectorStaging_, copyBytes, cudaMemcpyDeviceToDevice);
+
+    cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
+
+    vectorVertexCount_[vectorWriteIndex_] = vectorStagingVertexCount_;
+    vectorWriteIndex_ = 1 - vectorWriteIndex_;
+    vectorStagingVertexCount_ = 0;
+}
+
+// 快照矢量箭头渲染状态：在安全区域调用，确定并行渲染时使用哪个VBO
+void Renderer::prepareVectorRender()
+{
+    vectorRenderReadIndex_ = 1 - vectorWriteIndex_;
+    vectorRenderVertexCount_ = vectorVertexCount_[vectorRenderReadIndex_];
 }
 
 // 重新调整互操作缓冲区尺寸
@@ -739,6 +835,30 @@ void Renderer::ensureVectorVBOCapacity(int requiredVertices)
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     
+    // 注册两个VBO为CUDA图形资源（必须在GL线程调用）
+    for (int i = 0; i < 2; i++)
+    {
+        cudaError_t err = cudaGraphicsGLRegisterBuffer(
+            &cudaVectorVBOResource_[i],
+            vectorVBO_[i],
+            cudaGraphicsRegisterFlagsWriteDiscard);
+        if (err != cudaSuccess)
+        {
+            fprintf(stderr, "[错误] 注册矢量VBO[%d]失败: %s\n", i, cudaGetErrorString(err));
+        }
+    }
+
+    // 同步调整矢量暂存缓冲区
+    if (d_vectorStaging_) { cudaFree(d_vectorStaging_); d_vectorStaging_ = nullptr; }
+    cudaError_t stagingErr = cudaMalloc(&d_vectorStaging_, requiredBytes);
+    if (stagingErr != cudaSuccess)
+    {
+        fprintf(stderr, "[错误] 分配矢量暂存缓冲区失败: %s\n", cudaGetErrorString(stagingErr));
+        d_vectorStaging_ = nullptr;
+    }
+    vectorStagingCapacity_ = requiredBytes;
+    vectorStagingVertexCount_ = 0;
+
     vectorVBOCapacity_ = requiredVertices;
     vectorVertexCount_[0] = vectorVertexCount_[1] = 0;
     
@@ -762,21 +882,12 @@ float *Renderer::mapVectorVBO(int &outMaxVertices)
         return nullptr;
     }
     
-    // 确保当前writeIndex的VBO已注册
+    // 检查当前writeIndex的VBO是否已注册（应由ensureVectorVBOCapacity预注册）
     if (!cudaVectorVBOResource_[vectorWriteIndex_])
     {
-        cudaError_t err = cudaGraphicsGLRegisterBuffer(
-            &cudaVectorVBOResource_[vectorWriteIndex_],
-            vectorVBO_[vectorWriteIndex_],
-            cudaGraphicsRegisterFlagsWriteDiscard);
-        
-        if (err != cudaSuccess)
-        {
-            std::cerr << "[错误] 注册矢量VBO[" << vectorWriteIndex_ << "]失败: " 
-                      << cudaGetErrorString(err) << "\n";
-            outMaxVertices = 0;
-            return nullptr;
-        }
+        std::cerr << "[错误] 矢量VBO[" << vectorWriteIndex_ << "]未注册CUDA资源\n";
+        outMaxVertices = 0;
+        return nullptr;
     }
     
     // 映射当前writeIndex的VBO资源
@@ -863,8 +974,8 @@ void Renderer::render(const SimParams &params)
     // 绘制readIndex的VBO（CUDA正在写入另一个VBO）
     if (showVectors_)
     {
-        int readIndex = 1 - vectorWriteIndex_;
-        int vertexCount = vectorVertexCount_[readIndex];
+        int readIndex = vectorRenderReadIndex_;
+        int vertexCount = vectorRenderVertexCount_;
         
         if (vertexCount > 0)
         {

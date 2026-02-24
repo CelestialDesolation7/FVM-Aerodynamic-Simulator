@@ -170,6 +170,21 @@ public:
     // 设置场值范围（零拷贝模式下使用，无数据传输）
     void setFieldRange(float minVal, float maxVal, FieldType type);
 
+    // 快照矢量箭头渲染状态，供并行渲染阶段安全使用（安全区域调用）
+    void prepareVectorRender();
+
+    // === 多线程暂存缓冲区接口 ===
+    // 获取纯CUDA暂存缓冲区指针（供solver线程写入可视化数据，无需GL上下文）
+    float *getFieldStagingBuffer() const { return d_fieldStaging_; }
+    float *getVectorStagingBuffer() const { return d_vectorStaging_; }
+    int getVectorStagingCapacityVertices() const { return static_cast<int>(vectorStagingCapacity_ / (5 * sizeof(float))); }
+    void setVectorStagingVertexCount(int count) { vectorStagingVertexCount_ = count; }
+
+    // GL线程：从暂存缓冲区提交到PBO/纹理（map → memcpy → unmap → upload）
+    void commitFieldFromStaging();
+    // GL线程：从暂存缓冲区提交到VBO（map → memcpy → unmap → swap）
+    void commitVectorsFromStaging();
+
     // 检查互操作是否已启用
     bool isCudaInteropEnabled() const { return cudaInteropEnabled_; }
 
@@ -216,6 +231,10 @@ private:
     int vectorWriteIndex_ = 0;          // 当前CUDA写入的VBO索引（0或1）
     bool vectorVBOMapped_ = false;     // VBO是否已映射
 
+    // 缓存的矢量渲染状态（安全区域设置，并行渲染使用）
+    int vectorRenderReadIndex_ = 0;
+    int vectorRenderVertexCount_ = 0;
+
     // 渲染设置
     ColormapType colormap_ = ColormapType::JET; // 当前色图类型
     bool showVectors_ = false;                  // 是否显示速度矢量
@@ -237,6 +256,12 @@ private:
     cudaGraphicsResource *cudaPBOResource_[2] = {nullptr, nullptr}; // 对应的CUDA资源句柄
     int writeIndex_ = 0;                                            // 当前CUDA写入的PBO索引（0或1）
     size_t mappedSize_ = 0;                                         // 单个PBO的缓冲区大小
+
+    // 多线程暂存缓冲区（纯CUDA设备内存，solver线程写入，GL线程读出）
+    float *d_fieldStaging_ = nullptr;     // 物理场暂存（nx*ny float）
+    float *d_vectorStaging_ = nullptr;    // 矢量箭头暂存（顶点数*5 float）
+    size_t vectorStagingCapacity_ = 0;    // 矢量暂存容量（字节）
+    int vectorStagingVertexCount_ = 0;    // 本帧实际矢量顶点数
 
     // 着色器创建和编译的工具函数
     bool createShaders();                                     // 创建主渲染着色器

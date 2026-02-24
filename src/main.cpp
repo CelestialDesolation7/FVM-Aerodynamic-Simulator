@@ -71,6 +71,14 @@ float cachedMaxMach = 0.0f;
 // 垂直同步控制
 bool vsyncEnabled = true;
 
+// 求解器帧结果（求解器线程DONE前写入，渲染线程DONE后读取，通过条件变量同步保护）
+struct SolverFrameResults {
+    float maxTemp = 0.0f;
+    float maxMach = 0.0f;
+    float simTimePerStep = 0.0f;
+};
+SolverFrameResults g_solverResults;
+
 // 颜色映射范围控制变量（绝对值）
 float temperature_min = 200.0f; // 温度下限 (K)
 float temperature_max = 400.0f; // 温度上限 (K)
@@ -172,8 +180,8 @@ bool initializeSimulation()
 #pragma region 求解器线程
 // 求解器线程函数：独立于渲染线程运行仿真计算
 // 采用"生产者-消费者"帧同步模型：
-//   每批计算 stepsPerFrame 步后停止，等待渲染线程消费完数据再开始下一批
-//   保证求解器和渲染器永不同时访问GPU数据
+//   每批计算 stepsPerFrame 步 + 可视化写入PBO/VBO + 统计归约
+//   全部GPU工作完成后通知渲染线程，实现最大化并行
 void solverThreadFunc()
 {
     cudaSetDevice(0);
@@ -189,7 +197,7 @@ void solverThreadFunc()
             if (g_solverShouldStop) return;
         }
 
-        // 计算一批仿真步（此期间渲染线程不会访问solver数据）
+        // ==================== 1. 仿真计算 ====================
         auto simStart = std::chrono::high_resolution_clock::now();
 
         float dt = solver.computeStableTimeStep(params);
@@ -200,13 +208,71 @@ void solverThreadFunc()
             solver.step(params);
         }
 
-        // 关键：确保所有GPU工作完成，渲染线程可立即读取最新数据
+        // ==================== 2. 可视化：写入暂存缓冲区（纯CUDA，无需GL上下文） ====================
+        float *devPtr = renderer.getFieldStagingBuffer();
+        if (devPtr)
+        {
+            switch (currentField)
+            {
+            case FieldType::TEMPERATURE:
+                solver.computeTemperatureToDevice(devPtr);
+                break;
+            case FieldType::PRESSURE:
+                solver.computePressureToDevice(devPtr);
+                break;
+            case FieldType::DENSITY:
+                solver.computeDensityToDevice(devPtr);
+                break;
+            case FieldType::VELOCITY_MAG:
+                solver.computeVelocityMagToDevice(devPtr);
+                break;
+            case FieldType::MACH:
+                solver.computeMachToDevice(devPtr);
+                break;
+            }
+        }
+
+        // ==================== 3. 矢量箭头：写入暂存缓冲区（纯CUDA，无需GL上下文） ====================
+        if (renderer.getShowVectors())
+        {
+            int step = renderer.getVectorDensity();
+            const float arrowHeadAngle = 0.5f;
+            const float arrowHeadLength = 0.3f;
+            float cellWidth = 2.0f / params.nx;
+            float cellHeight = 2.0f / params.ny;
+            float maxArrowLength = std::min(cellWidth, cellHeight) * (step * 0.8f);
+
+            int vboCapacity = renderer.getVectorStagingCapacityVertices();
+            float *devVertexData = renderer.getVectorStagingBuffer();
+            if (devVertexData && vboCapacity > 0)
+            {
+                int numVertices = solver.generateVectorArrows(
+                    devVertexData, vboCapacity,
+                    step, params.u_inf,
+                    maxArrowLength, arrowHeadAngle, arrowHeadLength);
+                renderer.setVectorStagingVertexCount(numVertices);
+            }
+        }
+
+        // ==================== 4. 统计归约（节流至0.25秒一次） ====================
+        {
+            static auto lastStatsTime = std::chrono::high_resolution_clock::now();
+            auto statsNow = std::chrono::high_resolution_clock::now();
+            if (std::chrono::duration<float>(statsNow - lastStatsTime).count() >= 0.25f)
+            {
+                g_solverResults.maxTemp = solver.getMaxTemperature();
+                g_solverResults.maxMach = solver.getMaxMach();
+                lastStatsTime = statsNow;
+            }
+        }
+
+        // ==================== 5. 同步所有GPU工作 ====================
         cudaDeviceSynchronize();
 
         auto simEnd = std::chrono::high_resolution_clock::now();
-        simTimePerStep = std::chrono::duration<float>(simEnd - simStart).count() / n;
+        g_solverResults.simTimePerStep = std::chrono::duration<float>(simEnd - simStart).count() / n;
 
-        // 通知渲染线程：本批计算完成
+        // ==================== 6. 通知渲染线程 ====================
         {
             std::lock_guard<std::mutex> lock(g_solverMutex);
             g_solverState = SolverState::DONE;
@@ -1004,6 +1070,7 @@ int main(int argc, char *argv[])
         glfwPollEvents();
 
         // ==================== 等待求解器完成 ====================
+        bool hasNewResults = false;
         {
             std::unique_lock<std::mutex> lock(g_solverMutex);
             if (g_solverState == SolverState::RUNNING)
@@ -1012,6 +1079,9 @@ int main(int argc, char *argv[])
                     return g_solverState != SolverState::RUNNING;
                 });
             }
+            // 消费DONE状态：标记有新结果可用
+            hasNewResults = (g_solverState == SolverState::DONE);
+            if (hasNewResults) g_solverState = SolverState::IDLE;
         }
 
         // ========= 安全区域：求解器不运行，可自由访问GPU数据 =========
@@ -1024,36 +1094,65 @@ int main(int argc, char *argv[])
             solver.reset(params);
         }
 
+        // 消费求解器帧结果：暂存→PBO/VBO提交 + 准备渲染状态 + 读取统计
+        if (hasNewResults)
+        {
+            renderer.commitFieldFromStaging();    // GL: staging→PBO→纹理
+            renderer.commitVectorsFromStaging();  // GL: staging→VBO + swap
+            renderer.prepareVectorRender();       // 快照VBO读取索引
+            cachedMaxTemp = g_solverResults.maxTemp;
+            cachedMaxMach = g_solverResults.maxMach;
+            simTimePerStep = g_solverResults.simTimePerStep;
+        }
+
         // ImGui帧开始 + UI逻辑（所有solver交互在此安全发生）
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         renderUI();
 
-        // 更新可视化数据（CUDA写入PBO，读取solver的GPU缓冲区）
-        updateVisualization();
-
-        // 更新缓存统计数据（节流至0.25秒一次，避免每帧CUB归约）
+        // 设置场值范围（用于渲染着色器）
         {
-            static auto lastStatsTime = std::chrono::high_resolution_clock::now();
-            auto statsNow = std::chrono::high_resolution_clock::now();
-            if (std::chrono::duration<float>(statsNow - lastStatsTime).count() >= 0.25f)
+            float minVal, maxVal;
+            switch (currentField)
             {
-                cachedMaxTemp = solver.getMaxTemperature();
-                cachedMaxMach = solver.getMaxMach();
-                lastStatsTime = statsNow;
+            case FieldType::TEMPERATURE: minVal = temperature_min; maxVal = temperature_max; break;
+            case FieldType::PRESSURE:    minVal = pressure_min;    maxVal = pressure_max;    break;
+            case FieldType::DENSITY:     minVal = density_min;     maxVal = density_max;     break;
+            case FieldType::VELOCITY_MAG: minVal = 0.0f;           maxVal = velocity_max;    break;
+            case FieldType::MACH:        minVal = 0.0f;            maxVal = mach_max;        break;
             }
+            renderer.setFieldRange(minVal, maxVal, currentField);
         }
 
-        // ==================== 信号求解器开始下一批 ====================
+        // 确保矢量VBO容量（GL操作，必须在GL线程；在solver使用前完成）
+        if (renderer.getShowVectors())
+        {
+            int step = renderer.getVectorDensity();
+            int numArrowsX = (params.nx + step - 1) / step;
+            int numArrowsY = (params.ny + step - 1) / step;
+            int maxVertices = numArrowsX * numArrowsY * 8;
+            renderer.ensureVectorVBOCapacity(maxVertices);
+        }
+
+        // ==================== 信号求解器或处理暂停 ====================
         if (!params.paused)
         {
+            // 非暂停：启动求解器线程（计算、可视化、统计全部在solver线程完成）
             std::lock_guard<std::mutex> lock(g_solverMutex);
             g_solverState = SolverState::RUNNING;
             g_solverCV.notify_one();
         }
+        else
+        {
+            // 暂停时：在渲染线程直接更新可视化（用户可能切换显示物理量）
+            updateVisualization();
+        }
 
-        // ====== 并行区域：OpenGL渲染（求解器可能正在GPU上计算下一帧）======
+        // ====== 并行区域：OpenGL渲染 ======
+        // 此时求解器线程可能正在GPU上计算下一帧：
+        //   - solver CUDA写入PBO[A] 的同时，GL从纹理（来自PBO[B]）渲染
+        //   - solver CUDA写入VBO[A] 的同时，GL从VBO[B]绘制矢量箭头
         renderer.render(params);
 
         ImGui::Render();
