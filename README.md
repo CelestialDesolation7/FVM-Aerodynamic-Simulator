@@ -18,7 +18,7 @@
 
 ![image-20260204211222307](img/image-20260204211222307.png)
 
-![image-20260208174423648](assets/image-20260208174423648.png)
+![image-20260208174423648](img/image-20260208174423648.png)
 
 支持更复杂的障碍物：
 
@@ -153,16 +153,6 @@
 ---
 
 ## 构建指南
-
-
-### 前置要求
-
-在开始构建之前，请确保系统满足以下要求：
-
-1. **NVIDIA 显卡**：计算能力 ≥ 7.5（RTX 20 系列及以上）
-2. **显卡驱动**：支持 CUDA 12.0+ 的最新驱动
-3. **编译器**：Visual Studio 2022（含 C++ 桌面开发工具）
-4. **CMake**：版本 ≥ 3.21
 
 ### 步骤 1：安装 CUDA Toolkit
 
@@ -301,6 +291,7 @@ cd dist
 **症状**：`unsupported gpu architecture 'compute_XX'`
 
 **解决方法**：
+
 - 修改 `CMakeLists.txt` 中的 `CMAKE_CUDA_ARCHITECTURES`
 - 或在配置时指定：
   ```powershell
