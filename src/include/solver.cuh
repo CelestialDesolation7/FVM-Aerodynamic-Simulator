@@ -34,7 +34,7 @@ public:
 
     // 按照当前参数重置求解器状态
     void reset(const SimParams &params);
-    
+
     // 动态更新障碍物几何（不重置仿真，仅更新SDF/网格类型并修正新暴露区域）
     // 适用于：障碍物位置、大小、旋转、形状、襟翼角度的任意变化
     void updateObstacleGeometry(const SimParams &params);
@@ -49,12 +49,12 @@ public:
     void computeDensityToDevice(float *dev_dst);
     void computeVelocityMagToDevice(float *dev_dst);
     void computeMachToDevice(float *dev_dst);
-    
+
     // 生成速度矢量箭头，直接写入OpenGL VBO
     // 返回实际生成的顶点数，失败返回-1
     int generateVectorArrows(float *dev_vertexData, int maxVertices,
-                            int step, float u_inf,
-                            float maxArrowLength, float arrowHeadAngle, float arrowHeadLength);
+                             int step, float u_inf,
+                             float maxArrowLength, float arrowHeadAngle, float arrowHeadLength);
 
     // 获取网格尺寸
     int getNx() const { return _nx; }
@@ -127,6 +127,12 @@ private:
     float *d_reduction_buffer_ = nullptr; // CUB临时存储空间
     float *d_reduction_output_ = nullptr; // 归约结果输出（单个float）
     size_t reduction_buffer_size_ = 0;    // 动态计算的缓冲区字节数
+
+    // 预分配的临时计算缓冲区（用于归约前的中间计算，避免每次调用cudaMalloc/cudaFree）
+    float *d_scratch_ = nullptr;
+
+    // 预分配的原子计数器（用于矢量箭头生成，避免每帧cudaMalloc/cudaFree）
+    int *d_atomic_counter_ = nullptr;
 
     // 粘性相关中间量 (Navier-Stokes方程)
     float *d_mu_ = nullptr;     // 动态更新的粘度值场

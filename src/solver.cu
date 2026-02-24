@@ -2382,58 +2382,8 @@ void CFDSolver::launchDiffusionStepKernel(float *rho_u, float *rho_v, float *E, 
 #pragma endregion
 
 #pragma region 统计工具
-// ========== 已废弃的手写归约实现==========
-// 说明:此函数已被CUB库实现替代，保留仅作为教学示例
-// 展示传统手写归约的实现方法：块内共享内存树形归约 + CPU最终归约
-// 需要CPU-GPU同步，性能不如CUB的单阶段全GPU归约
-/*
-__global__ void maxMachKernelDeprecated(const float *u, const float *v,
-                                        const float *p, const float *rho,
-                                        float *block_results, int n)
-{
-    extern __shared__ float sdata[];
 
-    unsigned int tid = threadIdx.x;
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-    float local_max = 0.0f;
-    // Grid-stride loop处理多个元素
-    while (i < n)
-    {
-        float rho_val = rho[i] + 1e-10f;
-        float speed = sqrtf(u[i] * u[i] + v[i] * v[i]);
-        float c = sqrtf(GAMMA * fmaxf(p[i], MIN_PRESSURE) / rho_val);
-        float mach = speed / (c + 1e-10f);
-        local_max = fmaxf(local_max, mach);
-        i += blockDim.x * gridDim.x;
-    }
-
-    // 写入共享内存
-    sdata[tid] = local_max;
-    __syncthreads();
-
-    // 块内树形归约
-    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
-    {
-        if (tid < s)
-        {
-            sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
-        }
-        __syncthreads();
-    }
-
-    // 线程0写入该块的结果
-    if (tid == 0)
-    {
-        block_results[blockIdx.x] = sdata[0];
-    }
-}
-*/
-
-// 功能:使用CUB库计算运动粘性系数的最大值(用于粘性CFL条件)
-// 输入:粘性系数场 mu, 密度场 rho, 网格尺寸
-// 输出:最大运动粘性系数 nu_max = max(mu/rho)
-// 优化:使用CUB::DeviceReduce::Max + 临时核函数计算nu，单阶段完成
+// 核函数:计算运动粘性系数 nu = mu/rho
 __global__ void computeViscousNumberKernel(const float *mu, const float *rho,
                                            float *nu_out, int n)
 {
@@ -2444,55 +2394,31 @@ __global__ void computeViscousNumberKernel(const float *mu, const float *rho,
     }
 }
 
+// 功能:计算最大运动粘性系数(用于粘性CFL条件)
+// 优化:使用预分配缓冲区,无动态分配,无显式同步
 float CFDSolver::launchComputeMaxViscousNumber(const float *mu, const float *rho, int nx, int ny)
 {
     int n = nx * ny;
 
-    // 临时数组:计算运动粘性系数 nu = mu/rho
-    float *d_nu_temp;
-    CUDA_CHECK(cudaMalloc(&d_nu_temp, n * sizeof(float)));
-
-    // 计算所有网格的运动粘性系数
+    // 使用预分配的临时缓冲区
     dim3 block(256);
     dim3 grid((n + block.x - 1) / block.x);
-    computeViscousNumberKernel<<<grid, block>>>(mu, rho, d_nu_temp, n);
-    CUDA_CHECK(cudaGetLastError());      // 检查kernel启动错误
-    CUDA_CHECK(cudaDeviceSynchronize()); // 等待kernel完成
+    computeViscousNumberKernel<<<grid, block>>>(mu, rho, d_scratch_, n);
+    CUDA_CHECK(cudaGetLastError());
 
-    // 使用CUB归约找最大值
-    // 使用独立的临时存储和输出缓冲区，避免内存重叠
+    // CUB归约(在默认流上,自动等待上面的kernel完成)
     void *d_temp = d_reduction_buffer_;
     size_t temp_bytes = reduction_buffer_size_;
     float *d_out = d_reduction_output_;
 
-    // 查询CUB所需空间（应与分配时的查询结果一致）
-    size_t required_bytes = 0;
-    cub::DeviceReduce::Max(nullptr, required_bytes, d_nu_temp, d_out, n);
-
-    if (required_bytes > temp_bytes)
-    {
-        fprintf(stderr, "Warning: CUB需要 %zu 字节，但只有 %zu 字节可用\n", required_bytes, temp_bytes);
-        // 回退到动态分配
-        void *d_temp_alloc;
-        CUDA_CHECK(cudaMalloc(&d_temp_alloc, required_bytes));
-        CUDA_CHECK(cub::DeviceReduce::Max(d_temp_alloc, required_bytes, d_nu_temp, d_out, n));
-        CUDA_CHECK(cudaFree(d_temp_alloc));
-    }
-    else
-    {
-        CUDA_CHECK(cub::DeviceReduce::Max(d_temp, temp_bytes, d_nu_temp, d_out, n));
-    }
+    CUDA_CHECK(cub::DeviceReduce::Max(d_temp, temp_bytes, d_scratch_, d_out, n));
 
     float result;
     CUDA_CHECK(cudaMemcpy(&result, d_out, sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_nu_temp));
-
     return result;
 }
 
-// 功能:使用CUB库计算最大波速(用于对流CFL条件)
-// 输入:速度场(u,v)，压强场p，密度场rho
-// 输出:最大波速 = max(|v| + c)
+// 核函数:计算波速 |v| + c
 __global__ void computeWaveSpeedKernel(const float *u, const float *v,
                                        const float *p, const float *rho,
                                        float *speed_out, int n)
@@ -2505,53 +2431,30 @@ __global__ void computeWaveSpeedKernel(const float *u, const float *v,
     }
 }
 
+// 功能:计算最大波速(用于对流CFL条件)
+// 优化:使用预分配缓冲区,无动态分配,无显式同步
 float CFDSolver::launchComputeMaxWaveSpeed(const float *u, const float *v, const float *p,
                                            const float *rho, int nx, int ny)
 {
     int n = nx * ny;
 
-    // 临时数组:计算波速
-    float *d_speed_temp;
-    CUDA_CHECK(cudaMalloc(&d_speed_temp, n * sizeof(float)));
-
-    // 计算所有网格的波速
     dim3 block(256);
     dim3 grid((n + block.x - 1) / block.x);
-    computeWaveSpeedKernel<<<grid, block>>>(u, v, p, rho, d_speed_temp, n);
-    CUDA_CHECK(cudaGetLastError());      // 检查kernel启动错误
-    CUDA_CHECK(cudaDeviceSynchronize()); // 等待kernel完成
+    computeWaveSpeedKernel<<<grid, block>>>(u, v, p, rho, d_scratch_, n);
+    CUDA_CHECK(cudaGetLastError());
 
-    // 使用CUB归约找最大值
     void *d_temp = d_reduction_buffer_;
     size_t temp_bytes = reduction_buffer_size_;
     float *d_out = d_reduction_output_;
 
-    size_t required_bytes = 0;
-    cub::DeviceReduce::Max(nullptr, required_bytes, d_speed_temp, d_out, n);
-
-    if (required_bytes > temp_bytes)
-    {
-        fprintf(stderr, "Warning: CUB需要 %zu 字节，但只有 %zu 字节可用\n", required_bytes, temp_bytes);
-        void *d_temp_alloc;
-        CUDA_CHECK(cudaMalloc(&d_temp_alloc, required_bytes));
-        CUDA_CHECK(cub::DeviceReduce::Max(d_temp_alloc, required_bytes, d_speed_temp, d_out, n));
-        CUDA_CHECK(cudaFree(d_temp_alloc));
-    }
-    else
-    {
-        CUDA_CHECK(cub::DeviceReduce::Max(d_temp, temp_bytes, d_speed_temp, d_out, n));
-    }
+    CUDA_CHECK(cub::DeviceReduce::Max(d_temp, temp_bytes, d_scratch_, d_out, n));
 
     float result;
     CUDA_CHECK(cudaMemcpy(&result, d_out, sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_speed_temp));
-
     return result;
 }
 
-// 功能:使用CUB库计算最大马赫数
-// 输入:速度场(u,v)，压强场p，密度场rho
-// 输出:最大马赫数 = max(|v|/c)
+// 核函数:计算马赫数 |v| / c
 __global__ void computeMachNumberKernel(const float *u, const float *v,
                                         const float *p, const float *rho,
                                         float *mach_out, int n)
@@ -2566,47 +2469,26 @@ __global__ void computeMachNumberKernel(const float *u, const float *v,
     }
 }
 
+// 功能:计算最大马赫数
+// 优化:使用预分配缓冲区,无动态分配,无显式同步
 float CFDSolver::launchComputeMaxMach(const float *u, const float *v, const float *p,
                                       const float *rho, int nx, int ny)
 {
     int n = nx * ny;
 
-    // 临时数组:计算马赫数
-    float *d_mach_temp;
-    CUDA_CHECK(cudaMalloc(&d_mach_temp, n * sizeof(float)));
-
-    // 计算所有网格的马赫数
     dim3 block(256);
     dim3 grid((n + block.x - 1) / block.x);
-    computeMachNumberKernel<<<grid, block>>>(u, v, p, rho, d_mach_temp, n);
-    CUDA_CHECK(cudaGetLastError());      // 检查kernel启动错误
-    CUDA_CHECK(cudaDeviceSynchronize()); // 等待kernel完成
+    computeMachNumberKernel<<<grid, block>>>(u, v, p, rho, d_scratch_, n);
+    CUDA_CHECK(cudaGetLastError());
 
-    // 使用CUB归约找最大值
     void *d_temp = d_reduction_buffer_;
     size_t temp_bytes = reduction_buffer_size_;
     float *d_out = d_reduction_output_;
 
-    size_t required_bytes = 0;
-    cub::DeviceReduce::Max(nullptr, required_bytes, d_mach_temp, d_out, n);
-
-    if (required_bytes > temp_bytes)
-    {
-        fprintf(stderr, "Warning: CUB需要 %zu 字节，但只有 %zu 字节可用\n", required_bytes, temp_bytes);
-        void *d_temp_alloc;
-        CUDA_CHECK(cudaMalloc(&d_temp_alloc, required_bytes));
-        CUDA_CHECK(cub::DeviceReduce::Max(d_temp_alloc, required_bytes, d_mach_temp, d_out, n));
-        CUDA_CHECK(cudaFree(d_temp_alloc));
-    }
-    else
-    {
-        CUDA_CHECK(cub::DeviceReduce::Max(d_temp, temp_bytes, d_mach_temp, d_out, n));
-    }
+    CUDA_CHECK(cub::DeviceReduce::Max(d_temp, temp_bytes, d_scratch_, d_out, n));
 
     float result;
     CUDA_CHECK(cudaMemcpy(&result, d_out, sizeof(float), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_mach_temp));
-
     return result;
 }
 
@@ -2736,6 +2618,10 @@ void CFDSolver::allocateMemory()
     printf("[CFD规约缓冲区] 网格=%dx%d (%d元素), CUB临时存储=%zu字节 (%.2fKB), 输出缓冲=4字节\n",
            _nx, _ny, n, reduction_buffer_size_, reduction_buffer_size_ / 1024.0f);
 
+    // 6b. 分配归约用临时计算缓冲区（波速/马赫数/粘性数等中间结果）
+    // 避免在热路径中反复 cudaMalloc/cudaFree
+    CUDA_CHECK(cudaMalloc(&d_scratch_, size));
+
     // 7. 分配粘性相关数组(Navier-Stokes)
     CUDA_CHECK(cudaMalloc(&d_mu_, size));     // 动力粘性系数
     CUDA_CHECK(cudaMalloc(&d_k_, size));      // 热导率
@@ -2744,6 +2630,9 @@ void CFDSolver::allocateMemory()
     CUDA_CHECK(cudaMalloc(&d_tau_xy_, size)); // 应力张量XY分量
     CUDA_CHECK(cudaMalloc(&d_qx_, size));     // X方向热通量
     CUDA_CHECK(cudaMalloc(&d_qy_, size));     // Y方向热通量
+
+    // 8. 分配原子计数器（用于矢量箭头生成，避免每帧cudaMalloc/cudaFree）
+    CUDA_CHECK(cudaMalloc(&d_atomic_counter_, sizeof(int)));
 }
 
 // 功能:释放所有GPU显存
@@ -2816,6 +2705,8 @@ void CFDSolver::freeMemory()
         cudaFree(d_reduction_buffer_);
     if (d_reduction_output_)
         cudaFree(d_reduction_output_);
+    if (d_scratch_)
+        cudaFree(d_scratch_);
 
     // 释放粘性相关数组
     if (d_mu_)
@@ -2833,6 +2724,10 @@ void CFDSolver::freeMemory()
     if (d_qy_)
         cudaFree(d_qy_);
 
+    // 释放原子计数器
+    if (d_atomic_counter_)
+        cudaFree(d_atomic_counter_);
+
     // 置空所有指针(防止重复释放)
     d_rho_ = d_rho_u_ = d_rho_v_ = d_E_ = d_rho_e_ = nullptr;
     d_rho_new_ = d_rho_u_new_ = d_rho_v_new_ = d_E_new_ = d_rho_e_new_ = nullptr;
@@ -2843,8 +2738,10 @@ void CFDSolver::freeMemory()
     d_flux_rho_y_ = d_flux_rho_u_y_ = d_flux_rho_v_y_ = d_flux_E_y_ = d_flux_rho_e_y_ = nullptr;
     d_reduction_buffer_ = nullptr;
     d_reduction_output_ = nullptr;
+    d_scratch_ = nullptr;
     reduction_buffer_size_ = 0; // 重置缓冲区大小
     d_mu_ = d_k_ = d_tau_xx_ = d_tau_yy_ = d_tau_xy_ = d_qx_ = d_qy_ = nullptr;
+    d_atomic_counter_ = nullptr;
 }
 
 // 功能:初始化求解器
@@ -3140,8 +3037,14 @@ size_t CFDSolver::getSimulationMemoryUsage()
     // 归约缓冲区（动态分配，根据网格大小自动计算）
     totalMemory += reduction_buffer_size_;
 
+    // 归约用临时计算缓冲区
+    totalMemory += gridSize * floatSize; // d_scratch_
+
     // 粘性相关数组 - 7个数组
     totalMemory += gridSize * floatSize * 7; // mu, k, tau_xx, tau_yy, tau_xy, qx, qy
+
+    // 原子计数器
+    totalMemory += sizeof(int); // d_atomic_counter_
 
     return totalMemory;
 }
@@ -3392,9 +3295,8 @@ int CFDSolver::generateVectorArrows(float *dev_vertexData, int maxVertices,
                                     int step, float u_inf,
                                     float maxArrowLength, float arrowHeadAngle, float arrowHeadLength)
 {
-    // 分配原子计数器（用于顶点索引）
-    int *d_counter;
-    CUDA_CHECK(cudaMalloc(&d_counter, sizeof(int)));
+    // 使用预分配的原子计数器（避免每帧cudaMalloc/cudaFree）
+    int *d_counter = d_atomic_counter_;
     CUDA_CHECK(cudaMemset(d_counter, 0, sizeof(int)));
 
     // 计算线程块和网格尺寸
@@ -3423,7 +3325,6 @@ int CFDSolver::generateVectorArrows(float *dev_vertexData, int maxVertices,
     // 获取实际生成的顶点数量
     int h_counter;
     CUDA_CHECK(cudaMemcpy(&h_counter, d_counter, sizeof(int), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaFree(d_counter));
 
     return h_counter; // 返回生成的顶点数量
 }

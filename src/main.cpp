@@ -170,25 +170,35 @@ void renderUI()
 
         ImGui::Separator();
 
-        // GPU 显存信息
-        size_t freeMem, totalMem;
-        CFDSolver::getGPUMemoryInfo(freeMem, totalMem);
-        float usedMem = (totalMem - freeMem) / (1024.0f * 1024.0f);
-        float totalMemMB = totalMem / (1024.0f * 1024.0f);
-        float memUsagePercent = (totalMem - freeMem) * 100.0f / totalMem;
+        // GPU 显存信息（节流查询：每1秒更新一次，避免驱动调用造成性能开销）
+        static float cachedUsedMem = 0.0f;
+        static float cachedTotalMemMB = 0.0f;
+        static float cachedMemUsagePercent = 0.0f;
+        static auto lastMemQueryTime = std::chrono::high_resolution_clock::now();
+        auto now = std::chrono::high_resolution_clock::now();
+        if (std::chrono::duration<float>(now - lastMemQueryTime).count() >= 1.0f)
+        {
+            lastMemQueryTime = now;
+            size_t freeMem, totalMem;
+            CFDSolver::getGPUMemoryInfo(freeMem, totalMem);
+            cachedUsedMem = (totalMem - freeMem) / (1024.0f * 1024.0f);
+            cachedTotalMemMB = totalMem / (1024.0f * 1024.0f);
+            cachedMemUsagePercent = (totalMem - freeMem) * 100.0f / totalMem;
+        }
 
         ImGui::Text(u8"GPU 显存使用");
         ImGui::SameLine();
 
         // 用一个进度条显示
         // RGBA 绿色->黄色->红色
-        ImVec4 barColor = (memUsagePercent < 70.0f) ? ImVec4(0.0f, 1.0f, 0.0f, 1.0f) : (memUsagePercent < 90.0f) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f)
+        ImVec4 barColor = (cachedMemUsagePercent < 70.0f) ? ImVec4(0.0f, 1.0f, 0.0f, 1.0f) : (cachedMemUsagePercent < 90.0f) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f)
                                                                                                                  : ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
         char memInfoLabel[64];
-        std::snprintf(memInfoLabel, sizeof(memInfoLabel), u8"GPU 显存使用: %.1f MB / %.1f MB (%.1f%%)", usedMem, totalMemMB, memUsagePercent);
+        std::snprintf(memInfoLabel, sizeof(memInfoLabel), u8"GPU 显存使用: %.1f MB / %.1f MB (%.1f%%)", cachedUsedMem, cachedTotalMemMB, cachedMemUsagePercent);
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barColor);
-        ImGui::ProgressBar(memUsagePercent / 100.0f, ImVec2(200, 0), memInfoLabel);
-        ImGui::PopStyleColor();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        ImGui::ProgressBar(cachedMemUsagePercent / 100.0f, ImVec2(200, 0), memInfoLabel);
+        ImGui::PopStyleColor(2);
 
         size_t simMemory = solver.getSimulationMemoryUsage();
         ImGui::Text(u8"仿真数据占用显存: %.1f MB", simMemory / (1024.0f * 1024.0f));
@@ -502,7 +512,7 @@ void renderUI()
             if (showVectors)
             {
                 int vectorDensity = renderer.getVectorDensity();
-                if (ImGui::SliderInt(u8"矢量箭头间隔", &vectorDensity, 5, 50, u8"%d 格"))
+                if (ImGui::SliderInt(u8"矢量箭头间隔", &vectorDensity, 5, 100, u8"%d 格"))
                 {
                     renderer.setVectorDensity(vectorDensity);
                 }
@@ -855,7 +865,7 @@ int main(int argc, char *argv[])
         return -1;
     }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1); // 启用垂直同步
+    glfwSwapInterval(0); // 关闭垂直同步，允许GPU全速运行
 
     // 设置回调函数
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
@@ -913,16 +923,18 @@ int main(int argc, char *argv[])
         auto frameStart = std::chrono::high_resolution_clock::now();
         glfwPollEvents();
 
-        // 进行一步仿真
+        // 进行仿真步进
         if (!params.paused)
         {
             auto simStart = std::chrono::high_resolution_clock::now();
 
+            // 每帧仅计算一次CFL时间步长，避免每步都进行GPU归约+D2H同步
+            // CFL条件在相邻时间步之间变化很小，安全系数(cfl<1.0)提供了足够裕度
+            float dt = solver.computeStableTimeStep(params);
+            params.dt = dt;
+
             for (int i = 0; i < stepsPerFrame; i++)
             {
-                // 计算 CFL 限制
-                float dt = solver.computeStableTimeStep(params);
-                params.dt = dt;
                 solver.step(params);
             }
 
