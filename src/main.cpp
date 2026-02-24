@@ -76,6 +76,7 @@ struct SolverFrameResults {
     float maxTemp = 0.0f;
     float maxMach = 0.0f;
     float simTimePerStep = 0.0f;
+    int vectorVertexCount = 0;  // 本帧生成的矢量箭头顶点数
 };
 SolverFrameResults g_solverResults;
 
@@ -208,8 +209,9 @@ void solverThreadFunc()
             solver.step(params);
         }
 
-        // ==================== 2. 可视化：写入暂存缓冲区（纯CUDA，无需GL上下文） ====================
-        float *devPtr = renderer.getFieldStagingBuffer();
+        // ==================== 2. 可视化：直接写入预映射的PBO（零拷贝，无需GL上下文） ====================
+        // PBO[writeIndex]已由GL线程预映射，此处获取的设备指针可直接写入
+        float *devPtr = renderer.getMappedFieldPtr();
         if (devPtr)
         {
             switch (currentField)
@@ -232,7 +234,8 @@ void solverThreadFunc()
             }
         }
 
-        // ==================== 3. 矢量箭头：写入暂存缓冲区（纯CUDA，无需GL上下文） ====================
+        // ==================== 3. 矢量箭头：直接写入预映射的VBO（零拷贝） ====================
+        g_solverResults.vectorVertexCount = 0;
         if (renderer.getShowVectors())
         {
             int step = renderer.getVectorDensity();
@@ -242,15 +245,15 @@ void solverThreadFunc()
             float cellHeight = 2.0f / params.ny;
             float maxArrowLength = std::min(cellWidth, cellHeight) * (step * 0.8f);
 
-            int vboCapacity = renderer.getVectorStagingCapacityVertices();
-            float *devVertexData = renderer.getVectorStagingBuffer();
+            int vboCapacity = renderer.getMappedVectorCapacity();
+            float *devVertexData = renderer.getMappedVectorPtr();
             if (devVertexData && vboCapacity > 0)
             {
                 int numVertices = solver.generateVectorArrows(
                     devVertexData, vboCapacity,
                     step, params.u_inf,
                     maxArrowLength, arrowHeadAngle, arrowHeadLength);
-                renderer.setVectorStagingVertexCount(numVertices);
+                g_solverResults.vectorVertexCount = numVertices;
             }
         }
 
@@ -776,10 +779,11 @@ void updateVisualization()
 
     renderer.setFieldRange(minVal, maxVal, currentField);
 
-    float *devPtr = renderer.mapFieldTexture();
+    // PBO[writeIndex]已预映射，直接获取设备指针写入
+    float *devPtr = renderer.getMappedFieldPtr();
     if (!devPtr)
     {
-        std::cerr << "[错误] PBO映射失败\n";
+        std::cerr << "[错误] PBO未映射\n";
         return;
     }
 
@@ -803,7 +807,8 @@ void updateVisualization()
         break;
     }
 
-    renderer.unmapFieldTexture();
+    // 提交PBO：unmap → 上传纹理 → swap → remap
+    renderer.submitField();
 
     // 生成矢量箭头（如果启用）
     if (renderer.getShowVectors())
@@ -824,22 +829,22 @@ void updateVisualization()
         int numArrowsY = (params.ny + step - 1) / step;
         int maxVertices = numArrowsX * numArrowsY * 8;
 
-        // 确保VBO有足够容量
+        // 确保VBO有足够容量（同时确保VBO已映射）
         renderer.ensureVectorVBOCapacity(maxVertices);
 
-        // 映射VBO
-        int vboCapacity;
-        float *devVertexData = renderer.mapVectorVBO(vboCapacity);
-        if (devVertexData)
+        // VBO[writeIndex]已预映射，直接获取设备指针写入
+        float *devVertexData = renderer.getMappedVectorPtr();
+        int vboCapacity = renderer.getMappedVectorCapacity();
+        if (devVertexData && vboCapacity > 0)
         {
-            // 调用solver生成箭头
             int numVertices = solver.generateVectorArrows(
                 devVertexData, vboCapacity,
                 step, params.u_inf,
                 maxArrowLength, arrowHeadAngle, arrowHeadLength);
 
-            // 取消映射
-            renderer.unmapVectorVBO(numVertices);
+            // 提交VBO：unmap → swap → remap
+            renderer.submitVectors(numVertices);
+            renderer.prepareVectorRender();
         }
     }
 }
@@ -1094,12 +1099,15 @@ int main(int argc, char *argv[])
             solver.reset(params);
         }
 
-        // 消费求解器帧结果：暂存→PBO/VBO提交 + 准备渲染状态 + 读取统计
+        // 消费求解器帧结果：提交PBO/VBO（unmap → upload → swap → remap）+ 读取统计
         if (hasNewResults)
         {
-            renderer.commitFieldFromStaging();    // GL: staging→PBO→纹理
-            renderer.commitVectorsFromStaging();  // GL: staging→VBO + swap
-            renderer.prepareVectorRender();       // 快照VBO读取索引
+            renderer.submitField();                                  // GL: unmap→纹理→swap→remap
+            if (g_solverResults.vectorVertexCount > 0)
+            {
+                renderer.submitVectors(g_solverResults.vectorVertexCount); // GL: unmap→swap→remap
+            }
+            renderer.prepareVectorRender();                          // 快照VBO读取索引
             cachedMaxTemp = g_solverResults.maxTemp;
             cachedMaxMach = g_solverResults.maxMach;
             simTimePerStep = g_solverResults.simTimePerStep;
@@ -1150,9 +1158,10 @@ int main(int argc, char *argv[])
         }
 
         // ====== 并行区域：OpenGL渲染 ======
-        // 此时求解器线程可能正在GPU上计算下一帧：
-        //   - solver CUDA写入PBO[A] 的同时，GL从纹理（来自PBO[B]）渲染
-        //   - solver CUDA写入VBO[A] 的同时，GL从VBO[B]绘制矢量箭头
+        // 此时求解器线程正在GPU上计算下一帧：
+        //   - solver CUDA直接写入PBO[writeIndex]（预映射），GL从纹理（来自另一个PBO）渲染
+        //   - solver CUDA直接写入VBO[writeIndex]（预映射），GL从另一个VBO绘制矢量箭头
+        //   完全零拷贝，无staging中转
         renderer.render(params);
 
         ImGui::Render();

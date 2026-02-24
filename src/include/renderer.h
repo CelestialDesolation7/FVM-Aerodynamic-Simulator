@@ -132,14 +132,8 @@ public:
 
     // 确保矢量VBO有足够的容量
     // 如果当前容量不足，会重新分配VBO并重新注册CUDA资源
+    // 调用后保证VBO[writeIndex]已映射，可通过getMappedVectorPtr()获取设备指针
     void ensureVectorVBOCapacity(int requiredVertices);
-    
-    // 映射矢量VBO以供CUDA写入，返回设备指针和实际顶点容量
-    // 返回nullptr表示失败或未启用
-    float *mapVectorVBO(int &outMaxVertices);
-    
-    // 取消映射矢量VBO，设置实际使用的顶点数量
-    void unmapVectorVBO(int actualVertices);
 
     // 窗口尺寸调整
     void resize(int width, int height);
@@ -156,14 +150,6 @@ public:
     // 清理CUDA互操作资源
     void cleanupCudaInterop();
 
-    // 映射PBO以供CUDA写入，返回设备指针（零拷贝模式专用）
-    // 注意：必须与unmapFieldTexture()配对使用
-    float *mapFieldTexture();
-
-    // 取消映射，CUDA写入完成后调用（零拷贝模式专用）
-    // 此函数会触发GPU内部的PBO到纹理传输，无CPU参与
-    void unmapFieldTexture();
-
     // 更新互操作纹理的尺寸（网格尺寸变化时调用）
     void resizeCudaInterop(int nx, int ny);
 
@@ -173,17 +159,30 @@ public:
     // 快照矢量箭头渲染状态，供并行渲染阶段安全使用（安全区域调用）
     void prepareVectorRender();
 
-    // === 多线程暂存缓冲区接口 ===
-    // 获取纯CUDA暂存缓冲区指针（供solver线程写入可视化数据，无需GL上下文）
-    float *getFieldStagingBuffer() const { return d_fieldStaging_; }
-    float *getVectorStagingBuffer() const { return d_vectorStaging_; }
-    int getVectorStagingCapacityVertices() const { return static_cast<int>(vectorStagingCapacity_ / (5 * sizeof(float))); }
-    void setVectorStagingVertexCount(int count) { vectorStagingVertexCount_ = count; }
+    // === 直接映射双缓冲接口（零拷贝，无staging中转） ===
+    // GL线程预先映射PBO/VBO[writeIndex]，solver线程直接写入映射后的设备指针
+    // 写入完成后GL线程提交：unmap → upload/swap → remap下一个缓冲区
 
-    // GL线程：从暂存缓冲区提交到PBO/纹理（map → memcpy → unmap → upload）
-    void commitFieldFromStaging();
-    // GL线程：从暂存缓冲区提交到VBO（map → memcpy → unmap → swap）
-    void commitVectorsFromStaging();
+    // 获取预映射的PBO设备指针（solver线程直接写入，无需GL上下文）
+    float *getMappedFieldPtr() const { return mappedFieldPtr_; }
+
+    // 获取预映射的VBO设备指针和容量（solver线程直接写入）
+    float *getMappedVectorPtr() const { return mappedVectorPtr_; }
+    int getMappedVectorCapacity() const { return mappedVectorMaxVertices_; }
+
+    // GL线程：映射PBO[writeIndex]，返回设备指针（初始化或提交后调用）
+    float *mapFieldForWriting();
+
+    // GL线程：提交已写入的PBO（unmap → 上传纹理 → swap → 映射新PBO）
+    // 返回新映射的设备指针（供下一帧solver使用）
+    float *submitField();
+
+    // GL线程：映射VBO[vectorWriteIndex]，返回设备指针
+    float *mapVectorForWriting();
+
+    // GL线程：提交已写入的VBO（unmap → 记录顶点数 → swap → 映射新VBO）
+    // 返回新映射的设备指针
+    float *submitVectors(int vertexCount);
 
     // 检查互操作是否已启用
     bool isCudaInteropEnabled() const { return cudaInteropEnabled_; }
@@ -257,11 +256,11 @@ private:
     int writeIndex_ = 0;                                            // 当前CUDA写入的PBO索引（0或1）
     size_t mappedSize_ = 0;                                         // 单个PBO的缓冲区大小
 
-    // 多线程暂存缓冲区（纯CUDA设备内存，solver线程写入，GL线程读出）
-    float *d_fieldStaging_ = nullptr;     // 物理场暂存（nx*ny float）
-    float *d_vectorStaging_ = nullptr;    // 矢量箭头暂存（顶点数*5 float）
-    size_t vectorStagingCapacity_ = 0;    // 矢量暂存容量（字节）
-    int vectorStagingVertexCount_ = 0;    // 本帧实际矢量顶点数
+    // 直接映射状态（GL线程预映射PBO/VBO，solver线程直接写入设备指针）
+    float *mappedFieldPtr_ = nullptr;       // 预映射的PBO设备指针
+    bool fieldPBOMapped_ = false;           // PBO[writeIndex]是否已映射
+    float *mappedVectorPtr_ = nullptr;      // 预映射的VBO设备指针
+    int mappedVectorMaxVertices_ = 0;       // 映射的VBO容量（顶点数）
 
     // 着色器创建和编译的工具函数
     bool createShaders();                                     // 创建主渲染着色器
