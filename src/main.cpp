@@ -12,6 +12,10 @@
 #include <chrono>
 #include <iostream>
 #include <filesystem>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
 
 #include "common.h"
 #include "solver.cuh"
@@ -48,6 +52,24 @@ Renderer renderer;
 FieldType currentField = FieldType::TEMPERATURE;
 const char *colormapNames[] = {"Jet", "Hot", "Plasma", "Inferno", "Viridis"};
 int currentColormap = 0;
+
+// 多线程：求解器与渲染器帧级同步（生产者-消费者模型）
+std::mutex g_solverMutex;
+std::condition_variable g_solverCV;
+std::atomic<bool> g_solverShouldStop{false};
+std::thread g_solverThread;
+enum class SolverState { IDLE, RUNNING, DONE };
+SolverState g_solverState = SolverState::IDLE; // 受 g_solverMutex 保护
+
+// 延迟操作标志（键盘回调中设置，主循环安全区域执行）
+std::atomic<bool> g_resetRequested{false};
+
+// 缓存的仿真统计数据（在渲染线程安全区域更新）
+float cachedMaxTemp = 0.0f;
+float cachedMaxMach = 0.0f;
+
+// 垂直同步控制
+bool vsyncEnabled = true;
 
 // 颜色映射范围控制变量（绝对值）
 float temperature_min = 200.0f; // 温度下限 (K)
@@ -91,9 +113,7 @@ void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods
     }
     if (key == GLFW_KEY_R && action == GLFW_PRESS)
     {
-        params.t_current = 0.0f;
-        params.step = 0;
-        solver.reset(params);
+        g_resetRequested = true;
     }
 }
 #pragma endregion
@@ -149,6 +169,53 @@ bool initializeSimulation()
 }
 #pragma endregion
 
+#pragma region 求解器线程
+// 求解器线程函数：独立于渲染线程运行仿真计算
+// 采用"生产者-消费者"帧同步模型：
+//   每批计算 stepsPerFrame 步后停止，等待渲染线程消费完数据再开始下一批
+//   保证求解器和渲染器永不同时访问GPU数据
+void solverThreadFunc()
+{
+    cudaSetDevice(0);
+
+    while (true)
+    {
+        // 等待渲染线程发出"开始计算"信号
+        {
+            std::unique_lock<std::mutex> lock(g_solverMutex);
+            g_solverCV.wait(lock, [] {
+                return g_solverState == SolverState::RUNNING || g_solverShouldStop.load();
+            });
+            if (g_solverShouldStop) return;
+        }
+
+        // 计算一批仿真步（此期间渲染线程不会访问solver数据）
+        auto simStart = std::chrono::high_resolution_clock::now();
+
+        float dt = solver.computeStableTimeStep(params);
+        params.dt = dt;
+        int n = stepsPerFrame; // 读一次当前值
+        for (int i = 0; i < n; i++)
+        {
+            solver.step(params);
+        }
+
+        // 关键：确保所有GPU工作完成，渲染线程可立即读取最新数据
+        cudaDeviceSynchronize();
+
+        auto simEnd = std::chrono::high_resolution_clock::now();
+        simTimePerStep = std::chrono::duration<float>(simEnd - simStart).count() / n;
+
+        // 通知渲染线程：本批计算完成
+        {
+            std::lock_guard<std::mutex> lock(g_solverMutex);
+            g_solverState = SolverState::DONE;
+        }
+        g_solverCV.notify_one();
+    }
+}
+#pragma endregion
+
 #pragma region 控制面板渲染
 void renderUI()
 {
@@ -167,6 +234,12 @@ void renderUI()
         ImGui::Text(u8"仿真时间: %.6f 秒", params.t_current);
         ImGui::Text(u8"迭代步数: %d", params.step);
         ImGui::SliderInt(u8"每帧迭代数", &stepsPerFrame, 1, 100);
+
+        // 垂直同步热切换
+        if (ImGui::Checkbox(u8"垂直同步", &vsyncEnabled))
+        {
+            glfwSwapInterval(vsyncEnabled ? 1 : 0);
+        }
 
         ImGui::Separator();
 
@@ -526,11 +599,9 @@ void renderUI()
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), u8"（速度矢量仅在[速度大小]模式下可用）");
         }
 
-        // Statistics
-        float maxT = solver.getMaxTemperature();
-        float maxMa = solver.getMaxMach();
-        ImGui::Text(u8"最高温度: %.1f K", maxT);
-        ImGui::Text(u8"最大马赫数: %.2f", maxMa);
+        // Statistics（使用缓存值，实际查询在主循环安全区域以0.25秒间隔执行）
+        ImGui::Text(u8"最高温度: %.1f K", cachedMaxTemp);
+        ImGui::Text(u8"最大马赫数: %.2f", cachedMaxMach);
     }
 
     ImGui::Separator();
@@ -913,46 +984,78 @@ int main(int argc, char *argv[])
         return -1;
     }
 
+    // 启动求解器线程
+    g_solverShouldStop = false;
+    g_solverThread = std::thread(solverThreadFunc);
+
     // 初始化时间和帧率
     auto lastTime = std::chrono::high_resolution_clock::now();
     int frameCount = 0;
 
     // 主渲染循环
+    // 架构：渲染线程与求解器线程使用条件变量进行帧级同步
+    // 每帧流程：
+    //   1. 等待求解器完成上一批计算
+    //   2. [安全区域] 处理UI、可视化、统计（求解器不运行）
+    //   3. 信号求解器开始下一批计算
+    //   4. [并行区域] OpenGL渲染当前帧（求解器同时计算下一帧数据）
     while (!glfwWindowShouldClose(window))
     {
-        auto frameStart = std::chrono::high_resolution_clock::now();
         glfwPollEvents();
 
-        // 进行仿真步进
-        if (!params.paused)
+        // ==================== 等待求解器完成 ====================
         {
-            auto simStart = std::chrono::high_resolution_clock::now();
-
-            // 每帧仅计算一次CFL时间步长，避免每步都进行GPU归约+D2H同步
-            // CFL条件在相邻时间步之间变化很小，安全系数(cfl<1.0)提供了足够裕度
-            float dt = solver.computeStableTimeStep(params);
-            params.dt = dt;
-
-            for (int i = 0; i < stepsPerFrame; i++)
+            std::unique_lock<std::mutex> lock(g_solverMutex);
+            if (g_solverState == SolverState::RUNNING)
             {
-                solver.step(params);
+                g_solverCV.wait(lock, [] {
+                    return g_solverState != SolverState::RUNNING;
+                });
             }
-
-            auto simEnd = std::chrono::high_resolution_clock::now();
-            simTimePerStep = std::chrono::duration<float>(simEnd - simStart).count() / stepsPerFrame;
         }
 
-        // 更新可视化数据（主机缓存）
-        updateVisualization();
+        // ========= 安全区域：求解器不运行，可自由访问GPU数据 =========
 
-        // 绘制可视化数据
-        renderer.render(params);
+        // 处理延迟的键盘操作（回调中设置标志，此处安全执行）
+        if (g_resetRequested.exchange(false))
+        {
+            params.t_current = 0.0f;
+            params.step = 0;
+            solver.reset(params);
+        }
 
-        // 最后绘制ImGui，防止控制面板被遮挡
+        // ImGui帧开始 + UI逻辑（所有solver交互在此安全发生）
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         renderUI();
+
+        // 更新可视化数据（CUDA写入PBO，读取solver的GPU缓冲区）
+        updateVisualization();
+
+        // 更新缓存统计数据（节流至0.25秒一次，避免每帧CUB归约）
+        {
+            static auto lastStatsTime = std::chrono::high_resolution_clock::now();
+            auto statsNow = std::chrono::high_resolution_clock::now();
+            if (std::chrono::duration<float>(statsNow - lastStatsTime).count() >= 0.25f)
+            {
+                cachedMaxTemp = solver.getMaxTemperature();
+                cachedMaxMach = solver.getMaxMach();
+                lastStatsTime = statsNow;
+            }
+        }
+
+        // ==================== 信号求解器开始下一批 ====================
+        if (!params.paused)
+        {
+            std::lock_guard<std::mutex> lock(g_solverMutex);
+            g_solverState = SolverState::RUNNING;
+            g_solverCV.notify_one();
+        }
+
+        // ====== 并行区域：OpenGL渲染（求解器可能正在GPU上计算下一帧）======
+        renderer.render(params);
+
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -970,6 +1073,15 @@ int main(int argc, char *argv[])
             lastTime = currentTime;
         }
     }
+
+    // 停止求解器线程
+    {
+        std::lock_guard<std::mutex> lock(g_solverMutex);
+        g_solverShouldStop = true;
+    }
+    g_solverCV.notify_one();
+    if (g_solverThread.joinable())
+        g_solverThread.join();
 
     // 例行清理代码
     ImGui_ImplOpenGL3_Shutdown();
