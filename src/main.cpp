@@ -1017,8 +1017,8 @@ int main(int argc, char *argv[])
         return -1;
     }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(0); // 关闭垂直同步，允许GPU全速运行
-
+    glfwSwapInterval(1);
+    
     // 设置回调函数
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
     glfwSetKeyCallback(window, keyCallback);

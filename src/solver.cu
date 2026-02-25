@@ -13,26 +13,26 @@ __device__ __constant__ float MIN_TEMPERATURE = 50.0f;
 __device__ __constant__ float MAX_VELOCITY = 10000.0f;
 
 // === 主机端编译期常量 ===
-constexpr int BLOCK_SIZE = 16;                          // CUDA线程块尺寸（2D）
+constexpr int BLOCK_SIZE = 16; // CUDA线程块尺寸（2D）
 
 // 数值方法超参数
-constexpr float ENTROPY_FIX_FACTOR = 0.1f;              // 熵修正系数：delta = factor * max(cL, cR)
-constexpr float DUAL_ENERGY_ETA_THRESHOLD = 0.1f;       // 双能量法切换阈值：eta < threshold 时使用内能法
-constexpr float LOW_DENSITY_THRESHOLD = 0.01f;           // 低密度阈值：低于此值时降级为一阶格式
-constexpr float MAX_VELOCITY_LIMIT = 5000.0f;           // 最大速度限制 [m/s]（防止非物理超高速）
-constexpr float MAX_GHOST_VELOCITY = 2500.0f;            // 虚拟网格最大速度 [m/s]
+constexpr float ENTROPY_FIX_FACTOR = 0.1f;        // 熵修正系数：delta = factor * max(cL, cR)
+constexpr float DUAL_ENERGY_ETA_THRESHOLD = 0.1f; // 双能量法切换阈值：eta < threshold 时使用内能法
+constexpr float LOW_DENSITY_THRESHOLD = 0.01f;    // 低密度阈值：低于此值时降级为一阶格式
+constexpr float MAX_VELOCITY_LIMIT = 5000.0f;     // 最大速度限制 [m/s]（防止非物理超高速）
+constexpr float MAX_GHOST_VELOCITY = 2500.0f;     // 虚拟网格最大速度 [m/s]
 
 // SDF几何常量
-constexpr float SDF_BAND_WIDTH_FACTOR = 1.5f;            // Ghost Cell层宽度因子（相对于网格间距）
-constexpr float STAR_INNER_OUTER_RATIO = 0.38f;          // 五角星内外圆半径比（标准比例）
-constexpr float DIAMOND_HALF_SQRT2 = 0.7071f;            // 菱形缩放因子 ≈ 1/√2
-constexpr float CAPSULE_HALF_HEIGHT = 1.5f;               // 胶囊体半高（相对于半径）
-constexpr float CAPSULE_HALF_WIDTH = 0.5f;                // 胶囊体半宽（相对于半径）
-constexpr float TRIANGLE_HALF_SQRT3 = 0.866025404f;      // 三角形高度因子 = √3/2
+constexpr float SDF_BAND_WIDTH_FACTOR = 1.5f;       // Ghost Cell层宽度因子（相对于网格间距）
+constexpr float STAR_INNER_OUTER_RATIO = 0.38f;     // 五角星内外圆半径比（标准比例）
+constexpr float DIAMOND_HALF_SQRT2 = 0.7071f;       // 菱形缩放因子 ≈ 1/√2
+constexpr float CAPSULE_HALF_HEIGHT = 1.5f;         // 胶囊体半高（相对于半径）
+constexpr float CAPSULE_HALF_WIDTH = 0.5f;          // 胶囊体半宽（相对于半径）
+constexpr float TRIANGLE_HALF_SQRT3 = 0.866025404f; // 三角形高度因子 = √3/2
 
 // 壁面边界条件超参数
-constexpr float SLIP_REFERENCE_VELOCITY = 100.0f;        // 滑移因子参考速度 [m/s]
-constexpr float SLIP_FACTOR_MAX = 0.8f;                   // 最大滑移因子
+constexpr float SLIP_REFERENCE_VELOCITY = 100.0f; // 滑移因子参考速度 [m/s]
+constexpr float SLIP_FACTOR_MAX = 0.8f;           // 最大滑移因子
 #pragma endregion
 
 #pragma region 数学工具函数
@@ -127,8 +127,8 @@ __device__ __forceinline__ float sdfCircle(float px, float py, float cx, float c
 // 输出:带符号距离
 __device__ __forceinline__ float sdfStar(float px, float py, float cx, float cy, float r, float rotation)
 {
-    const int N = 5;                // 5个尖角
-    const float outerR = r;         // 外圆半径(尖角处)
+    const int N = 5;                                 // 5个尖角
+    const float outerR = r;                          // 外圆半径(尖角处)
     const float innerR = r * STAR_INNER_OUTER_RATIO; // 内圆半径(凹陷处，0.38是五角星的标准比例)
 
     // 转换到局部坐标系(以中心为原点)
@@ -231,7 +231,7 @@ __device__ __forceinline__ float sdfCapsule(float px, float py, float cx, float 
     // 核心思想是，胶囊形可以看作是一个半径为 capRadius 的圆，沿着一条线段“扫过”形成的区域
     // 胶囊参数: 水平方向的伸展
     float halfWidth = r * CAPSULE_HALF_HEIGHT; // 胶囊的半长(中轴长度的一半)
-    float capRadius = r * CAPSULE_HALF_WIDTH; // 两端圆弧的半径
+    float capRadius = r * CAPSULE_HALF_WIDTH;  // 两端圆弧的半径
 
     // 将x坐标限制到中轴线段上
     // 中轴线段范围: [-halfWidth + capRadius, halfWidth - capRadius]
@@ -852,8 +852,8 @@ __device__ __forceinline__ void hllFluxX(
 
     // 熵修正：避免跨音速区域的膨胀激波问题
     float delta = ENTROPY_FIX_FACTOR * fmaxf(cL, cR); // 修正阈值取决于声速
-    SL = -entropyFix(-SL, delta);       // 对负波速应用修正
-    SR = entropyFix(SR, delta);         // 对正波速应用修正
+    SL = -entropyFix(-SL, delta);                     // 对负波速应用修正
+    SR = entropyFix(SR, delta);                       // 对正波速应用修正
 
     // 计算左右两侧的物理通量
     float fL_rho, fL_rho_u, fL_rho_v, fL_E;
