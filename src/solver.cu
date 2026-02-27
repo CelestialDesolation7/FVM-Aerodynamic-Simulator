@@ -2020,196 +2020,6 @@ __global__ void applyBoundaryConditionsKernel(
 #pragma endregion
 
 #pragma region 有粘性逻辑
-// 功能:融合核函数 - 一次性计算粘性系数、应力张量和热通量
-// 输入:速度场 u,v, 温度场 T, 网格类型, 网格间距 dx,dy
-// 输出:粘性系数 mu(供CFL使用), 应力张量 tau_xx/yy/xy, 热通量 qx/qy
-// 说明:将原来的 computeViscosity + computeStressTensor + computeHeatFlux 三次内核启动
-//       合并为单次启动，消除中间场(k)的全局内存读写和重复的邻居索引计算
-__global__ void computeViscousTermsKernel(
-    const float *u, const float *v, const float *T,
-    float *mu_out, float *tau_xx, float *tau_yy, float *tau_xy,
-    float *qx, float *qy,
-    const uint8_t *cell_type,
-    float dx, float dy, int nx, int ny)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (i >= nx || j >= ny)
-        return;
-
-    int idx = j * nx + i;
-
-    // 固体单元: 所有粘性量为零
-    if (cell_type[idx] == CELL_SOLID)
-    {
-        mu_out[idx] = 0.0f;
-        tau_xx[idx] = 0.0f;
-        tau_yy[idx] = 0.0f;
-        tau_xy[idx] = 0.0f;
-        qx[idx] = 0.0f;
-        qy[idx] = 0.0f;
-        return;
-    }
-
-    // ===== 1. Sutherland粘性 + 热导率 (就地计算，无需中间存储k) =====
-    float T_val = fmaxf(T[idx], MIN_TEMPERATURE);
-    T_val = fminf(T_val, MAX_TEMPERATURE);
-    float T_ratio = T_val / T_REF;
-    float mu_val = MU_REF * (T_ratio * sqrtf(T_ratio)) * (T_REF + S_SUTHERLAND) / (T_val + S_SUTHERLAND);
-    float k_val = mu_val * CP / PRANDTL_NUMBER;
-    mu_out[idx] = mu_val; // 写出 mu 供CFL条件使用
-
-    // ===== 2. 共享的邻居索引 (只计算一次) =====
-    int idx_im1 = (i > 0) ? (j * nx + (i - 1)) : idx;
-    int idx_ip1 = (i < nx - 1) ? (j * nx + (i + 1)) : idx;
-    int idx_jm1 = (j > 0) ? ((j - 1) * nx + i) : idx;
-    int idx_jp1 = (j < ny - 1) ? ((j + 1) * nx + i) : idx;
-
-    // ===== 3. 速度梯度 → 应力张量 =====
-    float du_dx = (u[idx_ip1] - u[idx_im1]) / (2.0f * dx);
-    float du_dy = (u[idx_jp1] - u[idx_jm1]) / (2.0f * dy);
-    float dv_dx = (v[idx_ip1] - v[idx_im1]) / (2.0f * dx);
-    float dv_dy = (v[idx_jp1] - v[idx_jm1]) / (2.0f * dy);
-
-    // 边界单侧差分
-    if (i == 0)
-    {
-        du_dx = (u[idx_ip1] - u[idx]) / dx;
-        dv_dx = (v[idx_ip1] - v[idx]) / dx;
-    }
-    else if (i == nx - 1)
-    {
-        du_dx = (u[idx] - u[idx_im1]) / dx;
-        dv_dx = (v[idx] - v[idx_im1]) / dx;
-    }
-
-    if (j == 0)
-    {
-        du_dy = (u[idx_jp1] - u[idx]) / dy;
-        dv_dy = (v[idx_jp1] - v[idx]) / dy;
-    }
-    else if (j == ny - 1)
-    {
-        du_dy = (u[idx] - u[idx_jm1]) / dy;
-        dv_dy = (v[idx] - v[idx_jm1]) / dy;
-    }
-
-    float div_v = du_dx + dv_dy;
-    tau_xx[idx] = mu_val * (2.0f * du_dx - (2.0f / 3.0f) * div_v);
-    tau_yy[idx] = mu_val * (2.0f * dv_dy - (2.0f / 3.0f) * div_v);
-    tau_xy[idx] = mu_val * (du_dy + dv_dx);
-
-    // ===== 4. 温度梯度 → 热通量 (复用邻居索引) =====
-    float dT_dx = (T[idx_ip1] - T[idx_im1]) / (2.0f * dx);
-    float dT_dy = (T[idx_jp1] - T[idx_jm1]) / (2.0f * dy);
-
-    if (i == 0)
-        dT_dx = (T[idx_ip1] - T[idx]) / dx;
-    else if (i == nx - 1)
-        dT_dx = (T[idx] - T[idx_im1]) / dx;
-
-    if (j == 0)
-        dT_dy = (T[idx_jp1] - T[idx]) / dy;
-    else if (j == ny - 1)
-        dT_dy = (T[idx] - T[idx_jm1]) / dy;
-
-    qx[idx] = -k_val * dT_dx;
-    qy[idx] = -k_val * dT_dy;
-}
-
-// 功能:粘性扩散步，积分粘性和热传导项
-// 输入:守恒变量，应力张量，热通量，速度，时间步长 dt，网格间距 dx,dy
-// 输出:更新后的守恒变量(就地修改)
-// 说明:实现 d(U)/dt = div(F_visc) 的时间积分
-__global__ void diffusionStepKernel(
-    float *rho_u, float *rho_v, float *E, float *rho_e,
-    const float *tau_xx, const float *tau_yy, const float *tau_xy,
-    const float *qx, const float *qy,
-    const float *u, const float *v,
-    const uint8_t *cell_type,
-    float dt, float dx, float dy, int nx, int ny)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (i >= nx || j >= ny)
-        return;
-
-    int idx = j * nx + i;
-
-    // 跳过固体和虚拟网格
-    if (cell_type[idx] == CELL_SOLID || cell_type[idx] == CELL_GHOST)
-        return;
-
-    // 跳过域边界(由边界条件处理)
-    if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1)
-        return;
-
-    // 邻居索引
-    int idx_im1 = j * nx + (i - 1);
-    int idx_ip1 = j * nx + (i + 1);
-    int idx_jm1 = (j - 1) * nx + i;
-    int idx_jp1 = (j + 1) * nx + i;
-
-    // ===== 计算应力张量的散度(动量方程右端项) =====
-    // X动量: d(tau_xx)/dx + d(tau_xy)/dy
-    float dtau_xx_dx = (tau_xx[idx_ip1] - tau_xx[idx_im1]) / (2.0f * dx);
-    float dtau_xy_dy = (tau_xy[idx_jp1] - tau_xy[idx_jm1]) / (2.0f * dy);
-
-    // Y动量: d(tau_xy)/dx + d(tau_yy)/dy
-    float dtau_xy_dx = (tau_xy[idx_ip1] - tau_xy[idx_im1]) / (2.0f * dx);
-    float dtau_yy_dy = (tau_yy[idx_jp1] - tau_yy[idx_jm1]) / (2.0f * dy);
-
-    // ===== 计算热通量的散度(能量方程的热传导项) =====
-    float dqx_dx = (qx[idx_ip1] - qx[idx_im1]) / (2.0f * dx);
-    float dqy_dy = (qy[idx_jp1] - qy[idx_jm1]) / (2.0f * dy);
-
-    // ===== 计算速度梯度(用于粘性耗散) =====
-    float du_dx = (u[idx_ip1] - u[idx_im1]) / (2.0f * dx);
-    float du_dy = (u[idx_jp1] - u[idx_jm1]) / (2.0f * dy);
-    float dv_dx = (v[idx_ip1] - v[idx_im1]) / (2.0f * dx);
-    float dv_dy = (v[idx_jp1] - v[idx_jm1]) / (2.0f * dy);
-
-    // ===== 粘性耗散: Phi = tau : grad(v) =====
-    // 应力张量与速度梯度张量的双点积
-    // Phi = tau_xx * du/dx + tau_yy * dv/dy + tau_xy * (du/dy + dv/dx)
-    // 物理意义: 粘性力做功转化为热(不可逆过程，总是正值)
-    float Phi = tau_xx[idx] * du_dx + tau_yy[idx] * dv_dy + tau_xy[idx] * (du_dy + dv_dx);
-
-    // ===== 更新动量(粘性力) =====
-    // d(rho*u)/dt = div(tau_x)
-    float rhs_rho_u = dtau_xx_dx + dtau_xy_dy;
-    float rhs_rho_v = dtau_xy_dx + dtau_yy_dy;
-
-    // ===== 更新能量(热传导 + 粘性做功) =====
-    // d(E)/dt = -div(q) + div(tau·v)
-    // div(tau·v) 项展开为粘性应力对流体做功
-
-    // 粘性应力做功项: div(tau·v) = div(u*tau_x + v*tau_y)
-    float work_x_ip1 = u[idx_ip1] * tau_xx[idx_ip1] + v[idx_ip1] * tau_xy[idx_ip1];
-    float work_x_im1 = u[idx_im1] * tau_xx[idx_im1] + v[idx_im1] * tau_xy[idx_im1];
-    float work_y_jp1 = u[idx_jp1] * tau_xy[idx_jp1] + v[idx_jp1] * tau_yy[idx_jp1];
-    float work_y_jm1 = u[idx_jm1] * tau_xy[idx_jm1] + v[idx_jm1] * tau_yy[idx_jm1];
-
-    float dwork_dx = (work_x_ip1 - work_x_im1) / (2.0f * dx);
-    float dwork_dy = (work_y_jp1 - work_y_jm1) / (2.0f * dy);
-
-    // 总能量方程右端项 = -div(q) + div(tau·v)
-    float rhs_E = -dqx_dx - dqy_dy + dwork_dx + dwork_dy;
-
-    // ===== 更新内能(热传导 + 粘性耗散) =====
-    // d(rho*e)/dt = -p*div(v) + Phi - div(q)
-    // 其中 -p*div(v) 项在 updateKernel 中已处理
-    // 这里只添加 Phi 和 -div(q)
-    float rhs_rho_e = -dqx_dx - dqy_dy + Phi;
-
-    // ===== 欧拉前向时间积分 =====
-    rho_u[idx] += dt * rhs_rho_u;
-    rho_v[idx] += dt * rhs_rho_v;
-    E[idx] += dt * rhs_E;
-    rho_e[idx] += dt * rhs_rho_e;
-}
 
 // ===== 辅助设备函数：在任意网格点 (i,j) 计算粘性项 =====
 // 用于融合核函数中按需重算邻居粘性量，避免中间全局内存往返
@@ -2518,43 +2328,6 @@ void CFDSolver::launchApplyBoundaryConditionsKernel(float *rho, float *rho_u, fl
 #pragma endregion
 
 #pragma region 有粘性条件
-// 功能:启动融合粘性项核函数(替代 Viscosity+StressTensor+HeatFlux 三次调用)
-// 说明:单次内核启动完成 Sutherland粘性 + 应力张量 + 热通量 的全部计算
-void CFDSolver::launchComputeViscousTermsKernel(
-    const float *u, const float *v, const float *T,
-    float *mu, float *tau_xx, float *tau_yy, float *tau_xy,
-    float *qx, float *qy,
-    const uint8_t *cell_type,
-    float dx, float dy, int nx, int ny)
-{
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
-
-    computeViscousTermsKernel<<<grid, block>>>(u, v, T, mu,
-                                               tau_xx, tau_yy, tau_xy,
-                                               qx, qy, cell_type,
-                                               dx, dy, nx, ny);
-    CUDA_CHECK(cudaGetLastError());
-}
-
-// 功能:启动扩散步核函数
-void CFDSolver::launchDiffusionStepKernel(float *rho_u, float *rho_v, float *E, float *rho_e,
-                                          const float *tau_xx, const float *tau_yy, const float *tau_xy,
-                                          const float *qx, const float *qy,
-                                          const float *u, const float *v,
-                                          const uint8_t *cell_type,
-                                          float dt, float dx, float dy, int nx, int ny)
-{
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
-
-    diffusionStepKernel<<<grid, block>>>(rho_u, rho_v, E, rho_e,
-                                         tau_xx, tau_yy, tau_xy, qx, qy,
-                                         u, v, cell_type,
-                                         dt, dx, dy, nx, ny);
-    CUDA_CHECK(cudaGetLastError());
-}
-
 // 功能:启动融合粘性-扩散核函数(替代 ViscousTerms + DiffusionStep 双核函数调用)
 // 说明:每线程按需重算邻居粘性量，消除 tau/q 5个中间数组的全局内存往返
 //       节省约 40-50% 的显存带宽
@@ -2819,12 +2592,7 @@ void CFDSolver::allocateMemory()
     CUDA_CHECK(cudaMalloc(&d_scratch_, size));
 
     // 7. 分配粘性相关数组(Navier-Stokes)
-    CUDA_CHECK(cudaMalloc(&d_mu_, size));     // 动力粘性系数
-    CUDA_CHECK(cudaMalloc(&d_tau_xx_, size)); // 应力张量XX分量
-    CUDA_CHECK(cudaMalloc(&d_tau_yy_, size)); // 应力张量YY分量
-    CUDA_CHECK(cudaMalloc(&d_tau_xy_, size)); // 应力张量XY分量
-    CUDA_CHECK(cudaMalloc(&d_qx_, size));     // X方向热通量
-    CUDA_CHECK(cudaMalloc(&d_qy_, size));     // Y方向热通量
+    CUDA_CHECK(cudaMalloc(&d_mu_, size)); // 动力粘性系数
 
     // 8. 分配原子计数器（用于矢量箭头生成，避免每帧cudaMalloc/cudaFree）
     CUDA_CHECK(cudaMalloc(&d_atomic_counter_, sizeof(int)));
@@ -2912,16 +2680,6 @@ void CFDSolver::freeMemory()
     // 释放粘性相关数组
     if (d_mu_)
         cudaFree(d_mu_);
-    if (d_tau_xx_)
-        cudaFree(d_tau_xx_);
-    if (d_tau_yy_)
-        cudaFree(d_tau_yy_);
-    if (d_tau_xy_)
-        cudaFree(d_tau_xy_);
-    if (d_qx_)
-        cudaFree(d_qx_);
-    if (d_qy_)
-        cudaFree(d_qy_);
 
     // 释放原子计数器
     if (d_atomic_counter_)
@@ -2943,7 +2701,6 @@ void CFDSolver::freeMemory()
     d_reduction_output_ = nullptr;
     d_scratch_ = nullptr;
     reduction_buffer_size_ = 0; // 重置缓冲区大小
-    d_mu_ = d_tau_xx_ = d_tau_yy_ = d_tau_xy_ = d_qx_ = d_qy_ = nullptr;
     d_atomic_counter_ = nullptr;
     h_pinnedReduction_ = nullptr;
 }
@@ -2997,11 +2754,12 @@ void CFDSolver::reset(const SimParams &params)
                                   d_u_, d_v_, d_p_, d_T_, _nx, _ny);
 
     // 5. 初始化粘性场(确保 computeStableTimeStep 首次调用时 d_mu_ 有效)
-    //    使用融合核函数: 内部同时计算 mu / tau / q，但此处只需 mu 输出
-    launchComputeViscousTermsKernel(d_u_, d_v_, d_T_,
-                                    d_mu_, d_tau_xx_, d_tau_yy_, d_tau_xy_,
-                                    d_qx_, d_qy_, d_cell_type_,
-                                    params.dx, params.dy, _nx, _ny);
+    //    使用融合核函数(dt=0): 仅计算并写出 mu，不更新守恒变量
+    launchFusedViscousDiffusionKernel(d_u_, d_v_, d_T_,
+                                      d_mu_,
+                                      d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+                                      d_cell_type_,
+                                      0.0f, params.dx, params.dy, _nx, _ny);
 
     // 同步确保完成
     CUDA_CHECK(cudaDeviceSynchronize());

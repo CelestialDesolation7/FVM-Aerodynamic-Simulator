@@ -141,12 +141,7 @@ private:
     int *d_atomic_counter_ = nullptr;
 
     // 粘性相关中间量 (Navier-Stokes方程)
-    float *d_mu_ = nullptr;     // 动态更新的粘度值场
-    float *d_tau_xx_ = nullptr; // x轴方向-粘性力动量-通量场
-    float *d_tau_yy_ = nullptr; // y轴方向-粘性力动量-通量场
-    float *d_tau_xy_ = nullptr; // x和y轴方向-摩擦力动量-通量场
-    float *d_qx_ = nullptr;     // x轴方向-内能-通量场
-    float *d_qy_ = nullptr;     // y轴方向-内能-通量场
+    float *d_mu_ = nullptr; // 动力粘性系数场（供CFL条件使用，由 fusedViscousDiffusionKernel 输出）
 
     // 功能:启动初始化核函数，将全场设为来流条件
     // 输入:守恒变量数组指针，仿真参数，网格尺寸
@@ -230,26 +225,6 @@ private:
     // 实现:使用CUB库高效归约，单阶段GPU完成
     float launchComputeMaxWaveSpeed(const float *u, const float *v, const float *p,
                                     const float *rho, int nx, int ny);
-
-    // 功能:启动融合粘性项核函数(替代上述三个独立核函数的调用)
-    // 输入:速度场(u,v)，温度场(T)，网格类型，网格间距
-    // 输出:粘性系数(mu)，应力张量(tau_xx/yy/xy)，热通量(qx/qy)
-    // 优势:单次内核启动完成全部粘性计算，省去k的全局读写和重复的邻居索引计算
-    void launchComputeViscousTermsKernel(const float *u, const float *v, const float *T,
-                                         float *mu, float *tau_xx, float *tau_yy, float *tau_xy,
-                                         float *qx, float *qy,
-                                         const uint8_t *cell_type,
-                                         float dx, float dy, int nx, int ny);
-
-    // 功能:启动粘性扩散步核函数，积分粘性力和热传导项
-    // 输入:守恒变量，应力张量，热通量，速度场，时间步长，网格间距
-    // 输出:更新后的动量和能量(包括粘性耗散和热传导效应)
-    void launchDiffusionStepKernel(float *rho_u, float *rho_v, float *E, float *rho_e,
-                                   const float *tau_xx, const float *tau_yy, const float *tau_xy,
-                                   const float *qx, const float *qy,
-                                   const float *u, const float *v,
-                                   const uint8_t *cell_type,
-                                   float dt, float dx, float dy, int nx, int ny);
 
     // 功能:融合粘性-扩散核函数(替代 ViscousTerms + DiffusionStep 双核函数调用)
     // 原理:每线程按需重算中心+4邻居的粘性量(寄存器级)，消除 tau/q 中间数组全局内存往返
