@@ -106,6 +106,33 @@ void main() {
 }
 )";
 
+// -----------------------------------------------------------
+// 障碍物轮廓线的顶点着色器
+// 作用：绘制障碍物的外形轮廓
+// -----------------------------------------------------------
+const char *obstacleVertexShader = R"(
+#version 330 core
+layout (location = 0) in vec2 aPos;
+
+void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)";
+
+// -----------------------------------------------------------
+// 障碍物轮廓线的片元着色器
+// 作用：绘制障碍物的颜色
+// -----------------------------------------------------------
+const char *obstacleFragmentShader = R"(
+#version 330 core
+out vec4 FragColor;
+
+uniform vec4 obstacleColor;
+
+void main() {
+    FragColor = obstacleColor;
+}
+)";
 #pragma endregion
 
 #pragma region 构造和析构函数
@@ -129,6 +156,13 @@ bool Renderer::initialize(int width, int height)
     if (!createShaders())
     {
         fprintf(stderr, "创建场渲染着色器失败\n");
+        return false;
+    }
+
+    // 创建障碍物轮廓着色器程序
+    if (!createObstacleShader())
+    {
+        fprintf(stderr, "创建障碍物着色器失败\n");
         return false;
     }
 
@@ -201,7 +235,9 @@ bool Renderer::initialize(int width, int height)
     createColormapTexture();
 
     // 以下属性的值在这里无法确定，会在第一次渲染时更新
-
+    // 创建障碍物轮廓的 VAO/VBO
+    glGenVertexArrays(1, &obstacleVAO_);
+    glGenBuffers(1, &obstacleVBO_);
 
     // 创建矢量箭头的 VAO/VBO（双缓冲）
     glGenVertexArrays(1, &vectorVAO_);
@@ -215,6 +251,10 @@ bool Renderer::initialize(int width, int height)
     glUniform1i(glGetUniformLocation(shaderProgram_, "fieldTexture"), 0);
     glUniform1i(glGetUniformLocation(shaderProgram_, "colormapTexture"), 1);
     glUniform1i(glGetUniformLocation(shaderProgram_, "cellTypeTexture"), 2);
+
+    glUseProgram(obstacleShaderProgram_);
+    glUniform4f(glGetUniformLocation(obstacleShaderProgram_, "obstacleColor"),
+                0.0f, 0.0f, 0.0f, 1.0f);
 
     glUseProgram(0);
 
@@ -235,6 +275,12 @@ void Renderer::cleanup()
         glDeleteVertexArrays(1, &VAO_);
     if (VBO_)
         glDeleteBuffers(1, &VBO_);
+    if (obstacleShaderProgram_)
+        glDeleteProgram(obstacleShaderProgram_);
+    if (obstacleVAO_)
+        glDeleteVertexArrays(1, &obstacleVAO_);
+    if (obstacleVBO_)
+        glDeleteBuffers(1, &obstacleVBO_);
     if (vectorShaderProgram_)
         glDeleteProgram(vectorShaderProgram_);
     if (vectorVAO_)
@@ -302,36 +348,8 @@ bool Renderer::initCudaInterop(int nx, int ny)
 
     mappedSize_ = bufferSize;
     writeIndex_ = 0;
-    fieldPBOMapped_ = false;
-    mappedFieldPtr_ = nullptr;
     cudaInteropEnabled_ = true;
-
-    // 预映射PBO[0]，供solver线程第一帧直接写入
-    mapFieldForWriting();
-
-    // 创建Cell Type PBO（单缓冲，预映射模式：求解器线程直接写入，GL线程提交）
-    glGenBuffers(1, &cellTypePBO_);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, cellTypePBO_);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, bufferSize, nullptr, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    cudaError_t ctErr = cudaGraphicsGLRegisterBuffer(
-        &cudaCellTypePBOResource_, cellTypePBO_,
-        cudaGraphicsMapFlagsWriteDiscard);
-    if (ctErr != cudaSuccess)
-    {
-        fprintf(stderr, "[CUDA互操作] 注册CellType PBO失败: %s\n", cudaGetErrorString(ctErr));
-        glDeleteBuffers(1, &cellTypePBO_);
-        cellTypePBO_ = 0;
-        cudaCellTypePBOResource_ = nullptr;
-    }
-    else
-    {
-        // 预映射Cell Type PBO，供求解器线程第一次写入
-        mapCellTypeForWriting();
-    }
-
-    std::cout << "[CUDA互操作] 双缓冲PBO初始化成功（零拷贝直接映射模式）" << std::endl;
+    std::cout << "[CUDA互操作] 双缓冲PBO初始化成功" << std::endl;
     std::cout << "  网格尺寸: " << nx << " x " << ny << std::endl;
     std::cout << "  每个PBO大小: " << bufferSize / 1024.0f << " KB" << std::endl;
     std::cout << "  总显存占用: " << (bufferSize * 2) / 1024.0f << " KB" << std::endl;
@@ -341,27 +359,6 @@ bool Renderer::initCudaInterop(int nx, int ny)
 // 清理CUDA互操作资源
 void Renderer::cleanupCudaInterop()
 {
-    // 先取消映射（如果仍处于映射状态）
-    if (fieldPBOMapped_ && cudaPBOResource_[writeIndex_])
-    {
-        cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
-        fieldPBOMapped_ = false;
-        mappedFieldPtr_ = nullptr;
-    }
-    if (cellTypePBOMapped_ && cudaCellTypePBOResource_)
-    {
-        cudaGraphicsUnmapResources(1, &cudaCellTypePBOResource_, 0);
-        cellTypePBOMapped_ = false;
-        mappedCellTypePtr_ = nullptr;
-    }
-    if (vectorVBOMapped_ && cudaVectorVBOResource_[vectorWriteIndex_])
-    {
-        cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
-        vectorVBOMapped_ = false;
-        mappedVectorPtr_ = nullptr;
-        mappedVectorMaxVertices_ = 0;
-    }
-
     for (int i = 0; i < 2; i++)
     {
         if (cudaPBOResource_[i])
@@ -385,19 +382,7 @@ void Renderer::cleanupCudaInterop()
             cudaVectorVBOResource_[i] = nullptr;
         }
     }
-
-    // 清理Cell Type PBO
-    if (cudaCellTypePBOResource_)
-    {
-        cudaGraphicsUnregisterResource(cudaCellTypePBOResource_);
-        cudaCellTypePBOResource_ = nullptr;
-    }
-    if (cellTypePBO_)
-    {
-        glDeleteBuffers(1, &cellTypePBO_);
-        cellTypePBO_ = 0;
-    }
-
+    
     cudaInteropEnabled_ = false;
     mappedSize_ = 0;
     writeIndex_ = 0;
@@ -407,16 +392,15 @@ void Renderer::cleanupCudaInterop()
     vectorVBOMapped_ = false;
 }
 
-// 映射PBO[writeIndex]，返回设备指针供CUDA直接写入
-// 映射后的设备指针是普通CUDA地址，任何线程都可以安全写入
-float *Renderer::mapFieldForWriting()
+// 映射当前写入PBO以供CUDA写入，返回设备指针
+float *Renderer::mapFieldTexture()
 {
     if (!cudaInteropEnabled_ || !cudaPBOResource_[writeIndex_])
+    {
         return nullptr;
+    }
 
-    if (fieldPBOMapped_)
-        return mappedFieldPtr_; // 已经映射，直接返回
-
+    // 映射当前writeIndex_对应的CUDA PBO资源，使得OpenGL无法访问它，CUDA可以写入
     cudaError_t err = cudaGraphicsMapResources(1, &cudaPBOResource_[writeIndex_], 0);
     if (err != cudaSuccess)
     {
@@ -424,108 +408,51 @@ float *Renderer::mapFieldForWriting()
         return nullptr;
     }
 
+    // 获取设备指针（显卡内部地址）和大小
     float *devPtr = nullptr;
     size_t size = 0;
     err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void **>(&devPtr), &size, cudaPBOResource_[writeIndex_]);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "[CUDA互操作] 获取PBO[%d]设备指针失败: %s\n", writeIndex_, cudaGetErrorString(err));
+        fprintf(stderr, "[CUDA互操作] 获取设备指针失败: %s\n", cudaGetErrorString(err));
+        // 避免资源泄漏导致死锁，立即取消映射
         cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
         return nullptr;
     }
 
-    fieldPBOMapped_ = true;
-    mappedFieldPtr_ = devPtr;
     return devPtr;
 }
 
-// GL线程：提交已写入的PBO数据（unmap → 上传纹理 → swap → 映射新PBO）
-// 返回新映射的设备指针（供下一帧solver使用）
-float *Renderer::submitField()
+// 取消映射，交换缓冲区，并将读取PBO数据传输到纹理
+void Renderer::unmapFieldTexture()
 {
-    if (!cudaInteropEnabled_ || !fieldPBOMapped_)
-        return nullptr;
+    if (!cudaPBOResource_[writeIndex_])
+        return;
 
-    // 1. 取消映射PBO[writeIndex]（solver已完成写入）
+    // 取消当前writeIndex_对应的CUDA PBO资源映射，这将允许OpenGL访问它
     cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
-    fieldPBOMapped_ = false;
-    mappedFieldPtr_ = nullptr;
 
-    // 2. PBO[writeIndex] → 纹理（GPU内部DMA传输）
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_[writeIndex_]);
-    glBindTexture(GL_TEXTURE_2D, fieldTexture_);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx_, ny_, GL_RED, GL_FLOAT, nullptr);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    // 3. 交换写入索引：下一帧CUDA写入另一个PBO
+    // 交换缓冲区索引：下一帧CUDA写入另一个PBO
+    int readIndex = writeIndex_;
     writeIndex_ = 1 - writeIndex_;
 
-    // 4. 映射新PBO[writeIndex]，为下一帧solver准备设备指针
-    return mapFieldForWriting();
-}
-
-// 映射VBO[vectorWriteIndex]，返回设备指针供CUDA直接写入
-float *Renderer::mapVectorForWriting()
-{
-    if (!cudaInteropEnabled_ || !cudaVectorVBOResource_[vectorWriteIndex_])
-        return nullptr;
-
-    if (vectorVBOMapped_)
-        return mappedVectorPtr_; // 已经映射
-
-    cudaError_t err = cudaGraphicsMapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "[CUDA互操作] 映射矢量VBO[%d]失败: %s\n", vectorWriteIndex_, cudaGetErrorString(err));
-        return nullptr;
-    }
-
-    float *devPtr = nullptr;
-    size_t size = 0;
-    err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void **>(&devPtr), &size,
-                                               cudaVectorVBOResource_[vectorWriteIndex_]);
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "[CUDA互操作] 获取矢量VBO[%d]设备指针失败: %s\n", vectorWriteIndex_, cudaGetErrorString(err));
-        cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
-        return nullptr;
-    }
-
-    vectorVBOMapped_ = true;
-    mappedVectorPtr_ = devPtr;
-    mappedVectorMaxVertices_ = static_cast<int>(vectorVBOCapacity_);
-    return devPtr;
-}
-
-// GL线程：提交已写入的VBO数据（unmap → 记录顶点数 → swap → 映射新VBO）
-// 返回新映射的设备指针
-float *Renderer::submitVectors(int vertexCount)
-{
-    if (!vectorVBOMapped_)
-        return nullptr;
-
-    // 1. 取消映射VBO[vectorWriteIndex]
-    cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
-    vectorVBOMapped_ = false;
-    mappedVectorPtr_ = nullptr;
-    mappedVectorMaxVertices_ = 0;
-
-    // 2. 记录该VBO实际使用的顶点数
-    vectorVertexCount_[vectorWriteIndex_] = vertexCount;
-
-    // 3. 交换索引：下一次CUDA写入另一个VBO
-    vectorWriteIndex_ = 1 - vectorWriteIndex_;
-
-    // 4. 映射新VBO[vectorWriteIndex]，为下一帧准备
-    return mapVectorForWriting();
-}
-
-// 快照矢量箭头渲染状态：在安全区域调用，确定并行渲染时使用哪个VBO
-void Renderer::prepareVectorRender()
-{
-    vectorRenderReadIndex_ = 1 - vectorWriteIndex_;
-    vectorRenderVertexCount_ = vectorVertexCount_[vectorRenderReadIndex_];
+    // 将刚写入完成的PBO（现在是读取PBO）的数据传输到纹理
+    // 这个传输在GPU内部进行，非常快
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, fieldPBO_[readIndex]);
+    glBindTexture(GL_TEXTURE_2D, fieldTexture_);
+    // 参数1-纹理目标：由上面这个函数绑定
+    // 参数2-mipmap层级（即是否使用缩略图）：0（不使用）
+    // 参数3-内部格式：GL_R32F（单通道32位浮点数）
+    // 参数4-宽度：nx
+    // 参数5-高度：ny
+    // 参数6-历史包袱：0（不使用）
+    // 参数7-格式：GL_RED（红色通道/单通道）
+    // 参数8-源数据的类型：GL_FLOAT（浮点数）
+    // 参数9-数据：nullptr（因为数据已经在PBO中，不需要提供CPU指针）
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx_, ny_, GL_RED, GL_FLOAT, nullptr);
+    // 解绑
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
 
 // 重新调整互操作缓冲区尺寸
@@ -566,6 +493,21 @@ bool Renderer::createShaders()
     return shaderProgram_ != 0;
 }
 
+bool Renderer::createObstacleShader()
+{
+    GLuint vertShader = compileShader(obstacleVertexShader, GL_VERTEX_SHADER);
+    GLuint fragShader = compileShader(obstacleFragmentShader, GL_FRAGMENT_SHADER);
+
+    if (!vertShader || !fragShader)
+        return false;
+
+    obstacleShaderProgram_ = linkProgram(vertShader, fragShader);
+
+    glDeleteShader(vertShader);
+    glDeleteShader(fragShader);
+
+    return obstacleShaderProgram_ != 0;
+}
 
 bool Renderer::createVectorShader()
 {
@@ -824,65 +766,6 @@ void Renderer::updateCellTypes(const uint8_t *types, int nx, int ny)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, nx, ny, 0, GL_RED, GL_FLOAT, typeData.data());
 }
 
-// GPU零拷贝路径：预映射Cell Type PBO为CUDA设备指针
-// 如果已经映射则直接返回缓存的指针，否则执行映射
-float *Renderer::mapCellTypeForWriting()
-{
-    if (!cudaInteropEnabled_ || !cudaCellTypePBOResource_)
-        return nullptr;
-
-    // 如果已经映射，直接返回缓存的指针（零开销）
-    if (cellTypePBOMapped_)
-        return mappedCellTypePtr_;
-
-    cudaError_t err = cudaGraphicsMapResources(1, &cudaCellTypePBOResource_, 0);
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "[CUDA互操作] 映射CellType PBO失败: %s\n", cudaGetErrorString(err));
-        return nullptr;
-    }
-
-    float *devPtr = nullptr;
-    size_t size = 0;
-    err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void **>(&devPtr), &size, cudaCellTypePBOResource_);
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "[CUDA互操作] 获取CellType PBO设备指针失败: %s\n", cudaGetErrorString(err));
-        cudaGraphicsUnmapResources(1, &cudaCellTypePBOResource_, 0);
-        return nullptr;
-    }
-
-    cellTypePBOMapped_ = true;
-    mappedCellTypePtr_ = devPtr;
-    return devPtr;
-}
-
-// GPU零拷贝路径：提交已写入的Cell Type PBO数据到GL纹理
-// 流程：unmap CUDA → GL纹理上传 → 重新map供下次写入
-void Renderer::submitCellTypes()
-{
-    if (!cudaCellTypePBOResource_)
-        return;
-
-    // 1. 取消CUDA映射，让GL可以访问PBO数据
-    if (cellTypePBOMapped_)
-    {
-        cudaGraphicsUnmapResources(1, &cudaCellTypePBOResource_, 0);
-        cellTypePBOMapped_ = false;
-        mappedCellTypePtr_ = nullptr;
-    }
-
-    // 2. PBO → cellTypeTexture_（GPU内部DMA传输，无CPU介入）
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, cellTypePBO_);
-    glBindTexture(GL_TEXTURE_2D, cellTypeTexture_);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, nx_, ny_, GL_RED, GL_FLOAT, nullptr);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    // 3. 立即重新映射，供求解器线程下次写入
-    mapCellTypeForWriting();
-}
-
 // 更新速度场数据（用于矢量可视化）
 // 确保矢量VBO有足够的容量
 void Renderer::ensureVectorVBOCapacity(int requiredVertices)
@@ -892,22 +775,12 @@ void Renderer::ensureVectorVBOCapacity(int requiredVertices)
         return;
     }
     
-    // 如果容量足够，确保VBO已映射后直接返回
+    // 如果容量足够，直接返回
     if (vectorVBOCapacity_ >= static_cast<size_t>(requiredVertices))
     {
-        if (!vectorVBOMapped_) mapVectorForWriting();
         return;
     }
     
-    // 需要扩容：先取消映射（如果处于映射状态）
-    if (vectorVBOMapped_)
-    {
-        cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
-        vectorVBOMapped_ = false;
-        mappedVectorPtr_ = nullptr;
-        mappedVectorMaxVertices_ = 0;
-    }
-
     // 取消旧的CUDA注册（两个VBO）
     for (int i = 0; i < 2; i++)
     {
@@ -927,29 +800,93 @@ void Renderer::ensureVectorVBOCapacity(int requiredVertices)
     }
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     
-    // 注册两个VBO为CUDA图形资源（必须在GL线程调用）
-    for (int i = 0; i < 2; i++)
-    {
-        cudaError_t err = cudaGraphicsGLRegisterBuffer(
-            &cudaVectorVBOResource_[i],
-            vectorVBO_[i],
-            cudaGraphicsRegisterFlagsWriteDiscard);
-        if (err != cudaSuccess)
-        {
-            fprintf(stderr, "[错误] 注册矢量VBO[%d]失败: %s\n", i, cudaGetErrorString(err));
-        }
-    }
-
     vectorVBOCapacity_ = requiredVertices;
     vectorVertexCount_[0] = vectorVertexCount_[1] = 0;
-
-    // 预映射VBO[writeIndex]，供solver线程直接写入
-    mapVectorForWriting();
     
     std::cout << "[信息] 矢量VBO双缓冲重新分配: " << requiredVertices << " 顶点 ("
               << (requiredBytes / 1024.0f / 1024.0f) << " MB × 2)\n";
 }
 
+// 映射矢量VBO以供CUDA写入（双缓冲：映射当前writeIndex的VBO）
+float *Renderer::mapVectorVBO(int &outMaxVertices)
+{
+    if (!cudaInteropEnabled_ || vectorVBO_[vectorWriteIndex_] == 0)
+    {
+        outMaxVertices = 0;
+        return nullptr;
+    }
+    
+    if (vectorVBOMapped_)
+    {
+        std::cerr << "[警告] 矢量VBO已经处于映射状态\n";
+        outMaxVertices = 0;
+        return nullptr;
+    }
+    
+    // 确保当前writeIndex的VBO已注册
+    if (!cudaVectorVBOResource_[vectorWriteIndex_])
+    {
+        cudaError_t err = cudaGraphicsGLRegisterBuffer(
+            &cudaVectorVBOResource_[vectorWriteIndex_],
+            vectorVBO_[vectorWriteIndex_],
+            cudaGraphicsRegisterFlagsWriteDiscard);
+        
+        if (err != cudaSuccess)
+        {
+            std::cerr << "[错误] 注册矢量VBO[" << vectorWriteIndex_ << "]失败: " 
+                      << cudaGetErrorString(err) << "\n";
+            outMaxVertices = 0;
+            return nullptr;
+        }
+    }
+    
+    // 映射当前writeIndex的VBO资源
+    cudaError_t err = cudaGraphicsMapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "[错误] 映射矢量VBO[" << vectorWriteIndex_ << "]失败: " 
+                  << cudaGetErrorString(err) << "\n";
+        outMaxVertices = 0;
+        return nullptr;
+    }
+    
+    // 获取设备指针
+    float *devPtr = nullptr;
+    size_t mappedBytes = 0;
+    err = cudaGraphicsResourceGetMappedPointer((void **)&devPtr, &mappedBytes,
+                                               cudaVectorVBOResource_[vectorWriteIndex_]);
+    if (err != cudaSuccess)
+    {
+        std::cerr << "[错误] 获取矢量VBO[" << vectorWriteIndex_ << "]设备指针失败: " 
+                  << cudaGetErrorString(err) << "\n";
+        cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
+        outMaxVertices = 0;
+        return nullptr;
+    }
+    
+    vectorVBOMapped_ = true;
+    outMaxVertices = static_cast<int>(vectorVBOCapacity_);
+    return devPtr;
+}
+
+// 取消映射矢量VBO，交换缓冲区索引
+void Renderer::unmapVectorVBO(int actualVertices)
+{
+    if (!vectorVBOMapped_)
+    {
+        return;
+    }
+    
+    // 取消当前writeIndex的VBO映射
+    cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
+    vectorVBOMapped_ = false;
+    
+    // 保存当前VBO的顶点数量
+    vectorVertexCount_[vectorWriteIndex_] = actualVertices;
+    
+    // 交换缓冲区索引：下一次CUDA写入另一个VBO
+    vectorWriteIndex_ = 1 - vectorWriteIndex_;
+}
 #pragma endregion
 
 #pragma region 渲染主循环
@@ -982,13 +919,135 @@ void Renderer::render(const SimParams &params)
     glBindVertexArray(VAO_);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
-    // 第二层：渲染速度矢量箭头（双缓冲）
+    // 第二层：渲染障碍物轮廓
+    if (showObstacle_ && nx_ > 0 && ny_ > 0)
+    {
+        glUseProgram(obstacleShaderProgram_);
+        // obstacleColor 已在初始化时设置
+
+        // 生成障碍物顶点（在 NDC 坐标系中）
+        std::vector<float> obstacleVerts;
+        const float PI = 3.14159265f;
+
+        // 从参数中获取障碍物的世界空间坐标
+        float obs_cx = params.obstacle_x;
+        float obs_cy = params.obstacle_y;
+        float obs_r = params.obstacle_r;
+        float rotation = params.obstacle_rotation;
+
+        // 辅助函数：将世界坐标转换为 NDC 坐标
+        auto worldToNDC = [&](float wx, float wy, float &nx, float &ny)
+        {
+            nx = (wx / params.domain_width) * 2.0f - 1.0f;
+            ny = (wy / params.domain_height) * 2.0f - 1.0f;
+        };
+
+        // 辅助函数：在世界空间中对点进行旋转，然后转换为 NDC
+        auto addRotatedPoint = [&](float localX, float localY)
+        {
+            // 在世界空间中进行旋转
+            float cosR = cosf(rotation);
+            float sinR = sinf(rotation);
+            float worldX = obs_cx + localX * cosR - localY * sinR;
+            float worldY = obs_cy + localX * sinR + localY * cosR;
+            // 转换为 NDC
+            float ndcX, ndcY;
+            worldToNDC(worldX, worldY, ndcX, ndcY);
+            obstacleVerts.push_back(ndcX);
+            obstacleVerts.push_back(ndcY);
+        };
+
+        // 根据障碍物形状生成顶点
+        switch (params.obstacle_shape)
+        {
+        case 0:
+        { // 圆形
+            int segments = 64;
+            for (int i = 0; i <= segments; i++)
+            {
+                float angle = 2.0f * PI * i / segments;
+                addRotatedPoint(obs_r * cosf(angle), obs_r * sinf(angle));
+            }
+            break;
+        }
+        case 1:
+        { // 五角星
+            int numPoints = 5;
+            float outerR = obs_r;
+            float innerR = obs_r * 0.38f;
+            for (int i = 0; i <= numPoints * 2; i++)
+            {
+                float angle = PI * i / numPoints - PI / 2.0f;
+                float r = (i % 2 == 0) ? outerR : innerR;
+                addRotatedPoint(r * cosf(angle), r * sinf(angle));
+            }
+            // 闭合五角星
+            addRotatedPoint(outerR * cosf(-PI / 2.0f), outerR * sinf(-PI / 2.0f));
+            break;
+        }
+        case 2:
+        { // 菱形
+            float pts[5][2] = {
+                {0, 1}, {1, 0}, {0, -1}, {-1, 0}, {0, 1}};
+            for (int i = 0; i < 5; i++)
+            {
+                addRotatedPoint(obs_r * pts[i][0], obs_r * pts[i][1]);
+            }
+            break;
+        }
+        case 3:
+        { // 胶囊形（圆角矩形）
+            int segments = 16;
+            float halfW = obs_r * 1.5f;
+            float capR = obs_r * 0.5f;
+            // 右侧半圆
+            for (int i = 0; i <= segments; i++)
+            {
+                float angle = -PI / 2 + PI * i / segments;
+                addRotatedPoint(halfW - capR + capR * cosf(angle), capR * sinf(angle));
+            }
+            // 左侧半圆
+            for (int i = 0; i <= segments; i++)
+            {
+                float angle = PI / 2 + PI * i / segments;
+                addRotatedPoint(-halfW + capR + capR * cosf(angle), capR * sinf(angle));
+            }
+            // 闭合
+            addRotatedPoint(halfW - capR, -capR);
+            break;
+        }
+        case 4:
+        { // 三角形（尖端向右）
+            float sqrt3_2 = 0.866025404f;
+            addRotatedPoint(obs_r, 0);
+            addRotatedPoint(-obs_r * 0.5f, obs_r * sqrt3_2);
+            addRotatedPoint(-obs_r * 0.5f, -obs_r * sqrt3_2);
+            addRotatedPoint(obs_r, 0); // 闭合
+            break;
+        }
+        }
+
+        // 上传障碍物顶点数据
+        glBindVertexArray(obstacleVAO_);
+        glBindBuffer(GL_ARRAY_BUFFER, obstacleVBO_);
+        glBufferData(GL_ARRAY_BUFFER, obstacleVerts.size() * sizeof(float),
+                     obstacleVerts.data(), GL_DYNAMIC_DRAW);
+
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
+        glEnableVertexAttribArray(0);
+
+        // 绘制障碍物轮廓
+        glLineWidth(2.0f);
+        glDrawArrays(GL_LINE_STRIP, 0, static_cast<GLsizei>(obstacleVerts.size() / 2));
+    }
+
+    // 第三层：渲染速度矢量箭头（双缓冲）
     // 注意：箭头顶点数据由solver生成，此处仅负责绘制
     // 绘制readIndex的VBO（CUDA正在写入另一个VBO）
     if (showVectors_)
     {
-        int readIndex = vectorRenderReadIndex_;
-        int vertexCount = vectorRenderVertexCount_;
+        int readIndex = 1 - vectorWriteIndex_;
+        int vertexCount = vectorVertexCount_[readIndex];
         
         if (vertexCount > 0)
         {

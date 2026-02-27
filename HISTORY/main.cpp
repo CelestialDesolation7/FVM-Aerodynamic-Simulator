@@ -12,10 +12,6 @@
 #include <chrono>
 #include <iostream>
 #include <filesystem>
-#include <thread>
-#include <mutex>
-#include <atomic>
-#include <condition_variable>
 
 #include "common.h"
 #include "solver.cuh"
@@ -53,39 +49,6 @@ FieldType currentField = FieldType::TEMPERATURE;
 const char *colormapNames[] = {"Jet", "Hot", "Plasma", "Inferno", "Viridis"};
 int currentColormap = 0;
 
-// 多线程：求解器与渲染器帧级同步（生产者-消费者模型）
-std::mutex g_solverMutex;
-std::condition_variable g_solverCV;
-std::atomic<bool> g_solverShouldStop{false};
-std::thread g_solverThread;
-enum class SolverState { IDLE, RUNNING, DONE };
-SolverState g_solverState = SolverState::IDLE; // 受 g_solverMutex 保护
-
-// 延迟操作标志（键盘回调中设置，主循环安全区域执行）
-std::atomic<bool> g_resetRequested{false};
-
-// 障碍物几何更新标志（UI线程设置，求解器线程消费）
-std::atomic<bool> g_obstacleGeometryDirty{false};
-// 形状改变标志（需要完整reset，UI线程设置，求解器线程消费）
-std::atomic<bool> g_shapeResetRequested{false};
-
-// 缓存的仿真统计数据（在渲染线程安全区域更新）
-float cachedMaxTemp = 0.0f;
-float cachedMaxMach = 0.0f;
-
-// 垂直同步控制
-bool vsyncEnabled = true;
-
-// 求解器帧结果（求解器线程DONE前写入，渲染线程DONE后读取，通过条件变量同步保护）
-struct SolverFrameResults {
-    float maxTemp = 0.0f;
-    float maxMach = 0.0f;
-    float simTimePerStep = 0.0f;
-    int vectorVertexCount = 0;  // 本帧生成的矢量箭头顶点数
-    bool cellTypesDirty = false; // 求解器线程更新了网格类型，渲染线程应提交到GL纹理
-};
-SolverFrameResults g_solverResults;
-
 // 颜色映射范围控制变量（绝对值）
 float temperature_min = 200.0f; // 温度下限 (K)
 float temperature_max = 400.0f; // 温度上限 (K)
@@ -105,20 +68,6 @@ constexpr float DENSITY_MIN_LIMIT = 0.01f;
 constexpr float DENSITY_MAX_LIMIT = 10.0f;
 constexpr float VELOCITY_MAX_LIMIT = 2000.0f;
 constexpr float MACH_MAX_LIMIT = 10.0f;
-
-// 矢量箭头渲染常量
-constexpr float ARROW_HEAD_ANGLE = 0.5f;               // 箭头头部张角 [rad]
-constexpr float ARROW_HEAD_LENGTH_RATIO = 0.3f;        // 箭头头部占箭身比例
-constexpr float ARROW_LENGTH_SCALE = 0.8f;             // 箭头长度缩放因子（相对于网格间距）
-constexpr int VERTICES_PER_ARROW = 8;                  // 每箭头顶点数（箭身2+头部6）
-
-// 性能监控节流常量
-constexpr float STATS_THROTTLE_INTERVAL = 0.25f;       // 统计归约节流间隔 [秒]
-constexpr float FPS_UPDATE_INTERVAL = 0.5f;            // FPS显示更新间隔 [秒]
-
-// CUDA环境检测常量
-constexpr int MIN_COMPUTE_CAPABILITY_MAJOR = 7;        // 最低计算能力主版本号
-constexpr int MIN_COMPUTE_CAPABILITY_MINOR = 5;        // 最低计算能力次版本号
 
 #pragma endregion
 
@@ -142,7 +91,9 @@ void keyCallback(GLFWwindow *window, int key, int scancode, int action, int mods
     }
     if (key == GLFW_KEY_R && action == GLFW_PRESS)
     {
-        g_resetRequested = true;
+        params.t_current = 0.0f;
+        params.step = 0;
+        solver.reset(params);
     }
 }
 #pragma endregion
@@ -198,137 +149,6 @@ bool initializeSimulation()
 }
 #pragma endregion
 
-#pragma region 求解器线程
-// 求解器线程函数：独立于渲染线程运行仿真计算
-// 采用"生产者-消费者"帧同步模型：
-//   每批计算 stepsPerFrame 步 + 可视化写入PBO/VBO + 统计归约
-//   全部GPU工作完成后通知渲染线程，实现最大化并行
-void solverThreadFunc()
-{
-    cudaSetDevice(0);
-
-    while (true)
-    {
-        // 等待渲染线程发出"开始计算"信号
-        {
-            std::unique_lock<std::mutex> lock(g_solverMutex);
-            g_solverCV.wait(lock, [] {
-                return g_solverState == SolverState::RUNNING || g_solverShouldStop.load();
-            });
-            if (g_solverShouldStop) return;
-        }
-
-        // ==================== 0. 障碍物几何更新（延迟到求解器线程执行，消除主线程CUDA同步开销） ====================
-        if (g_shapeResetRequested.exchange(false))
-        {
-            // 形状/大小变化：完整重置流场
-            solver.reset(params);
-            // 将cell type写入预映射的PBO
-            float *ctPtr = renderer.getMappedCellTypePtr();
-            if (ctPtr)
-            {
-                solver.convertCellTypesToDevice(ctPtr);
-                g_solverResults.cellTypesDirty = true;
-            }
-        }
-        else if (g_obstacleGeometryDirty.exchange(false))
-        {
-            // 位置/旋转/襟翼等变化：热更新SDF（不重置流场）
-            solver.updateObstacleGeometry(params);
-            // 将cell type写入预映射的PBO
-            float *ctPtr = renderer.getMappedCellTypePtr();
-            if (ctPtr)
-            {
-                solver.convertCellTypesToDevice(ctPtr);
-                g_solverResults.cellTypesDirty = true;
-            }
-        }
-
-        // ==================== 1. 仿真计算 ====================
-        auto simStart = std::chrono::high_resolution_clock::now();
-
-        float dt = solver.computeStableTimeStep(params);
-        params.dt = dt;
-        int n = stepsPerFrame; // 读一次当前值
-        for (int i = 0; i < n; i++)
-        {
-            solver.step(params);
-        }
-
-        // ==================== 2. 可视化：直接写入预映射的PBO（零拷贝，无需GL上下文） ====================
-        // PBO[writeIndex]已由GL线程预映射，此处获取的设备指针可直接写入
-        float *devPtr = renderer.getMappedFieldPtr();
-        if (devPtr)
-        {
-            switch (currentField)
-            {
-            case FieldType::TEMPERATURE:
-                solver.computeTemperatureToDevice(devPtr);
-                break;
-            case FieldType::PRESSURE:
-                solver.computePressureToDevice(devPtr);
-                break;
-            case FieldType::DENSITY:
-                solver.computeDensityToDevice(devPtr);
-                break;
-            case FieldType::VELOCITY_MAG:
-                solver.computeVelocityMagToDevice(devPtr);
-                break;
-            case FieldType::MACH:
-                solver.computeMachToDevice(devPtr);
-                break;
-            }
-        }
-
-        // ==================== 3. 矢量箭头：直接写入预映射的VBO（零拷贝） ====================
-        g_solverResults.vectorVertexCount = 0;
-        if (renderer.getShowVectors())
-        {
-            int step = renderer.getVectorDensity();
-            float cellWidth = 2.0f / params.nx;
-            float cellHeight = 2.0f / params.ny;
-            float maxArrowLength = std::min(cellWidth, cellHeight) * (step * ARROW_LENGTH_SCALE);
-
-            int vboCapacity = renderer.getMappedVectorCapacity();
-            float *devVertexData = renderer.getMappedVectorPtr();
-            if (devVertexData && vboCapacity > 0)
-            {
-                int numVertices = solver.generateVectorArrows(
-                    devVertexData, vboCapacity,
-                    step, params.u_inf,
-                    maxArrowLength, ARROW_HEAD_ANGLE, ARROW_HEAD_LENGTH_RATIO);
-                g_solverResults.vectorVertexCount = numVertices;
-            }
-        }
-
-        // ==================== 4. 统计归约（节流至0.25秒一次） ====================
-        {
-            static auto lastStatsTime = std::chrono::high_resolution_clock::now();
-            auto statsNow = std::chrono::high_resolution_clock::now();
-            if (std::chrono::duration<float>(statsNow - lastStatsTime).count() >= STATS_THROTTLE_INTERVAL)
-            {
-                g_solverResults.maxTemp = solver.getMaxTemperature();
-                g_solverResults.maxMach = solver.getMaxMach();
-                lastStatsTime = statsNow;
-            }
-        }
-
-        // ==================== 5. 同步所有GPU工作 ====================
-        cudaDeviceSynchronize();
-
-        auto simEnd = std::chrono::high_resolution_clock::now();
-        g_solverResults.simTimePerStep = std::chrono::duration<float>(simEnd - simStart).count() / n;
-
-        // ==================== 6. 通知渲染线程 ====================
-        {
-            std::lock_guard<std::mutex> lock(g_solverMutex);
-            g_solverState = SolverState::DONE;
-        }
-        g_solverCV.notify_one();
-    }
-}
-#pragma endregion
-
 #pragma region 控制面板渲染
 void renderUI()
 {
@@ -348,43 +168,27 @@ void renderUI()
         ImGui::Text(u8"迭代步数: %d", params.step);
         ImGui::SliderInt(u8"每帧迭代数", &stepsPerFrame, 1, 100);
 
-        // 垂直同步热切换
-        if (ImGui::Checkbox(u8"垂直同步", &vsyncEnabled))
-        {
-            glfwSwapInterval(vsyncEnabled ? 1 : 0);
-        }
-
         ImGui::Separator();
 
-        // GPU 显存信息（节流查询：每1秒更新一次，避免驱动调用造成性能开销）
-        static float cachedUsedMem = 0.0f;
-        static float cachedTotalMemMB = 0.0f;
-        static float cachedMemUsagePercent = 0.0f;
-        static auto lastMemQueryTime = std::chrono::high_resolution_clock::now();
-        auto now = std::chrono::high_resolution_clock::now();
-        if (std::chrono::duration<float>(now - lastMemQueryTime).count() >= 1.0f)
-        {
-            lastMemQueryTime = now;
-            size_t freeMem, totalMem;
-            CFDSolver::getGPUMemoryInfo(freeMem, totalMem);
-            cachedUsedMem = (totalMem - freeMem) / (1024.0f * 1024.0f);
-            cachedTotalMemMB = totalMem / (1024.0f * 1024.0f);
-            cachedMemUsagePercent = (totalMem - freeMem) * 100.0f / totalMem;
-        }
+        // GPU 显存信息
+        size_t freeMem, totalMem;
+        CFDSolver::getGPUMemoryInfo(freeMem, totalMem);
+        float usedMem = (totalMem - freeMem) / (1024.0f * 1024.0f);
+        float totalMemMB = totalMem / (1024.0f * 1024.0f);
+        float memUsagePercent = (totalMem - freeMem) * 100.0f / totalMem;
 
         ImGui::Text(u8"GPU 显存使用");
         ImGui::SameLine();
 
         // 用一个进度条显示
         // RGBA 绿色->黄色->红色
-        ImVec4 barColor = (cachedMemUsagePercent < 70.0f) ? ImVec4(0.0f, 1.0f, 0.0f, 1.0f) : (cachedMemUsagePercent < 90.0f) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f)
+        ImVec4 barColor = (memUsagePercent < 70.0f) ? ImVec4(0.0f, 1.0f, 0.0f, 1.0f) : (memUsagePercent < 90.0f) ? ImVec4(1.0f, 1.0f, 0.0f, 1.0f)
                                                                                                                  : ImVec4(1.0f, 0.0f, 0.0f, 1.0f);
         char memInfoLabel[64];
-        std::snprintf(memInfoLabel, sizeof(memInfoLabel), u8"GPU 显存使用: %.1f MB / %.1f MB (%.1f%%)", cachedUsedMem, cachedTotalMemMB, cachedMemUsagePercent);
+        std::snprintf(memInfoLabel, sizeof(memInfoLabel), u8"GPU 显存使用: %.1f MB / %.1f MB (%.1f%%)", usedMem, totalMemMB, memUsagePercent);
         ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barColor);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
-        ImGui::ProgressBar(cachedMemUsagePercent / 100.0f, ImVec2(200, 0), memInfoLabel);
-        ImGui::PopStyleColor(2);
+        ImGui::ProgressBar(memUsagePercent / 100.0f, ImVec2(200, 0), memInfoLabel);
+        ImGui::PopStyleColor();
 
         size_t simMemory = solver.getSimulationMemoryUsage();
         ImGui::Text(u8"仿真数据占用显存: %.1f MB", simMemory / (1024.0f * 1024.0f));
@@ -541,8 +345,7 @@ void renderUI()
     // 障碍物设置
     if (ImGui::CollapsingHeader(u8"障碍物设置", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        bool shapeChanged = false;
-        bool obstacleChanged = false;
+        bool changed = false;
 
         // Quick shape buttons
         ImGui::Text(u8"障碍物形状:");
@@ -550,82 +353,83 @@ void renderUI()
         if (ImGui::Button(u8"圆形"))
         {
             params.obstacle_shape = ObstacleShape::CIRCLE;
-            shapeChanged = true;
+            changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"五角星"))
         {
             params.obstacle_shape = ObstacleShape::STAR;
-            shapeChanged = true;
+            changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"菱形"))
         {
             params.obstacle_shape = ObstacleShape::DIAMOND;
-            shapeChanged = true;
+            changed = true;
         }
         if (ImGui::Button(u8"胶囊形"))
         {
             params.obstacle_shape = ObstacleShape::CAPSULE;
-            shapeChanged = true;
+            changed = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"三角形"))
         {
             params.obstacle_shape = ObstacleShape::TRIANGLE;
-            shapeChanged = true;
+            changed = true;
         }
         ImGui::SameLine();
-        if (ImGui::Button(u8"星舰"))
-        {
+        if(ImGui::Button(u8"星舰")){
             params.obstacle_shape = ObstacleShape::STARSHIP;
-            shapeChanged = true;
+            changed = true;
         }
 
         ImGui::Separator();
 
-        obstacleChanged |= ImGui::SliderFloat(u8"中心 X 坐标", &params.obstacle_x, 0.5f, params.domain_width * 0.5f);
-        shapeChanged |= ImGui::SliderFloat(u8"大小 (半径)", &params.obstacle_r, 0.1f, 1.5f);
+        changed |= ImGui::SliderFloat(u8"中心 X 坐标", &params.obstacle_x, 0.5f, params.domain_width * 0.5f);
+        changed |= ImGui::SliderFloat(u8"大小 (半径)", &params.obstacle_r, 0.1f, 1.5f);
 
         // 障碍物旋转角度
         float rotationDeg = params.obstacle_rotation * 180.0f / PI;
         if (ImGui::SliderFloat(u8"旋转角度 (度)", &rotationDeg, -180.0f, 180.0f))
         {
             params.obstacle_rotation = rotationDeg * PI / 180.0f;
-            obstacleChanged = true;
+            changed = true;
         }
         if (ImGui::InputFloat(u8"精确旋转角度 (度)", &rotationDeg))
         {
             params.obstacle_rotation = rotationDeg * PI / 180.0f;
-            obstacleChanged = true;
+            changed = true;
         }
-
         if (params.obstacle_shape == ObstacleShape::STARSHIP)
         {
+            bool wingChanged = false;
             float wingRotationDeg = params.wing_rotation * 180.0f / PI;
             if (ImGui::SliderFloat(u8"襟翼旋转角度 (度)", &wingRotationDeg, 0.0f, 90.0f))
             {
                 params.wing_rotation = wingRotationDeg * PI / 180.0f;
-                obstacleChanged = true;
+                wingChanged = true;
             }
             if (ImGui::InputFloat(u8"襟翼精确旋转角度 (度)", &wingRotationDeg))
             {
                 wingRotationDeg = std::clamp(wingRotationDeg, 0.0f, 90.0f);
                 params.wing_rotation = wingRotationDeg * PI / 180.0f;
-                obstacleChanged = true;
+                wingChanged = true;
+            }
+            // 襟翼角度变化：动态更新，不重置仿真
+            if (wingChanged && !changed)
+            {
+                solver.updateWingRotation(params);
+                solver.getCellTypes(h_cellTypes.data());
+                renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
             }
         }
-
-        if (shapeChanged)
+        if (changed)
         {
             params.obstacle_y = params.domain_height / 2.0f;
-            // 延迟到求解器线程执行（避免安全区域的CUDA同步开销）
-            g_shapeResetRequested = true;
-        }
-        else if (obstacleChanged)
-        {
-            // 延迟到求解器线程执行（避免安全区域的CUDA同步开销）
-            g_obstacleGeometryDirty = true;
+            solver.reset(params);
+            solver.getCellTypes(h_cellTypes.data());
+            renderer.updateCellTypes(h_cellTypes.data(), params.nx, params.ny);
         }
     }
     ImGui::Separator();
@@ -696,7 +500,7 @@ void renderUI()
             if (showVectors)
             {
                 int vectorDensity = renderer.getVectorDensity();
-                if (ImGui::SliderInt(u8"矢量箭头间隔", &vectorDensity, 5, 100, u8"%d 格"))
+                if (ImGui::SliderInt(u8"矢量箭头间隔", &vectorDensity, 5, 50, u8"%d 格"))
                 {
                     renderer.setVectorDensity(vectorDensity);
                 }
@@ -710,9 +514,11 @@ void renderUI()
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), u8"（速度矢量仅在[速度大小]模式下可用）");
         }
 
-        // Statistics（使用缓存值，实际查询在主循环安全区域以0.25秒间隔执行）
-        ImGui::Text(u8"最高温度: %.1f K", cachedMaxTemp);
-        ImGui::Text(u8"最大马赫数: %.2f", cachedMaxMach);
+        // Statistics
+        float maxT = solver.getMaxTemperature();
+        float maxMa = solver.getMaxMach();
+        ImGui::Text(u8"最高温度: %.1f K", maxT);
+        ImGui::Text(u8"最大马赫数: %.2f", maxMa);
     }
 
     ImGui::Separator();
@@ -745,8 +551,8 @@ void renderUI()
 
         // Labels
         const char *unit = "";
-        float minVal = 0.0f;
-        float maxVal = 1.0f;
+        float minVal = params.T_min;
+        float maxVal = params.T_max;
 
         switch (currentField)
         {
@@ -821,11 +627,10 @@ void updateVisualization()
 
     renderer.setFieldRange(minVal, maxVal, currentField);
 
-    // PBO[writeIndex]已预映射，直接获取设备指针写入
-    float *devPtr = renderer.getMappedFieldPtr();
+    float *devPtr = renderer.mapFieldTexture();
     if (!devPtr)
     {
-        std::cerr << "[错误] PBO未映射\n";
+        std::cerr << "[错误] PBO映射失败\n";
         return;
     }
 
@@ -849,8 +654,7 @@ void updateVisualization()
         break;
     }
 
-    // 提交PBO：unmap → 上传纹理 → swap → remap
-    renderer.submitField();
+    renderer.unmapFieldTexture();
 
     // 生成矢量箭头（如果启用）
     if (renderer.getShowVectors())
@@ -858,33 +662,35 @@ void updateVisualization()
         int step = renderer.getVectorDensity();
 
         // 计算箭头参数
+        const float arrowHeadAngle = 0.5f;
+        const float arrowHeadLength = 0.3f;
 
         // 计算单个格子在NDC中的尺寸
         float cellWidth = 2.0f / params.nx;
         float cellHeight = 2.0f / params.ny;
-        float maxArrowLength = std::min(cellWidth, cellHeight) * (step * ARROW_LENGTH_SCALE);
+        float maxArrowLength = std::min(cellWidth, cellHeight) * (step * 0.8f);
 
         // 计算最大可能的箭头数量（每个箭头8个顶点）
         int numArrowsX = (params.nx + step - 1) / step;
         int numArrowsY = (params.ny + step - 1) / step;
         int maxVertices = numArrowsX * numArrowsY * 8;
 
-        // 确保VBO有足够容量（同时确保VBO已映射）
+        // 确保VBO有足够容量
         renderer.ensureVectorVBOCapacity(maxVertices);
 
-        // VBO[writeIndex]已预映射，直接获取设备指针写入
-        float *devVertexData = renderer.getMappedVectorPtr();
-        int vboCapacity = renderer.getMappedVectorCapacity();
-        if (devVertexData && vboCapacity > 0)
+        // 映射VBO
+        int vboCapacity;
+        float *devVertexData = renderer.mapVectorVBO(vboCapacity);
+        if (devVertexData)
         {
+            // 调用solver生成箭头
             int numVertices = solver.generateVectorArrows(
                 devVertexData, vboCapacity,
                 step, params.u_inf,
-                maxArrowLength, ARROW_HEAD_ANGLE, ARROW_HEAD_LENGTH_RATIO);
+                maxArrowLength, arrowHeadAngle, arrowHeadLength);
 
-            // 提交VBO：unmap → swap → remap
-            renderer.submitVectors(numVertices);
-            renderer.prepareVectorRender();
+            // 取消映射
+            renderer.unmapVectorVBO(numVertices);
         }
     }
 }
@@ -989,7 +795,7 @@ bool checkCudaAvailability()
 
         // 检查计算能力是否足够（至少需要 7.5，对应 RTX 20 系列）
         int computeCapability = prop.major * 10 + prop.minor;
-        if (computeCapability < MIN_COMPUTE_CAPABILITY_MAJOR * 10 + MIN_COMPUTE_CAPABILITY_MINOR)
+        if (computeCapability < 75)
         {
             std::cerr << "========================================" << std::endl;
             std::cerr << "[警告] GPU 计算能力较低 (" << prop.major << "." << prop.minor << ")" << std::endl;
@@ -1047,8 +853,8 @@ int main(int argc, char *argv[])
         return -1;
     }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1);
-    
+    glfwSwapInterval(1); // 启用垂直同步
+
     // 设置回调函数
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
     glfwSetKeyCallback(window, keyCallback);
@@ -1095,123 +901,44 @@ int main(int argc, char *argv[])
         return -1;
     }
 
-    // 启动求解器线程
-    g_solverShouldStop = false;
-    g_solverThread = std::thread(solverThreadFunc);
-
     // 初始化时间和帧率
     auto lastTime = std::chrono::high_resolution_clock::now();
     int frameCount = 0;
 
     // 主渲染循环
-    // 架构：渲染线程与求解器线程使用条件变量进行帧级同步
-    // 每帧流程：
-    //   1. 等待求解器完成上一批计算
-    //   2. [安全区域] 处理UI、可视化、统计（求解器不运行）
-    //   3. 信号求解器开始下一批计算
-    //   4. [并行区域] OpenGL渲染当前帧（求解器同时计算下一帧数据）
     while (!glfwWindowShouldClose(window))
     {
+        auto frameStart = std::chrono::high_resolution_clock::now();
         glfwPollEvents();
 
-        // ==================== 等待求解器完成 ====================
-        bool hasNewResults = false;
+        // 进行一步仿真
+        if (!params.paused)
         {
-            std::unique_lock<std::mutex> lock(g_solverMutex);
-            if (g_solverState == SolverState::RUNNING)
+            auto simStart = std::chrono::high_resolution_clock::now();
+
+            for (int i = 0; i < stepsPerFrame; i++)
             {
-                g_solverCV.wait(lock, [] {
-                    return g_solverState != SolverState::RUNNING;
-                });
-            }
-            // 消费DONE状态：标记有新结果可用
-            hasNewResults = (g_solverState == SolverState::DONE);
-            if (hasNewResults) g_solverState = SolverState::IDLE;
-        }
-
-        // ========= 安全区域：求解器不运行，可自由访问GPU数据 =========
-
-        // 处理延迟的键盘操作（回调中设置标志，此处安全执行）
-        if (g_resetRequested.exchange(false))
-        {
-            params.t_current = 0.0f;
-            params.step = 0;
-            solver.reset(params);
-        }
-
-        // 消费求解器帧结果：提交PBO/VBO（unmap → upload → swap → remap）+ 读取统计
-        if (hasNewResults)
-        {
-            renderer.submitField();                                  // GL: unmap→纹理→swap→remap
-            if (g_solverResults.vectorVertexCount > 0)
-            {
-                renderer.submitVectors(g_solverResults.vectorVertexCount); // GL: unmap→swap→remap
-            }
-            renderer.prepareVectorRender();                          // 快照VBO读取索引
-
-            // 如果求解器线程更新了网格类型，提交到GL纹理
-            if (g_solverResults.cellTypesDirty)
-            {
-                renderer.submitCellTypes();  // GL: unmap PBO → glTexSubImage2D → remap
-                g_solverResults.cellTypesDirty = false;
+                // 计算 CFL 限制
+                float dt = solver.computeStableTimeStep(params);
+                params.dt = dt;
+                solver.step(params);
             }
 
-            cachedMaxTemp = g_solverResults.maxTemp;
-            cachedMaxMach = g_solverResults.maxMach;
-            simTimePerStep = g_solverResults.simTimePerStep;
+            auto simEnd = std::chrono::high_resolution_clock::now();
+            simTimePerStep = std::chrono::duration<float>(simEnd - simStart).count() / stepsPerFrame;
         }
 
-        // ImGui帧开始 + UI逻辑（所有solver交互在此安全发生）
+        // 更新可视化数据（主机缓存）
+        updateVisualization();
+
+        // 绘制可视化数据
+        renderer.render(params);
+
+        // 最后绘制ImGui，防止控制面板被遮挡
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
         renderUI();
-
-        // 设置场值范围（用于渲染着色器）
-        {
-            float minVal, maxVal;
-            switch (currentField)
-            {
-            case FieldType::TEMPERATURE: minVal = temperature_min; maxVal = temperature_max; break;
-            case FieldType::PRESSURE:    minVal = pressure_min;    maxVal = pressure_max;    break;
-            case FieldType::DENSITY:     minVal = density_min;     maxVal = density_max;     break;
-            case FieldType::VELOCITY_MAG: minVal = 0.0f;           maxVal = velocity_max;    break;
-            case FieldType::MACH:        minVal = 0.0f;            maxVal = mach_max;        break;
-            }
-            renderer.setFieldRange(minVal, maxVal, currentField);
-        }
-
-        // 确保矢量VBO容量（GL操作，必须在GL线程；在solver使用前完成）
-        if (renderer.getShowVectors())
-        {
-            int step = renderer.getVectorDensity();
-            int numArrowsX = (params.nx + step - 1) / step;
-            int numArrowsY = (params.ny + step - 1) / step;
-            int maxVertices = numArrowsX * numArrowsY * VERTICES_PER_ARROW;
-            renderer.ensureVectorVBOCapacity(maxVertices);
-        }
-
-        // ==================== 信号求解器或处理暂停 ====================
-        if (!params.paused)
-        {
-            // 非暂停：启动求解器线程（计算、可视化、统计全部在solver线程完成）
-            std::lock_guard<std::mutex> lock(g_solverMutex);
-            g_solverState = SolverState::RUNNING;
-            g_solverCV.notify_one();
-        }
-        else
-        {
-            // 暂停时：在渲染线程直接更新可视化（用户可能切换显示物理量）
-            updateVisualization();
-        }
-
-        // ====== 并行区域：OpenGL渲染 ======
-        // 此时求解器线程正在GPU上计算下一帧：
-        //   - solver CUDA直接写入PBO[writeIndex]（预映射），GL从纹理（来自另一个PBO）渲染
-        //   - solver CUDA直接写入VBO[writeIndex]（预映射），GL从另一个VBO绘制矢量箭头
-        //   完全零拷贝，无staging中转
-        renderer.render(params);
-
         ImGui::Render();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -1222,22 +949,13 @@ int main(int argc, char *argv[])
         auto currentTime = std::chrono::high_resolution_clock::now();
         float elapsed = std::chrono::duration<float>(currentTime - lastTime).count();
 
-        if (elapsed >= FPS_UPDATE_INTERVAL)
+        if (elapsed >= 0.5f)
         {
             fps = frameCount / elapsed;
             frameCount = 0;
             lastTime = currentTime;
         }
     }
-
-    // 停止求解器线程
-    {
-        std::lock_guard<std::mutex> lock(g_solverMutex);
-        g_solverShouldStop = true;
-    }
-    g_solverCV.notify_one();
-    if (g_solverThread.joinable())
-        g_solverThread.join();
 
     // 例行清理代码
     ImGui_ImplOpenGL3_Shutdown();

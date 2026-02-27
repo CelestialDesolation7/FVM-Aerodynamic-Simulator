@@ -232,12 +232,21 @@ target_compile_options(${PROJECT_NAME} PRIVATE
         --use_fast_math                    # 启用快速数学运算
         --expt-relaxed-constexpr           # 放宽 constexpr 限制
         -Xcompiler=/utf-8                  # MSVC UTF-8 支持
+        
+        # 真正用于日常断点找 Bug 的 Debug 模式 (慢，但能查错)
         $<$<CONFIG:Debug>:
-            -G                             # 生成调试信息
+            -O0                            # 禁用优化
+            -G                             # 开启设备端调试信息
             -lineinfo                      # 行信息
         >
+        
         $<$<CONFIG:Release>:
-            -O3                            # 最高优化
+            -O3                            # 最高优化级别
+        >
+        
+        $<$<CONFIG:RelWithDebInfo>:
+            -O3
+            -lineinfo                      # 在 Release 中保留行号供 Nsight 分析
         >
     >
 )
@@ -248,8 +257,10 @@ if(MSVC)
         $<$<COMPILE_LANGUAGE:CXX>:
             /utf-8                         # UTF-8 字符集
             /W3                            # 警告级别 3
-            $<$<CONFIG:Debug>:/Od /Zi>     # Debug: 无优化 + 调试信息
-            $<$<CONFIG:Release>:/O2 /Ob2>  # Release: 优化
+            
+            # C++ 的 Debug 和 Release 区分
+            $<$<CONFIG:Debug>:/Od /Zi>     # Debug: 无优化 + 调试信息 (系统默认带 /RTC1)
+            $<$<CONFIG:Release>:/O2 /Ob2 /Zi> # Release: 优化 + 调试信息库(PDB)
         >
     )
 endif()

@@ -30,6 +30,7 @@ enum class FieldType
     MACH          // 马赫数场
 };
 #pragma endregion
+#pragma endregion
 
 #pragma region 色图辅助函数
 // 全局辅助函数：根据色图类型和归一化值(0~1)计算RGB颜色
@@ -95,6 +96,7 @@ inline void getColormapColor(ColormapType colormap, float t, float &r, float &g,
     }
 }
 #pragma endregion
+#pragma endregion
 
 #pragma region 渲染器类定义
 // 渲染器类：负责使用 OpenGL 进行 CFD 仿真结果的可视化
@@ -111,17 +113,7 @@ public:
     void cleanup();
 
     // 更新网格类型数据（用于显示障碍物和边界）
-    // 旧路径：CPU端 uint8→float 转换 + glTexImage2D（仅用于初始化）
     void updateCellTypes(const uint8_t *types, int nx, int ny);
-
-    // GPU零拷贝路径：预映射的cell type PBO设备指针（求解器线程直接写入）
-    float *getMappedCellTypePtr() const { return mappedCellTypePtr_; }
-
-    // GL线程：映射cell type PBO，返回设备指针（初始化或提交后调用）
-    float *mapCellTypeForWriting();
-
-    // GL线程：提交已写入的cell type PBO（unmap → glTexSubImage2D → remap）
-    void submitCellTypes();
 
     // 渲染当前帧
     void render(const SimParams &params);
@@ -140,8 +132,17 @@ public:
 
     // 确保矢量VBO有足够的容量
     // 如果当前容量不足，会重新分配VBO并重新注册CUDA资源
-    // 调用后保证VBO[writeIndex]已映射，可通过getMappedVectorPtr()获取设备指针
     void ensureVectorVBOCapacity(int requiredVertices);
+    
+    // 映射矢量VBO以供CUDA写入，返回设备指针和实际顶点容量
+    // 返回nullptr表示失败或未启用
+    float *mapVectorVBO(int &outMaxVertices);
+    
+    // 取消映射矢量VBO，设置实际使用的顶点数量
+    void unmapVectorVBO(int actualVertices);
+
+    // 设置障碍物显示开关
+    void setShowObstacle(bool show) { showObstacle_ = show; }
 
     // 窗口尺寸调整
     void resize(int width, int height);
@@ -158,39 +159,19 @@ public:
     // 清理CUDA互操作资源
     void cleanupCudaInterop();
 
+    // 映射PBO以供CUDA写入，返回设备指针（零拷贝模式专用）
+    // 注意：必须与unmapFieldTexture()配对使用
+    float *mapFieldTexture();
+
+    // 取消映射，CUDA写入完成后调用（零拷贝模式专用）
+    // 此函数会触发GPU内部的PBO到纹理传输，无CPU参与
+    void unmapFieldTexture();
+
     // 更新互操作纹理的尺寸（网格尺寸变化时调用）
     void resizeCudaInterop(int nx, int ny);
 
     // 设置场值范围（零拷贝模式下使用，无数据传输）
     void setFieldRange(float minVal, float maxVal, FieldType type);
-
-    // 快照矢量箭头渲染状态，供并行渲染阶段安全使用（安全区域调用）
-    void prepareVectorRender();
-
-    // === 直接映射双缓冲接口（零拷贝，无staging中转） ===
-    // GL线程预先映射PBO/VBO[writeIndex]，solver线程直接写入映射后的设备指针
-    // 写入完成后GL线程提交：unmap → upload/swap → remap下一个缓冲区
-
-    // 获取预映射的PBO设备指针（solver线程直接写入，无需GL上下文）
-    float *getMappedFieldPtr() const { return mappedFieldPtr_; }
-
-    // 获取预映射的VBO设备指针和容量（solver线程直接写入）
-    float *getMappedVectorPtr() const { return mappedVectorPtr_; }
-    int getMappedVectorCapacity() const { return mappedVectorMaxVertices_; }
-
-    // GL线程：映射PBO[writeIndex]，返回设备指针（初始化或提交后调用）
-    float *mapFieldForWriting();
-
-    // GL线程：提交已写入的PBO（unmap → 上传纹理 → swap → 映射新PBO）
-    // 返回新映射的设备指针（供下一帧solver使用）
-    float *submitField();
-
-    // GL线程：映射VBO[vectorWriteIndex]，返回设备指针
-    float *mapVectorForWriting();
-
-    // GL线程：提交已写入的VBO（unmap → 记录顶点数 → swap → 映射新VBO）
-    // 返回新映射的设备指针
-    float *submitVectors(int vertexCount);
 
     // 检查互操作是否已启用
     bool isCudaInteropEnabled() const { return cudaInteropEnabled_; }
@@ -224,6 +205,11 @@ private:
     GLuint VAO_ = 0;
     GLuint VBO_ = 0;
 
+    // 障碍物轮廓叠加层的着色器和缓冲区
+    GLuint obstacleShaderProgram_ = 0;
+    GLuint obstacleVAO_ = 0;
+    GLuint obstacleVBO_ = 0;
+
     // 矢量箭头叠加层的着色器和缓冲区
     GLuint vectorShaderProgram_ = 0;
     GLuint vectorVAO_ = 0;
@@ -238,14 +224,11 @@ private:
     int vectorWriteIndex_ = 0;          // 当前CUDA写入的VBO索引（0或1）
     bool vectorVBOMapped_ = false;     // VBO是否已映射
 
-    // 缓存的矢量渲染状态（安全区域设置，并行渲染使用）
-    int vectorRenderReadIndex_ = 0;
-    int vectorRenderVertexCount_ = 0;
-
     // 渲染设置
     ColormapType colormap_ = ColormapType::JET; // 当前色图类型
     bool showVectors_ = false;                  // 是否显示速度矢量
     int vectorDensity_ = 20;                    // 矢量箭头密度（每多少格子显示一个）
+    bool showObstacle_ = true;                  // 是否显示障碍物轮廓
 
 
     // 当前物理场的值域范围
@@ -256,12 +239,6 @@ private:
     // CUDA-OpenGL 互操作相关（双缓冲PBO）
     bool cudaInteropEnabled_ = false; // 互操作是否启用
 
-    // Cell type PBO（单缓冲，预映射模式：求解器线程写入，GL线程提交）
-    GLuint cellTypePBO_ = 0;
-    cudaGraphicsResource *cudaCellTypePBOResource_ = nullptr;
-    float *mappedCellTypePtr_ = nullptr;   // 预映射的设备指针
-    bool cellTypePBOMapped_ = false;       // PBO是否已映射
-
     // 双缓冲PBO：两个PBO交替使用
     // - 一个用于CUDA写入（writeIndex_指向）
     // - 另一个用于OpenGL读取（1-writeIndex_指向）
@@ -270,14 +247,10 @@ private:
     int writeIndex_ = 0;                                            // 当前CUDA写入的PBO索引（0或1）
     size_t mappedSize_ = 0;                                         // 单个PBO的缓冲区大小
 
-    // 直接映射状态（GL线程预映射PBO/VBO，solver线程直接写入设备指针）
-    float *mappedFieldPtr_ = nullptr;       // 预映射的PBO设备指针
-    bool fieldPBOMapped_ = false;           // PBO[writeIndex]是否已映射
-    float *mappedVectorPtr_ = nullptr;      // 预映射的VBO设备指针
-    int mappedVectorMaxVertices_ = 0;       // 映射的VBO容量（顶点数）
-
     // 着色器创建和编译的工具函数
     bool createShaders();                                     // 创建主渲染着色器
+    bool createGridShader();                                  // 创建网格线着色器（现用于矢量箭头）
+    bool createObstacleShader();                                // 创建障碍物轮廓着色器
     bool createVectorShader();                                // 创建矢量箭头着色器
     GLuint compileShader(const char *source, GLenum type);    // 编译单个着色器
     GLuint linkProgram(GLuint vertShader, GLuint fragShader); // 链接着色器程序
