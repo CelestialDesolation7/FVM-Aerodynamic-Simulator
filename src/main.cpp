@@ -69,6 +69,9 @@ std::atomic<bool> g_obstacleGeometryDirty{false};
 // 形状改变标志（需要完整reset，UI线程设置，求解器线程消费）
 std::atomic<bool> g_shapeResetRequested{false};
 
+// dt重算标志（重置/几何变化后设置，强制求解器线程同步重算dt）
+std::atomic<bool> g_dtNeedsRecompute{true};
+
 // 缓存的仿真统计数据（在渲染线程安全区域更新）
 float cachedMaxTemp = 0.0f;
 float cachedMaxMach = 0.0f;
@@ -223,6 +226,7 @@ void solverThreadFunc()
         {
             // 形状/大小变化：完整重置流场
             solver.reset(params);
+            g_dtNeedsRecompute = true;
             // 将cell type写入预映射的PBO
             float *ctPtr = renderer.getMappedCellTypePtr();
             if (ctPtr)
@@ -247,8 +251,14 @@ void solverThreadFunc()
         // ==================== 1. 仿真计算 ====================
         auto simStart = std::chrono::high_resolution_clock::now();
 
-        float dt = solver.computeStableTimeStep(params);
-        params.dt = dt;
+        // 延迟dt模式：首帧或重置后同步计算，否则使用上帧异步计算的结果
+        // 这消除了computeStableTimeStep中的GPU空闲气泡
+        static float cachedDt = 0.0f;
+        if (g_dtNeedsRecompute.exchange(false))
+        {
+            cachedDt = solver.computeStableTimeStep(params); // 同步版本，仅用于首帧/重置
+        }
+        params.dt = cachedDt;
         int n = stepsPerFrame; // 读一次当前值
         for (int i = 0; i < n; i++)
         {
@@ -313,8 +323,15 @@ void solverThreadFunc()
             }
         }
 
-        // ==================== 5. 同步所有GPU工作 ====================
+        // ==================== 5. 异步排入下帧dt计算（GPU流水线，无CPU停顿） ====================
+        // 归约核函数紧跟step+viz内核后执行，GPU零空闲
+        solver.queueTimeStepComputation(params);
+
+        // ==================== 6. 同步所有GPU工作（step+viz+dt归约） ====================
         cudaDeviceSynchronize();
+
+        // 读取异步dt结果（锁页内存已就绪，零延迟）
+        cachedDt = solver.readTimeStepResult(params);
 
         auto simEnd = std::chrono::high_resolution_clock::now();
         g_solverResults.simTimePerStep = std::chrono::duration<float>(simEnd - simStart).count() / n;
@@ -406,9 +423,7 @@ void renderUI()
         ImGui::SameLine();
         if (ImGui::Button(u8"重置（R）"))
         {
-            solver.reset(params);
-            params.t_current = 0.0f;
-            params.step = 0;
+            g_resetRequested = true;
         }
         ImGui::SameLine();
         if (ImGui::Button(u8"单步（N）") && params.paused)
@@ -418,6 +433,7 @@ void renderUI()
                 solver.step(params);
                 params.t_current += params.dt;
                 params.step += 1;
+                g_dtNeedsRecompute = true;
             }
         }
     }
@@ -447,6 +463,7 @@ void renderUI()
             params.computeDerived();
             // 重新初始化仿真（重新分配显存和缓冲区）
             initializeSimulation();
+            g_dtNeedsRecompute = true;
             // 重置时间记录
             params.t_current = 0.0f;
             params.step = 0;
@@ -532,7 +549,7 @@ void renderUI()
 
         if (viscosityChanged)
         {
-            solver.reset(params);
+            g_resetRequested = true;
         }
     }
 
@@ -1137,6 +1154,14 @@ int main(int argc, char *argv[])
             params.t_current = 0.0f;
             params.step = 0;
             solver.reset(params);
+            g_dtNeedsRecompute = true;
+            // 更新网格类型到PBO
+            float *ctPtr = renderer.getMappedCellTypePtr();
+            if (ctPtr)
+            {
+                solver.convertCellTypesToDevice(ctPtr);
+                renderer.submitCellTypes();
+            }
         }
 
         // 消费求解器帧结果：提交PBO/VBO（unmap → upload → swap → remap）+ 读取统计

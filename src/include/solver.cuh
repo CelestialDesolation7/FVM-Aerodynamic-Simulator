@@ -63,6 +63,12 @@ public:
     // 计算稳定时间步长(CFL条件)
     float computeStableTimeStep(const SimParams &params);
 
+    // 异步时间步长计算流水线（消除GPU空闲气泡）
+    // queueTimeStepComputation: 将归约核函数+异步回传排入GPU流，不阻塞CPU
+    // readTimeStepResult: 从锁页内存读取已完成的结果（调用前需确保GPU已同步）
+    void queueTimeStepComputation(const SimParams &params);
+    float readTimeStepResult(const SimParams &params) const;
+
     // 获取统计数据
     float getMaxTemperature();
     float getMaxMach();
@@ -124,6 +130,10 @@ private:
 
     // 预分配的临时计算缓冲区（用于归约前的中间计算，避免每次调用cudaMalloc/cudaFree）
     float *d_scratch_ = nullptr;
+
+    // 锁页主机内存（用于computeStableTimeStep异步归约流水线，消除CPU-GPU同步停顿）
+    // [0]=最大波速, [1]=最大粘性数
+    float *h_pinnedReduction_ = nullptr;
 
     // 预分配的原子计数器（用于矢量箭头生成，避免每帧cudaMalloc/cudaFree）
     int *d_atomic_counter_ = nullptr;

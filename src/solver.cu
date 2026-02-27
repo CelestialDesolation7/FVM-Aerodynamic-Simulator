@@ -2622,6 +2622,12 @@ void CFDSolver::allocateMemory()
 
     // 8. 分配原子计数器（用于矢量箭头生成，避免每帧cudaMalloc/cudaFree）
     CUDA_CHECK(cudaMalloc(&d_atomic_counter_, sizeof(int)));
+
+    // 9. 分配锁页主机内存（用于computeStableTimeStep异步归约流水线）
+    // 允许cudaMemcpyAsync将归约结果直接DMA到锁页内存，消除GPU空闲气泡
+    CUDA_CHECK(cudaMallocHost(&h_pinnedReduction_, 2 * sizeof(float)));
+    h_pinnedReduction_[0] = 0.0f;
+    h_pinnedReduction_[1] = 0.0f;
 }
 
 // 功能:释放所有GPU显存
@@ -2715,6 +2721,10 @@ void CFDSolver::freeMemory()
     if (d_atomic_counter_)
         cudaFree(d_atomic_counter_);
 
+    // 释放锁页主机内存
+    if (h_pinnedReduction_)
+        cudaFreeHost(h_pinnedReduction_);
+
     // 置空所有指针(防止重复释放)
     d_rho_ = d_rho_u_ = d_rho_v_ = d_E_ = d_rho_e_ = nullptr;
     d_rho_new_ = d_rho_u_new_ = d_rho_v_new_ = d_E_new_ = d_rho_e_new_ = nullptr;
@@ -2729,6 +2739,7 @@ void CFDSolver::freeMemory()
     reduction_buffer_size_ = 0; // 重置缓冲区大小
     d_mu_ = d_tau_xx_ = d_tau_yy_ = d_tau_xy_ = d_qx_ = d_qy_ = nullptr;
     d_atomic_counter_ = nullptr;
+    h_pinnedReduction_ = nullptr;
 }
 
 // 功能:初始化求解器
@@ -2824,41 +2835,75 @@ void CFDSolver::updateObstacleGeometry(const SimParams &params)
 #pragma endregion
 
 #pragma region solver类计算链顶层的计算函数
-// 功能:计算稳定时间步长
+// 功能:将归约核函数+异步D→H回传排入GPU流，不阻塞CPU
+// 设计:所有GPU工作背靠背排入流中，消除原来两次同步cudaMemcpy导致的GPU空闲气泡
+//       调用方负责在读取结果前确保GPU已同步
+void CFDSolver::queueTimeStepComputation(const SimParams &params)
+{
+    int n = _nx * _ny;
+    dim3 block(256);
+    dim3 grid((n + block.x - 1) / block.x);
+
+    void *d_temp = d_reduction_buffer_;
+    size_t temp_bytes = reduction_buffer_size_;
+
+    // 1. 计算波速 |v|+c → d_scratch_
+    computeWaveSpeedKernel<<<grid, block>>>(d_u_, d_v_, d_p_, d_rho_, d_scratch_, n);
+    CUDA_CHECK(cudaGetLastError());
+
+    // 2. CUB归约求最大波速 → d_reduction_output_
+    CUDA_CHECK(cub::DeviceReduce::Max(d_temp, temp_bytes, d_scratch_, d_reduction_output_, n));
+
+    // 3. 异步拷贝到锁页内存（不阻塞CPU，由流顺序保证正确性）
+    CUDA_CHECK(cudaMemcpyAsync(h_pinnedReduction_, d_reduction_output_,
+                               sizeof(float), cudaMemcpyDeviceToHost, 0));
+
+    if (params.enable_viscosity)
+    {
+        // 4. 计算粘性数 nu=mu/rho → d_scratch_
+        //    安全：CUB已在同一流上读完d_scratch_，流顺序保证重写安全
+        computeViscousNumberKernel<<<grid, block>>>(d_mu_, d_rho_, d_scratch_, n);
+        CUDA_CHECK(cudaGetLastError());
+
+        // 5. CUB归约求最大粘性数 → d_reduction_output_
+        //    安全：步骤3的异步拷贝已在同一流上读完d_reduction_output_
+        CUDA_CHECK(cub::DeviceReduce::Max(d_temp, temp_bytes, d_scratch_, d_reduction_output_, n));
+
+        // 6. 异步拷贝粘性数结果
+        CUDA_CHECK(cudaMemcpyAsync(h_pinnedReduction_ + 1, d_reduction_output_,
+                                   sizeof(float), cudaMemcpyDeviceToHost, 0));
+    }
+    // 不同步 — GPU继续执行，CPU立即返回
+}
+
+// 功能:从Pinned Memory读取已完成的异步归约结果，计算CFL时间步长
+// 前置条件：queueTimeStepComputation()已调用且GPU已同步
+float CFDSolver::readTimeStepResult(const SimParams &params) const
+{
+    float max_speed = h_pinnedReduction_[0];
+    float min_dx = fminf(params.dx, params.dy);
+    float dt_conv = params.cfl * min_dx / (max_speed + 1e-10f);
+    float dt = dt_conv;
+
+    if (params.enable_viscosity)
+    {
+        float max_nu = h_pinnedReduction_[1];
+        float dt_visc = params.cfl_visc * min_dx * min_dx / (max_nu + 1e-10f);
+        dt = fminf(dt_conv, dt_visc);
+    }
+
+    return dt;
+}
+
+// 功能:计算稳定时间步长（同步版本，用于首帧或重置后的一次性计算）
 // 输入:仿真参数 params
 // 输出:满足CFL条件的时间步长 dt
 // 说明:同时考虑对流CFL和扩散CFL条件
 float CFDSolver::computeStableTimeStep(const SimParams &params)
 {
-    // 原始变量(d_u_, d_v_, d_p_, d_T_)已在 reset() 或上一步 step() 结尾计算完毕
-    // 粘性场(d_mu_)同样已在 reset() 或上一步 step() 中计算完毕
-    // 因此这里无需重复计算，直接使用已有数据
-
-    // 使用归约找到最大波速
-    float max_speed = launchComputeMaxWaveSpeed(d_u_, d_v_, d_p_, d_rho_, _nx, _ny);
-
-    float min_dx = fminf(params.dx, params.dy);
-
-    // 对流CFL条件: dt <= CFL * dx / (|v| + c)
-    float dt_conv = params.cfl * min_dx / (max_speed + 1e-10f);
-
-    float dt = dt_conv;
-
-    // 如果启用粘性，还需检查扩散CFL条件
-    if (params.enable_viscosity)
-    {
-        // 找到最大运动粘性系数 nu = mu/rho (使用已有的 d_mu_)
-        float max_nu = launchComputeMaxViscousNumber(d_mu_, d_rho_, _nx, _ny);
-
-        // 扩散CFL条件: dt <= CFL_visc * dx^2 / nu
-        // 注意是 dx^2，扩散项对时间步长的约束更严格
-        float dt_visc = params.cfl_visc * min_dx * min_dx / (max_nu + 1e-10f);
-
-        // 取两个约束的最小值
-        dt = fminf(dt_conv, dt_visc);
-    }
-
-    return dt;
+    queueTimeStepComputation(params);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return readTimeStepResult(params);
 }
 
 // 功能:执行单步时间推进
