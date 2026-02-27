@@ -251,6 +251,15 @@ private:
                                    const uint8_t *cell_type,
                                    float dt, float dx, float dy, int nx, int ny);
 
+    // 功能:融合粘性-扩散核函数(替代 ViscousTerms + DiffusionStep 双核函数调用)
+    // 原理:每线程按需重算中心+4邻居的粘性量(寄存器级)，消除 tau/q 中间数组全局内存往返
+    // 输出:mu(供CFL), 直接更新 rho_u/rho_v/E/rho_e
+    void launchFusedViscousDiffusionKernel(const float *u, const float *v, const float *T,
+                                           float *mu,
+                                           float *rho_u, float *rho_v, float *E, float *rho_e,
+                                           const uint8_t *cell_type,
+                                           float dt, float dx, float dy, int nx, int ny);
+
     // 功能:归约计算全场最大运动粘性系数 nu = mu / rho
     // 输入:动力粘性系数场，密度场，网格尺寸
     // 输出:最大运动粘性系数(用于粘性CFL条件: dt <= dx^2 / nu)

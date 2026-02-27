@@ -1226,7 +1226,36 @@ int main(int argc, char *argv[])
         }
         else
         {
-            // 暂停时：在渲染线程直接更新可视化（用户可能切换显示物理量）
+            // 暂停时：求解器线程处于阻塞状态，安全区域内可直接执行CUDA操作
+
+            // 处理暂停期间的障碍物几何变更（否则用户看不到即时反馈）
+            bool geometryUpdated = false;
+            if (g_shapeResetRequested.exchange(false))
+            {
+                // 形状/大小变化 → 完整重置流场
+                solver.reset(params);
+                g_dtNeedsRecompute = true;
+                geometryUpdated = true;
+            }
+            else if (g_obstacleGeometryDirty.exchange(false))
+            {
+                // 位置/旋转/襟翼变化 → 热更新SDF（不重置流场）
+                solver.updateObstacleGeometry(params);
+                geometryUpdated = true;
+            }
+
+            if (geometryUpdated)
+            {
+                // 将更新后的网格类型写入PBO并提交到GL纹理
+                float *ctPtr = renderer.getMappedCellTypePtr();
+                if (ctPtr)
+                {
+                    solver.convertCellTypesToDevice(ctPtr);
+                    renderer.submitCellTypes();
+                }
+            }
+
+            // 更新可视化（用户可能切换显示物理量，或上方刚变更了几何）
             updateVisualization();
         }
 
