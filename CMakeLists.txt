@@ -72,11 +72,6 @@ message(STATUS "CUDA 标准: C++${CMAKE_CUDA_STANDARD}")
 # GPU 架构设置
 # =========================================================
 
-# 支持的 GPU 架构：
-#   75 = RTX 20 系列 (Turing)
-#   86 = RTX 30 系列 (Ampere)
-#   89 = RTX 40 系列 (Ada Lovelace)
-#   +PTX = 包含虚拟架构代码，支持未来 GPU 的 JIT 编译
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES "75;86;89+PTX" CACHE STRING "CUDA 目标架构")
 endif()
@@ -268,6 +263,56 @@ endif()
 message(STATUS "编译选项:")
 message(STATUS "  - CUDA: --use_fast_math, UTF-8 支持")
 message(STATUS "  - C++: UTF-8 支持, 警告级别 3")
+
+# =========================================================
+# 核函数性能基准测试目标
+# =========================================================
+
+add_executable(KernelBenchmark
+    ${CMAKE_SOURCE_DIR}/test/kernel_benchmark.cu
+    ${CMAKE_SOURCE_DIR}/src/solver.cu
+)
+
+target_include_directories(KernelBenchmark PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/src/include
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
+set_target_properties(KernelBenchmark PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+
+target_compile_options(KernelBenchmark PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+        --use_fast_math
+        --expt-relaxed-constexpr
+        -Xcompiler=/utf-8
+        -Xcompiler=/Zc:preprocessor
+        $<$<CONFIG:Release>:-O3 -lineinfo>
+        $<$<CONFIG:RelWithDebInfo>:-O3 -lineinfo>
+    >
+)
+
+if(MSVC)
+    target_compile_options(KernelBenchmark PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:
+            /utf-8
+            /Zc:preprocessor
+            /W1
+        >
+    )
+endif()
+
+if(MSVC)
+    target_link_options(KernelBenchmark PRIVATE
+        "LINKER:/NODEFAULTLIB:LIBCMT"
+        "LINKER:/NODEFAULTLIB:LIBCMTD"
+    )
+endif()
+
+message(STATUS "✓ 核函数基准测试目标: KernelBenchmark (无OpenGL依赖)")
 
 # =========================================================
 # MSVC 特定配置

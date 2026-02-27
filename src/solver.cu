@@ -1,5 +1,6 @@
 #include "solver.cuh"
-#include <cstdio>
+#include <iostream>
+#include <iomanip>
 #include <algorithm>
 #include <vector>
 #include <cub/cub.cuh>
@@ -2500,7 +2501,7 @@ float CFDSolver::launchComputeMaxTemperature(const float *T, int nx, int ny)
 
     if (required_bytes > temp_bytes)
     {
-        fprintf(stderr, "Warning: CUB需要 %zu 字节，但只有 %zu 字节可用\n", required_bytes, temp_bytes);
+        std::cerr << "Warning: CUB需要 " << required_bytes << " 字节，但只有 " << temp_bytes << " 字节可用" << std::endl;
         // 极端情况:预分配空间不足，回退到动态分配
         void *d_temp_alloc;
         CUDA_CHECK(cudaMalloc(&d_temp_alloc, required_bytes));
@@ -2605,8 +2606,9 @@ void CFDSolver::allocateMemory()
     // 分配独立的输出缓冲区（单个float）
     CUDA_CHECK(cudaMalloc(&d_reduction_output_, sizeof(float)));
 
-    printf("[CFD规约缓冲区] 网格=%dx%d (%d元素), CUB临时存储=%zu字节 (%.2fKB), 输出缓冲=4字节\n",
-           _nx, _ny, n, reduction_buffer_size_, reduction_buffer_size_ / 1024.0f);
+    std::cout << "[CFD规约缓冲区] 网格=" << _nx << "x" << _ny << " (" << n << "元素), CUB临时存储="
+              << reduction_buffer_size_ << "字节 (" << std::fixed << std::setprecision(2)
+              << (reduction_buffer_size_ / 1024.0f) << "KB), 输出缓冲=4字节" << std::endl;
 
     // 6b. 分配归约用临时计算缓冲区（波速/马赫数/粘性数等中间结果）
     // 避免在热路径中反复 cudaMalloc/cudaFree

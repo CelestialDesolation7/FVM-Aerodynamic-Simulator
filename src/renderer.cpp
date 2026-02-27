@@ -1,6 +1,5 @@
 #include "renderer.h"
 #include <cuda_gl_interop.h>
-#include <cstdio>
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -12,8 +11,9 @@
         cudaError_t err = call;                                          \
         if (err != cudaSuccess)                                          \
         {                                                                \
-            fprintf(stderr, "[CUDA互操作错误] %s in %s line %i : %s.\n", \
-                    #call, __FILE__, __LINE__, cudaGetErrorString(err)); \
+            std::cerr << "[CUDA互操作错误] " << #call << " in "              \
+                      << __FILE__ << " line " << __LINE__ << " : "     \
+                      << cudaGetErrorString(err) << "." << std::endl;  \
             return false;                                                \
         }                                                                \
     } while (0)
@@ -128,14 +128,14 @@ bool Renderer::initialize(int width, int height)
     // 创建主着色器程序
     if (!createShaders())
     {
-        fprintf(stderr, "创建场渲染着色器失败\n");
+        std::cerr << "创建场渲染着色器失败" << std::endl;
         return false;
     }
 
     // 创建矢量箭头着色器程序
     if (!createVectorShader())
     {
-        fprintf(stderr, "创建矢量箭头着色器失败\n");
+        std::cerr << "创建矢量箭头着色器失败" << std::endl;
         return false;
         ;
     }
@@ -279,7 +279,7 @@ bool Renderer::initCudaInterop(int nx, int ny)
 
         if (err != cudaSuccess)
         {
-            fprintf(stderr, "[CUDA互操作] 注册PBO[%d]失败: %s\n", i, cudaGetErrorString(err));
+            std::cerr << "[CUDA互操作] 注册PBO[" << i << "]失败: " << cudaGetErrorString(err) << std::endl;
             // 清理已创建的资源
             for (int j = 0; j <= i; j++)
             {
@@ -320,7 +320,7 @@ bool Renderer::initCudaInterop(int nx, int ny)
         cudaGraphicsMapFlagsWriteDiscard);
     if (ctErr != cudaSuccess)
     {
-        fprintf(stderr, "[CUDA互操作] 注册CellType PBO失败: %s\n", cudaGetErrorString(ctErr));
+        std::cerr << "[CUDA互操作] 注册CellType PBO失败: " << cudaGetErrorString(ctErr) << std::endl;
         glDeleteBuffers(1, &cellTypePBO_);
         cellTypePBO_ = 0;
         cudaCellTypePBOResource_ = nullptr;
@@ -420,7 +420,7 @@ float *Renderer::mapFieldForWriting()
     cudaError_t err = cudaGraphicsMapResources(1, &cudaPBOResource_[writeIndex_], 0);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "[CUDA互操作] 映射PBO[%d]失败: %s\n", writeIndex_, cudaGetErrorString(err));
+        std::cerr << "[CUDA互操作] 映射PBO[" << writeIndex_ << "]失败: " << cudaGetErrorString(err) << std::endl;
         return nullptr;
     }
 
@@ -429,7 +429,7 @@ float *Renderer::mapFieldForWriting()
     err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void **>(&devPtr), &size, cudaPBOResource_[writeIndex_]);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "[CUDA互操作] 获取PBO[%d]设备指针失败: %s\n", writeIndex_, cudaGetErrorString(err));
+        std::cerr << "[CUDA互操作] 获取PBO[" << writeIndex_ << "]设备指针失败: " << cudaGetErrorString(err) << std::endl;
         cudaGraphicsUnmapResources(1, &cudaPBOResource_[writeIndex_], 0);
         return nullptr;
     }
@@ -477,7 +477,7 @@ float *Renderer::mapVectorForWriting()
     cudaError_t err = cudaGraphicsMapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "[CUDA互操作] 映射矢量VBO[%d]失败: %s\n", vectorWriteIndex_, cudaGetErrorString(err));
+        std::cerr << "[CUDA互操作] 映射矢量VBO[" << vectorWriteIndex_ << "]失败: " << cudaGetErrorString(err) << std::endl;
         return nullptr;
     }
 
@@ -487,7 +487,7 @@ float *Renderer::mapVectorForWriting()
                                                cudaVectorVBOResource_[vectorWriteIndex_]);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "[CUDA互操作] 获取矢量VBO[%d]设备指针失败: %s\n", vectorWriteIndex_, cudaGetErrorString(err));
+        std::cerr << "[CUDA互操作] 获取矢量VBO[" << vectorWriteIndex_ << "]设备指针失败: " << cudaGetErrorString(err) << std::endl;
         cudaGraphicsUnmapResources(1, &cudaVectorVBOResource_[vectorWriteIndex_], 0);
         return nullptr;
     }
@@ -596,7 +596,7 @@ GLuint Renderer::compileShader(const char *source, GLenum type)
     {
         char infoLog[512];
         glGetShaderInfoLog(shader, 512, nullptr, infoLog);
-        fprintf(stderr, "着色器编译错误: %s\n", infoLog);
+        std::cerr << "着色器编译错误: " << infoLog << std::endl;
         glDeleteShader(shader);
         return 0;
     }
@@ -618,7 +618,7 @@ GLuint Renderer::linkProgram(GLuint vertShader, GLuint fragShader)
     {
         char infoLog[512];
         glGetProgramInfoLog(program, 512, nullptr, infoLog);
-        fprintf(stderr, "着色器程序链接错误: %s\n", infoLog);
+        std::cerr << "着色器程序链接错误: " << infoLog << std::endl;
         glDeleteProgram(program);
         return 0;
     }
@@ -838,7 +838,7 @@ float *Renderer::mapCellTypeForWriting()
     cudaError_t err = cudaGraphicsMapResources(1, &cudaCellTypePBOResource_, 0);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "[CUDA互操作] 映射CellType PBO失败: %s\n", cudaGetErrorString(err));
+        std::cerr << "[CUDA互操作] 映射CellType PBO失败: " << cudaGetErrorString(err) << std::endl;
         return nullptr;
     }
 
@@ -847,7 +847,7 @@ float *Renderer::mapCellTypeForWriting()
     err = cudaGraphicsResourceGetMappedPointer(reinterpret_cast<void **>(&devPtr), &size, cudaCellTypePBOResource_);
     if (err != cudaSuccess)
     {
-        fprintf(stderr, "[CUDA互操作] 获取CellType PBO设备指针失败: %s\n", cudaGetErrorString(err));
+        std::cerr << "[CUDA互操作] 获取CellType PBO设备指针失败: " << cudaGetErrorString(err) << std::endl;
         cudaGraphicsUnmapResources(1, &cudaCellTypePBOResource_, 0);
         return nullptr;
     }
@@ -936,7 +936,7 @@ void Renderer::ensureVectorVBOCapacity(int requiredVertices)
             cudaGraphicsRegisterFlagsWriteDiscard);
         if (err != cudaSuccess)
         {
-            fprintf(stderr, "[错误] 注册矢量VBO[%d]失败: %s\n", i, cudaGetErrorString(err));
+            std::cerr << "[错误] 注册矢量VBO[" << i << "]失败: " << cudaGetErrorString(err) << std::endl;
         }
     }
 
@@ -947,7 +947,7 @@ void Renderer::ensureVectorVBOCapacity(int requiredVertices)
     mapVectorForWriting();
     
     std::cout << "[信息] 矢量VBO双缓冲重新分配: " << requiredVertices << " 顶点 ("
-              << (requiredBytes / 1024.0f / 1024.0f) << " MB × 2)\n";
+              << (requiredBytes / 1024.0f / 1024.0f) << " MB × 2)" << std::endl;
 }
 
 #pragma endregion

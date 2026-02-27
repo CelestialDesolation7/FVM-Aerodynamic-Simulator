@@ -1,19 +1,21 @@
 #pragma once
 
 #include "common.h"
+#include <iostream>
 
 #pragma region 宏定义
 // 宏定义：检查 CUDA 函数调用的返回值
-#define CUDA_CHECK(call)                                                             \
-    do                                                                               \
-    {                                                                                \
-        cudaError_t err = call;                                                      \
-        if (err != cudaSuccess)                                                      \
-        {                                                                            \
-            fprintf(stderr, "CUDA 相关函数调用返回错误结果 '%s' in line %i : %s.\n", \
-                    __FILE__, __LINE__, cudaGetErrorString(err));                    \
-            exit(EXIT_FAILURE);                                                      \
-        }                                                                            \
+#define CUDA_CHECK(call)                                               \
+    do                                                                 \
+    {                                                                  \
+        cudaError_t err = call;                                        \
+        if (err != cudaSuccess)                                        \
+        {                                                              \
+            std::cerr << "CUDA 相关函数调用返回错误结果 '" << __FILE__ \
+                      << "' in line " << __LINE__ << " : "             \
+                      << cudaGetErrorString(err) << "." << std::endl;  \
+            exit(EXIT_FAILURE);                                        \
+        }                                                              \
     } while (0)
 #pragma endregion
 

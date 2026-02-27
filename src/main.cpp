@@ -842,7 +842,7 @@ void updateVisualization()
     float *devPtr = renderer.getMappedFieldPtr();
     if (!devPtr)
     {
-        std::cerr << "[错误] PBO未映射\n";
+        std::cerr << "[错误] PBO未映射" << std::endl;
         return;
     }
 
@@ -1095,7 +1095,7 @@ int main(int argc, char *argv[])
     // 初始化渲染器
     if (!renderer.initialize(windowWidth, windowHeight))
     {
-        std::cerr << "[错误] 程序在初始化Renderer阶段失败并退出\n";
+        std::cerr << "[错误] 程序在初始化Renderer阶段失败并退出" << std::endl;
         system("pause");
         glfwDestroyWindow(window);
         glfwTerminate();
@@ -1105,7 +1105,7 @@ int main(int argc, char *argv[])
     // 初始化仿真器
     if (!initializeSimulation())
     {
-        std::cerr << "[错误] 程序在初始化Solver阶段失败并退出\n";
+        std::cerr << "[错误] 程序在初始化Solver阶段失败并退出" << std::endl;
         system("pause");
         glfwDestroyWindow(window);
         glfwTerminate();

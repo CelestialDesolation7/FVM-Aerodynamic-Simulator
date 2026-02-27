@@ -270,6 +270,49 @@ cd dist
 .\FVM-Aerodynamic-Simulator.exe
 ```
 
+### 核函数性能分析（Nsight Compute）
+
+项目提供了一个独立的核函数基准测试程序 `KernelBenchmark`，**无 OpenGL 依赖**，专门用于 Nsight Compute (ncu) 逐核分析。
+
+#### 构建 KernelBenchmark
+
+```powershell
+# 在项目根目录下
+cmake --build build --config Release --target KernelBenchmark
+```
+
+构建产物位于 `build\Release\KernelBenchmark.exe`。
+
+#### 运行基准测试
+
+```powershell
+# 默认 1024×1024 网格
+.\build\Release\KernelBenchmark.exe
+
+# 自定义网格尺寸
+.\build\Release\KernelBenchmark.exe 2048 2048
+```
+
+程序会先通过 10 步模拟产生真实流场结构，再进行预热和计时迭代，输出每步平均耗时。
+
+#### 使用 Nsight Compute 分析
+
+```powershell
+# 分析所有核函数（完整指标集）
+ncu --set full -o kernel_profile .\build\Release\KernelBenchmark.exe 1024 1024
+
+# 仅分析指定核函数（regex: 前缀启用正则匹配，--% 防止 PowerShell 解析 |）
+ncu --% --set full --kernel-name "regex:diffusionStepKernel|updateKernel|computeFluxesKernel|computePrimitivesKernel|computeViscousTermsKernel" -o kernel_profile .\build\Release\KernelBenchmark.exe
+
+# 快速概览（仅收集基本指标）
+ncu --set basic -o kernel_overview .\build\Release\KernelBenchmark.exe
+
+# 内存分析
+ncu --set memory -o kernel_memory .\build\Release\KernelBenchmark.exe
+```
+
+---
+
 ### 常见问题排查
 
 #### 1. CMake 找不到 CUDA
@@ -292,25 +335,6 @@ cd dist
 - 设置环境变量 `VCPKG_ROOT`
 - 或使用 `-DCMAKE_TOOLCHAIN_FILE` 手动指定
 
-#### 3. 编译时 CUDA 架构错误
-
-**症状**：`unsupported gpu architecture 'compute_XX'`
-
-**解决方法**：
-
-- 修改 `CMakeLists.txt` 中的 `CMAKE_CUDA_ARCHITECTURES`
-- 或在配置时指定：
-  ```powershell
-  cmake -B build -DCMAKE_CUDA_ARCHITECTURES="86"  # 仅编译 RTX 30 系列
-  ```
-
-#### 4. 运行时缺少 DLL
-
-**症状**：程序启动失败，提示缺少 `.dll` 文件
-
-**解决方法**：
-- 重新构建，CMake 会自动复制所需的 DLL
-- 或手动从 `vcpkg/installed/x64-windows/bin/` 复制 DLL 到可执行文件目录
 
 ### 高级配置选项
 
@@ -454,6 +478,8 @@ FVM-Aerodynamic-Simulator/
 │   ├── main.cpp                # 主程序入口
 │   ├── renderer.cpp            # OpenGL 渲染器实现
 │   └── solver.cu               # CUDA 求解器实现
+├── test/                        # 测试程序
+│   └── kernel_benchmark.cu     # 核函数基准测试（ncu 专用）
 ├── .gitignore                   # Git 忽略文件
 ├── CMakeLists.txt              # CMake 构建脚本
 └── README.md                   # 项目说明文档
