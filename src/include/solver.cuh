@@ -102,6 +102,13 @@ private:
     float *d_E_new_ = nullptr;
     float *d_rho_e_new_ = nullptr;
 
+    // SSP-RK2 第二阶段的中间缓冲区
+    float *d_rho_rk_ = nullptr;
+    float *d_rho_u_rk_ = nullptr;
+    float *d_rho_v_rk_ = nullptr;
+    float *d_E_rk_ = nullptr;
+    float *d_rho_e_rk_ = nullptr;
+
     // 为实现可视化和通量计算保存的原始变量
     float *d_u_ = nullptr; // x轴空气速度
     float *d_v_ = nullptr; // y轴空气速度

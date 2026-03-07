@@ -6,22 +6,31 @@
 #include <cub/cub.cuh>
 
 #pragma region 常量定义
-// === GPU设备常量（用于CUDA核函数内部的物理约束） ===
+// GPU设备常量（用于CUDA核函数内部的物理约束）
 __device__ __constant__ float MIN_DENSITY = 1e-4f;
 __device__ __constant__ float MIN_PRESSURE = 1e-2f;
 __device__ __constant__ float MAX_TEMPERATURE = 5000.0f;
 __device__ __constant__ float MIN_TEMPERATURE = 50.0f;
 __device__ __constant__ float MAX_VELOCITY = 10000.0f;
 
-// === 主机端编译期常量 ===
+// 主机端编译期常量
 constexpr int BLOCK_SIZE = 16; // CUDA线程块尺寸（2D）
 
+// 粘性扩散融合核函数线程块尺寸（32×8 对齐 warp 以优化合并访存）
+constexpr int VD_BX = 32;
+constexpr int VD_BY = 8;
+constexpr int VD_HALO = 2;                 // u/v/T halo 半径（邻居的 stencil 再偏移 1）
+constexpr int VD_SX = VD_BX + 2 * VD_HALO; // 36 - u/v/T 共享内存 X 维度
+constexpr int VD_SY = VD_BY + 2 * VD_HALO; // 12 - u/v/T 共享内存 Y 维度
+constexpr int VD_TX = VD_BX + 2;           // 34 - tau/q 共享内存 X 维度（halo=1）
+constexpr int VD_TY = VD_BY + 2;           // 10 - tau/q 共享内存 Y 维度（halo=1）
+
 // 数值方法超参数
-constexpr float ENTROPY_FIX_FACTOR = 0.1f;        // 熵修正系数：delta = factor * max(cL, cR)
-constexpr float DUAL_ENERGY_ETA_THRESHOLD = 0.1f; // 双能量法切换阈值：eta < threshold 时使用内能法
-constexpr float LOW_DENSITY_THRESHOLD = 0.01f;    // 低密度阈值：低于此值时降级为一阶格式
-constexpr float MAX_VELOCITY_LIMIT = 5000.0f;     // 最大速度限制 [m/s]（防止非物理超高速）
-constexpr float MAX_GHOST_VELOCITY = 2500.0f;     // 虚拟网格最大速度 [m/s]
+constexpr float DUAL_ENERGY_ETA_THRESHOLD = 0.001f; // 双能量法切换阈值：eta < 此值时使用rho_e
+constexpr float ENTROPY_FIX_FACTOR = 0.1f;          // 熵修正系数：delta = factor * max(cL, cR)
+constexpr float LOW_DENSITY_THRESHOLD = 0.01f;      // 低密度阈值：低于此值时降级为一阶格式
+constexpr float MAX_VELOCITY_LIMIT = 5000.0f;       // 最大速度限制 [m/s]（防止非物理超高速）
+constexpr float MAX_GHOST_VELOCITY = 2500.0f;       // 虚拟网格最大速度 [m/s]
 
 // SDF几何常量
 constexpr float SDF_BAND_WIDTH_FACTOR = 1.5f;       // Ghost Cell层宽度因子（相对于网格间距）
@@ -37,9 +46,16 @@ constexpr float SLIP_FACTOR_MAX = 0.8f;           // 最大滑移因子
 #pragma endregion
 
 #pragma region 数学工具函数
-// 功能:计算点到线段的最短距离(用于多边形SDF)
-// 输入:点坐标(px, py), 线段端点A(ax, ay)和B(bx, by)
-// 输出:点到线段的欧几里得距离
+/**
+ * @brief 计算点到线段的最短距离（用于多边形SDF）
+ * @param px 点的 x 坐标
+ * @param py 点的 y 坐标
+ * @param ax 线段端点A的 x 坐标
+ * @param ay 线段端点A的 y 坐标
+ * @param bx 线段端点B的 x 坐标
+ * @param by 线段端点B的 y 坐标
+ * @return 点到线段的欧几里得距离
+ */
 __device__ __forceinline__ float distToSegment(float px, float py, float ax, float ay, float bx, float by)
 {
     // 线段向量 AB = B - A
@@ -64,17 +80,25 @@ __device__ __forceinline__ float distToSegment(float px, float py, float ax, flo
     return sqrtf(dx * dx + dy * dy);
 }
 
-// 功能:计算二维向量的叉积(用于判断点的相对位置和环绕数)
-// 输入:两个二维向量 A(ax, ay) 和 B(bx, by)
-// 输出:叉积标量值 = ax*by - ay*bx (正值表示B在A的左侧)
+/**
+ * @brief 计算二维向量的叉积（用于判断点的相对位置和环绕数）
+ * @param ax 向量A的 x 分量
+ * @param ay 向量A的 y 分量
+ * @param bx 向量B的 x 分量
+ * @param by 向量B的 y 分量
+ * @return 叉积标量值 = ax*by - ay*bx（正值表示B在A的左侧）
+ */
 __device__ __forceinline__ float cross2d(float ax, float ay, float bx, float by)
 {
     return ax * by - ay * bx;
 }
 
-// 功能:Minmod 限制器函数，用于MUSCL重构
-// 输入:两个相邻网格的斜率 a 和 b
-// 输出:限制后的斜率，确保单调性，避免数值振荡
+/**
+ * @brief Minmod 限制器函数，用于MUSCL重构
+ * @param a 左侧差分斜率
+ * @param b 右侧差分斜率
+ * @return 限制后的斜率，确保单调性，避免数值振荡
+ */
 __device__ __forceinline__ float minmod(float a, float b)
 {
     // 如果 a 和 b 符号相反(一个正一个负)，则返回0(不外推)
@@ -84,9 +108,12 @@ __device__ __forceinline__ float minmod(float a, float b)
     return (fabsf(a) < fabsf(b)) ? a : b;
 }
 
-// 功能:Harten 熵修正，避免跨音速区域的数值不稳定(膨胀激波)
-// 输入:波速 lambda 和修正阈值 delta
-// 输出:修正后的波速绝对值
+/**
+ * @brief Harten 熵修正，避免跨音速区域的数值不稳定（膨胀激波）
+ * @param lambda 特征波速
+ * @param delta 修正阈值
+ * @return 修正后的波速绝对值
+ */
 __device__ __forceinline__ float entropyFix(float lambda, float delta)
 {
     // 当波速接近零时(亚音速区域)，使用二次插值避免除零
@@ -99,9 +126,13 @@ __device__ __forceinline__ float entropyFix(float lambda, float delta)
     return fabsf(lambda);
 }
 
-// 功能:MUSCL重构辅助函数，计算限制后的斜率
-// 输入:三个相邻网格的物理量值 qm1(i-1), q0(i), qp1(i+1)
-// 输出:限制后的斜率，用于二阶精度的变量重构
+/**
+ * @brief MUSCL重构辅助函数，计算限制后的斜率
+ * @param qm1 左邻居物理量 q(i-1)
+ * @param q0  中心网格物理量 q(i)
+ * @param qp1 右邻居物理量 q(i+1)
+ * @return 经 minmod 限制后的斜率，用于二阶精度的变量重构
+ */
 __device__ __forceinline__ float musclSlope(float qm1, float q0, float qp1)
 {
     // 计算左侧斜率: q(i) - q(i-1)
@@ -114,18 +145,31 @@ __device__ __forceinline__ float musclSlope(float qm1, float q0, float qp1)
 #pragma endregion
 
 #pragma region 多边形SDF场计算算法
-// 功能:计算点到圆形的带符号距离
-// 输入:点坐标(px, py), 圆心(cx, cy), 半径 r
-// 输出:带符号距离(负值表示在圆内，正值表示在圆外)
+/**
+ * @brief 计算点到圆形的带符号距离
+ * @param px 点的 x 坐标
+ * @param py 点的 y 坐标
+ * @param cx 圆心 x 坐标
+ * @param cy 圆心 y 坐标
+ * @param r  圆的半径
+ * @return 带符号距离（负值表示在圆内，正值表示在圆外）
+ */
 __device__ __forceinline__ float sdfCircle(float px, float py, float cx, float cy, float r)
 {
     // SDF(圆) = |点到圆心距离| - 半径
     return sqrtf((px - cx) * (px - cx) + (py - cy) * (py - cy)) - r;
 }
 
-// 功能:计算点到五角星的带符号距离
-// 输入:点坐标(px, py), 中心(cx, cy), 外接圆半径 r, 旋转角度 rotation
-// 输出:带符号距离
+/**
+ * @brief 计算点到五角星的带符号距离
+ * @param px 点的 x 坐标
+ * @param py 点的 y 坐标
+ * @param cx 中心 x 坐标
+ * @param cy 中心 y 坐标
+ * @param r  外接圆半径
+ * @param rotation 旋转角度 [rad]
+ * @return 带符号距离
+ */
 __device__ __forceinline__ float sdfStar(float px, float py, float cx, float cy, float r, float rotation)
 {
     const int N = 5;                                 // 5个尖角
@@ -189,9 +233,16 @@ __device__ __forceinline__ float sdfStar(float px, float py, float cx, float cy,
     return sign * minDist;
 }
 
-// 功能:计算点到菱形(旋转正方形)的带符号距离
-// 输入:点坐标(px, py), 中心(cx, cy), 半边长 r, 旋转角度 rotation
-// 输出:带符号距离
+/**
+ * @brief 计算点到菱形（旋转正方形）的带符号距离
+ * @param px 点的 x 坐标
+ * @param py 点的 y 坐标
+ * @param cx 中心 x 坐标
+ * @param cy 中心 y 坐标
+ * @param r  半边长
+ * @param rotation 旋转角度 [rad]
+ * @return 带符号距离
+ */
 __device__ __forceinline__ float sdfDiamond(float px, float py, float cx, float cy, float r, float rotation)
 {
     // 转换到局部坐标
@@ -214,9 +265,16 @@ __device__ __forceinline__ float sdfDiamond(float px, float py, float cx, float 
     return (ndx + ndy - 1.0f) * r * DIAMOND_HALF_SQRT2;
 }
 
-// 功能:计算点到胶囊形(圆角矩形)的带符号距离
-// 输入:点坐标(px, py), 中心(cx, cy), 长度 r, 旋转角度 rotation
-// 输出:带符号距离
+/**
+ * @brief 计算点到胶囊形（圆角矩形）的带符号距离
+ * @param px 点的 x 坐标
+ * @param py 点的 y 坐标
+ * @param cx 中心 x 坐标
+ * @param cy 中心 y 坐标
+ * @param r  胶囊体特征长度
+ * @param rotation 旋转角度 [rad]
+ * @return 带符号距离
+ */
 __device__ __forceinline__ float sdfCapsule(float px, float py, float cx, float cy, float r, float rotation)
 {
     // 转换到局部坐标
@@ -246,9 +304,16 @@ __device__ __forceinline__ float sdfCapsule(float px, float py, float cx, float 
     return sqrtf(dx * dx + dy * dy) - capRadius;
 }
 
-// 功能:计算点到三角形(等边，尖端向右)的带符号距离
-// 输入:点坐标(px, py), 中心(cx, cy), 外接圆半径 r, 旋转角度 rotation
-// 输出:带符号距离
+/**
+ * @brief 计算点到等边三角形（尖端向右）的带符号距离
+ * @param px 点的 x 坐标
+ * @param py 点的 y 坐标
+ * @param cx 中心 x 坐标
+ * @param cy 中心 y 坐标
+ * @param r  外接圆半径
+ * @param rotation 旋转角度 [rad]
+ * @return 带符号距离
+ */
 __device__ __forceinline__ float sdfTriangle(float px, float py, float cx, float cy, float r, float rotation)
 {
     // 转换到局部坐标
@@ -290,9 +355,16 @@ __device__ __forceinline__ float sdfTriangle(float px, float py, float cx, float
     return inside ? -minDist : minDist;
 }
 
-// 功能:计算点到凸四边形的带符号距离
-// 输入:点坐标(px, py), 四个顶点坐标（要求逆时针绕序）
-// 输出:带符号距离（负值表示在四边形内，正值表示在外）
+/**
+ * @brief 计算点到凸四边形的带符号距离
+ * @param px  点的 x 坐标
+ * @param py  点的 y 坐标
+ * @param v0x,v0y 顶点0坐标（要求逆时针绕序）
+ * @param v1x,v1y 顶点1坐标
+ * @param v2x,v2y 顶点2坐标
+ * @param v3x,v3y 顶点3坐标
+ * @return 带符号距离（负值表示在四边形内，正值表示在外）
+ */
 __device__ __forceinline__ float sdfQuad(float px, float py,
                                          float v0x, float v0y,
                                          float v1x, float v1y,
@@ -320,10 +392,19 @@ __device__ __forceinline__ float sdfQuad(float px, float py,
     return inside ? -minDist : minDist;
 }
 
-// 功能:计算点到星舰模型的带符号距离
-// 星舰由三部分组成：圆形主体 + 上下对称的固定襟翼根部 + 上下对称的可旋转襟翼
-// 输入:点坐标(px, py), 中心(cx, cy), 主体半径 r, 全局旋转角度 rotation, 襟翼旋转角度 wingRotation
-// 输出:带符号距离（联合体的SDF = 各部件SDF的最小值）
+/**
+ * @brief 计算点到星舰模型的带符号距离
+ * @note 星舰由三部分组成：圆形主体 + 上下对称的固定襟翼根部 + 上下对称的可旋转襟翼
+ *        联合体的 SDF = 各部件 SDF 的最小值
+ * @param px 点的 x 坐标
+ * @param py 点的 y 坐标
+ * @param cx 中心 x 坐标
+ * @param cy 中心 y 坐标
+ * @param r  主体圆半径
+ * @param rotation 全局旋转角度 [rad]
+ * @param wingRotation 襟翼旋转角度 [rad]
+ * @return 带符号距离
+ */
 __device__ __forceinline__ float sdfStarship(float px, float py, float cx, float cy, float r, float rotation, float wingRotation)
 {
     // 转换到局部坐标（以星舰中心为原点）
@@ -398,9 +479,18 @@ __device__ __forceinline__ float sdfStarship(float px, float py, float cx, float
     return fminf(distToCircle, fminf(distToRoot, distToWing));
 }
 
-// 功能:统一的SDF计算接口，根据形状类型调用相应的SDF函数
-// 输入:点坐标(px, py), 形状中心(cx, cy), 尺寸参数 r, 旋转角度 rotation, 形状类型 shapeType
-// 输出:带符号距离
+/**
+ * @brief 统一的SDF计算接口，根据形状类型调用相应的SDF函数
+ * @param px 点的 x 坐标
+ * @param py 点的 y 坐标
+ * @param cx 形状中心 x 坐标
+ * @param cy 形状中心 y 坐标
+ * @param r  尺寸参数
+ * @param rotation 旋转角度 [rad]
+ * @param shapeType 形状类型（圆/星/菱/胶囊/三角/星舰）
+ * @param wingRotation 襟翼旋转角度 [rad]（仅星舰使用）
+ * @return 带符号距离
+ */
 __device__ __forceinline__ float computeShapeSDF(float px, float py, float cx, float cy, float r,
                                                  float rotation, ObstacleShape shapeType, float wingRotation)
 {
@@ -424,9 +514,19 @@ __device__ __forceinline__ float computeShapeSDF(float px, float py, float cx, f
     }
 }
 
-// 功能:并行计算全场的SDF并初始化网格类型
-// 输入:障碍物参数(位置、大小、旋转、形状), 网格间距 dx,dy, 网格尺寸 nx,ny
-// 输出:SDF场 sdf[], 网格类型标记 cell_type[]
+/**
+ * @brief 并行计算全场的SDF并初始化网格类型
+ * @param[out] sdf       SDF场输出数组
+ * @param[out] cell_type 网格类型标记输出数组
+ * @param obs_x    障碍物中心 x
+ * @param obs_y    障碍物中心 y
+ * @param obs_r    障碍物尺寸参数
+ * @param rotation 障碍物旋转角度 [rad]
+ * @param shapeType 障碍物形状类型
+ * @param dx,dy    网格间距
+ * @param nx,ny    网格尺寸
+ * @param wingRotation 襟翼旋转角度 [rad]
+ */
 __global__ void computeSDFKernel(float *sdf, uint8_t *cell_type,
                                  float obs_x, float obs_y, float obs_r,
                                  float rotation, ObstacleShape shapeType,
@@ -482,12 +582,22 @@ __global__ void computeSDFKernel(float *sdf, uint8_t *cell_type,
     }
 }
 
-// 功能:重新计算SDF和网格类型（用于动态襟翼旋转），并对类型变化的网格做物理修正
-// 与 computeSDFKernel 不同，此核函数读取旧的 cell_type，对比新类型：
-// - 固体/Ghost → 流体：用来流条件初始化守恒变量（新暴露的流体区域）
-// - 流体 → 固体/Ghost：保持守恒变量不变（边界条件内核会在之后正确处理）
-// 输入:障碍物参数, 来流参数(rho_inf, u_inf, v_inf, p_inf), 守恒变量指针
-// 输出:更新后的SDF、cell_type，以及新暴露区域的守恒变量
+/**
+ * @brief 重新计算SDF和网格类型（用于动态襟翼旋转），并对类型变化的网格做物理修正
+ * @note 与 computeSDFKernel 不同，此核函数读取旧的 cell_type，对比新类型：
+ *       - 固体/Ghost → 流体：用来流条件初始化守恒变量（新暴露的流体区域）
+ *       - 流体 → 固体/Ghost：保持守恒变量不变（边界条件内核会在之后正确处理）
+ * @param[in,out] sdf      SDF场
+ * @param[in,out] cell_type 网格类型
+ * @param[in,out] rho,rho_u,rho_v,E,rho_e 守恒变量（新暴露区域会被重置）
+ * @param obs_x,obs_y,obs_r 障碍物参数
+ * @param rotation 障碍物全局旋转角度
+ * @param shapeType 障碍物形状类型
+ * @param dx,dy 网格间距
+ * @param nx,ny 网格尺寸
+ * @param wingRotation 襟翼旋转角度
+ * @param rho_inf,u_inf,v_inf,p_inf 来流参数
+ */
 __global__ void updateSDFWithFixupKernel(
     float *sdf, uint8_t *cell_type,
     float *rho, float *rho_u, float *rho_v, float *E, float *rho_e,
@@ -550,9 +660,17 @@ __global__ void updateSDFWithFixupKernel(
 
 #pragma region 物理逻辑操作核函数
 #pragma region 内联函数
-// 功能: 计算x方向的Riemann不变量（用于左右边界）
-// 输入: 原始变量(rho, u, v, p)
-// 输出: 四个Riemann不变量(R1, R2, R3, R4)
+/**
+ * @brief 计算x方向的Riemann不变量（用于左右边界）
+ * @param rho 密度
+ * @param u   x方向速度
+ * @param v   y方向速度
+ * @param p   压强
+ * @param[out] R1 熵波不变量
+ * @param[out] R2 剪切波不变量
+ * @param[out] R3 向右声波不变量
+ * @param[out] R4 向左声波不变量
+ */
 __device__ __forceinline__ void computeRiemannInvarFromPrimitiveX(float rho, float u, float v, float p,
                                                                   float &R1, float &R2, float &R3, float &R4)
 {
@@ -570,9 +688,17 @@ __device__ __forceinline__ void computeRiemannInvarFromPrimitiveX(float rho, flo
     R4 = u - c * two_over_gamma_minus_1;                            // 向左声波（特征速度 = u - c）
 }
 
-// 功能: 计算y方向的Riemann不变量（用于上下边界）
-// 输入: 原始变量(rho, u, v, p)
-// 输出: 四个Riemann不变量(R1, R2, R3, R4)
+/**
+ * @brief 计算y方向的Riemann不变量（用于上下边界）
+ * @param rho 密度
+ * @param u   x方向速度
+ * @param v   y方向速度
+ * @param p   压强
+ * @param[out] R1 熵波不变量
+ * @param[out] R2 剪切波不变量
+ * @param[out] R3 向上声波不变量
+ * @param[out] R4 向下声波不变量
+ */
 __device__ __forceinline__ void computeRiemannInvarFromPrimitiveY(float rho, float u, float v, float p,
                                                                   float &R1, float &R2, float &R3, float &R4)
 {
@@ -590,9 +716,17 @@ __device__ __forceinline__ void computeRiemannInvarFromPrimitiveY(float rho, flo
     R4 = v - c * two_over_gamma_minus_1;                            // 向下声波
 }
 
-// 功能: 从X方向Riemann不变量重构原始变量
-// 输入: Riemann不变量(R1, R2, R3, R4)
-// 输出: 原始变量(rho, u, v, p)
+/**
+ * @brief 从X方向Riemann不变量重构原始变量
+ * @param R1 熵波不变量
+ * @param R2 剪切波不变量
+ * @param R3 向右声波不变量
+ * @param R4 向左声波不变量
+ * @param[out] rho 密度
+ * @param[out] u   x方向速度
+ * @param[out] v   y方向速度
+ * @param[out] p   压强
+ */
 __device__ __forceinline__ void computePrimitiveFromRiemannInvarX(float R1, float R2, float R3, float R4,
                                                                   float &rho, float &u, float &v, float &p)
 {
@@ -615,9 +749,17 @@ __device__ __forceinline__ void computePrimitiveFromRiemannInvarX(float R1, floa
     p = rho * c_sq * inv_gamma; // 压强
 }
 
-// 功能: 从Y方向Riemann不变量重构原始变量
-// 输入: Riemann不变量(R1, R2, R3, R4)
-// 输出: 原始变量(rho, u, v, p)
+/**
+ * @brief 从Y方向Riemann不变量重构原始变量
+ * @param R1 熵波不变量
+ * @param R2 剪切波不变量
+ * @param R3 向上声波不变量
+ * @param R4 向下声波不变量
+ * @param[out] rho 密度
+ * @param[out] u   x方向速度
+ * @param[out] v   y方向速度
+ * @param[out] p   压强
+ */
 __device__ __forceinline__ void computePrimitiveFromRiemannInvarY(float R1, float R2, float R3, float R4,
                                                                   float &rho, float &u, float &v, float &p)
 {
@@ -640,9 +782,14 @@ __device__ __forceinline__ void computePrimitiveFromRiemannInvarY(float R1, floa
     p = rho * c_sq * inv_gamma; // 压强
 }
 
-// 功能: 计算远场条件对应的Riemann不变量（X方向边界条件使用）
-// 输入:来流参数(rho_inf, u_inf, v_inf, p_inf)
-// 输出:来流对应的Riemann不变量(R1_inf, R2_inf, R3_inf, R4_inf)
+/**
+ * @brief 计算远场条件对应的Riemann不变量（X方向边界条件使用）
+ * @param rho_inf 来流密度
+ * @param u_inf   来流 x 速度
+ * @param v_inf   来流 y 速度
+ * @param p_inf   来流压强
+ * @param[out] R1_inf,R2_inf,R3_inf,R4_inf 来流对应的Riemann不变量
+ */
 __device__ __forceinline__ void computeFarfieldRiemannInvarX(float rho_inf, float u_inf, float v_inf, float p_inf,
                                                              float &R1_inf, float &R2_inf, float &R3_inf, float &R4_inf)
 {
@@ -661,9 +808,14 @@ __device__ __forceinline__ void computeFarfieldRiemannInvarX(float rho_inf, floa
     R4_inf = u_inf - c_inf * two_over_gamma_minus_1; // 向左声波不变量
 }
 
-// 功能: 计算远场条件对应的Riemann不变量（Y方向边界条件使用）
-// 输入:来流参数(rho_inf, u_inf, v_inf, p_inf)
-// 输出:来流对应的Riemann不变量(R1_inf, R2_inf, R3_inf, R4_inf)
+/**
+ * @brief 计算远场条件对应的Riemann不变量（Y方向边界条件使用）
+ * @param rho_inf 来流密度
+ * @param u_inf   来流 x 速度
+ * @param v_inf   来流 y 速度
+ * @param p_inf   来流压强
+ * @param[out] R1_inf,R2_inf,R3_inf,R4_inf 来流对应的Riemann不变量
+ */
 __device__ __forceinline__ void computeFarfieldRiemannInvarY(float rho_inf, float u_inf, float v_inf, float p_inf,
                                                              float &R1_inf, float &R2_inf, float &R3_inf, float &R4_inf)
 {
@@ -682,12 +834,28 @@ __device__ __forceinline__ void computeFarfieldRiemannInvarY(float rho_inf, floa
     R4_inf = v_inf - c_inf * two_over_gamma_minus_1; // 向下声波不变量
 }
 
-// 功能: 从守恒变量计算原始变量，并应用双能量法切换以提高数值稳定性
-// 输入:守恒变量(rho, rho_u, rho_v, E, rho_e)，其中 rho_e 是从双能量方程追踪的内能密度
-// 输出:原始变量(u, v, p, T)，其中 T 是温度
+/**
+ * @brief 从守恒变量计算原始变量（双能量法：根据eta切换内能来源）
+ * @param rho   密度
+ * @param rho_u x方向动量密度
+ * @param rho_v y方向动量密度
+ * @param E     总能量密度（守恒量）
+ * @param rho_e 内能密度（双能量方程追踪值）
+ * @param[out] u 水平速度
+ * @param[out] v 垂直速度
+ * @param[out] p 压强
+ * @param[out] T 温度
+ *
+ * @par 数值安全保证（本函数对所有调用方承诺）
+ * - p ≥ MIN_PRESSURE（无论输入守恒量质量如何均强制）
+ * - T ∈ [MIN_TEMPERATURE, MAX_TEMPERATURE]（强制双侧限幅）
+ * - 内部对 rho 做保护除法（rho_val = max(rho, MIN_DENSITY)），但不保证写出值
+ * - 下游核函数（computeFluxesKernel、fusedViscousDiffusionKernel 等）
+ *   依赖此处保证，无需重复检查 p 和 T。
+ */
 __device__ __forceinline__ void computePrimitivesKernelInline(const float rho, const float rho_u,
                                                               const float rho_v, const float E,
-                                                              const float rho_e, // Internal energy from dual-energy equation
+                                                              const float rho_e,
                                                               float &u, float &v, float &p, float &T)
 {
     // 读取守恒变量并应用物理下限
@@ -695,44 +863,16 @@ __device__ __forceinline__ void computePrimitivesKernelInline(const float rho, c
     // 从动量密度计算速度: u = (rho*u) / rho
     float u_val = rho_u / rho_val;
     float v_val = rho_v / rho_val;
-    // 计算动能密度: KE = 0.5 * rho * (u^2 + v^2)
+
+    // 双能量法：根据 eta = rho_e / E 选择内能来源
+    // eta > threshold (低/中马赫)：使用 E-KE（守恒、无源项奇偶解耦）
+    // eta < threshold (高马赫)  ：使用 rho_e（避免 E-KE 大数减小数取消误差）
     float ke = 0.5f * rho_val * (u_val * u_val + v_val * v_val);
-
-    // ========== 双能量法 ==========
-    // 方法1(E法): 从总能量计算内能
-    // e_internal = E_total - KE
     float e_from_E = E - ke;
-    // 由内能计算压强: p = (gamma - 1) * e_internal
-    float p_from_E = (GAMMA - 1.0f) * e_from_E;
+    float eta = (E > 0.0f) ? (rho_e / E) : 1.0f;
+    float e_internal = (eta < DUAL_ENERGY_ETA_THRESHOLD) ? rho_e : e_from_E;
 
-    // 方法2(e法): 直接使用追踪的内能密度
-    float e_from_e = rho_e;
-    float p_from_e = (GAMMA - 1.0f) * e_from_e;
-
-    // 切换准则: eta = e_internal / E_total
-    // eta 是内能占总能量的比例
-    // 当 eta 很小时，动能占主导，E-KE的减法不可靠
-    float eta = e_from_e / (E + 1e-20f);
-
-    // 切换阈值(通常取 0.001 到 0.1)
-    // 低于此值时，说明动能远大于内能，应使用e法
-    float eta_switch = 0.1f;
-
-    float p_val;
-    if (eta > eta_switch && e_from_E > 0.0f)
-    {
-        // 情况1: 内能占比足够大(激波区、高温区)
-        // 使用 E 法保证守恒性，准确捕捉激波
-        p_val = p_from_E;
-    }
-    else
-    {
-        // 情况2: 动能占主导(膨胀区、低密度尾流)
-        // 使用 e 法避免精度损失
-        p_val = p_from_e;
-    }
-
-    // 最终安全限制
+    float p_val = (GAMMA - 1.0f) * e_internal;
     p_val = fmaxf(p_val, MIN_PRESSURE);
 
     // 由理想气体状态方程计算温度: T = p / (rho * R)
@@ -749,9 +889,19 @@ __device__ __forceinline__ void computePrimitivesKernelInline(const float rho, c
 #pragma endregion
 
 #pragma region 无条件初始化
-// 功能:初始化流场为来流(自由流)条件
-// 输入:来流密度 rho_inf, 速度 u_inf, v_inf, 压强 p_inf, 网格尺寸 nx, ny
-// 输出:初始化的守恒变量数组 rho, rho_u, rho_v, E, rho_e
+/**
+ * @brief 初始化流场为来流（自由流）条件
+ * @param[out] rho   密度场
+ * @param[out] rho_u x方向动量场
+ * @param[out] rho_v y方向动量场
+ * @param[out] E     总能量场
+ * @param[out] rho_e 内能场
+ * @param rho_inf 来流密度
+ * @param u_inf   来流 x 速度
+ * @param v_inf   来流 y 速度
+ * @param p_inf   来流压强
+ * @param nx,ny   网格尺寸
+ */
 __global__ void initializeKernel(float *rho, float *rho_u, float *rho_v, float *E, float *rho_e,
                                  float rho_inf, float u_inf, float v_inf, float p_inf,
                                  int nx, int ny)
@@ -785,11 +935,13 @@ __global__ void initializeKernel(float *rho, float *rho_u, float *rho_v, float *
 #pragma endregion
 
 #pragma region 无粘性逻辑
-
-// 功能:从守恒变量计算原始变量，使用双能量法避免数值精度问题
-// 输入:守恒变量 rho, rho_u, rho_v, E(总能量), rho_e(内能密度), 网格尺寸 nx, ny
-// 输出:原始变量 u, v, p, T
-// 说明:双能量法在动能占主导时使用单独追踪的内能，避免 E-KE 的大数减小数精度损失
+/**
+ * @brief 从守恒变量计算原始变量，使用双能量法避免数值精度问题
+ * @note 双能量法在动能占主导时使用单独追踪的内能，避免 E-KE 的大数减小数精度损失
+ * @param[in]  rho,rho_u,rho_v,E,rho_e 守恒变量
+ * @param[out] u,v,p,T 原始变量
+ * @param nx,ny 网格尺寸
+ */
 __global__ void computePrimitivesKernel(const float *rho, const float *rho_u,
                                         const float *rho_v, const float *E,
                                         const float *rho_e, // Internal energy from dual-energy equation
@@ -805,9 +957,18 @@ __global__ void computePrimitivesKernel(const float *rho, const float *rho_u,
     computePrimitivesKernelInline(rho[idx], rho_u[idx], rho_v[idx], E[idx], rho_e[idx], u[idx], v[idx], p[idx], T[idx]);
 }
 
-// 功能:从原始变量计算 X 方向(水平)的通量向量 F
-// 输入:密度 rho, 速度分量 u,v, 压强 p, 总能量密度 E
-// 输出:X方向通量的四个分量(质量、X动量、Y动量、能量通量)
+/**
+ * @brief 从原始变量计算 X 方向（水平）的通量向量 F
+ * @param rho 密度
+ * @param u   x方向速度
+ * @param v   y方向速度
+ * @param p   压强
+ * @param E   总能量密度
+ * @param[out] f_rho   质量通量
+ * @param[out] f_rho_u X动量通量
+ * @param[out] f_rho_v Y动量通量
+ * @param[out] f_E     能量通量
+ */
 __device__ __forceinline__ void computeFluxX(float rho, float u, float v, float p, float E,
                                              float &f_rho, float &f_rho_u, float &f_rho_v, float &f_E)
 {
@@ -819,9 +980,18 @@ __device__ __forceinline__ void computeFluxX(float rho, float u, float v, float 
     f_E = (E + p) * u;         // 能量通量 = (总能量+压强功) * X速度
 }
 
-// 功能:从原始变量计算 Y 方向(垂直)的通量向量 G
-// 输入:密度 rho, 速度分量 u,v, 压强 p, 总能量密度 E
-// 输出:Y方向通量的四个分量(质量、X动量、Y动量、能量通量)
+/**
+ * @brief 从原始变量计算 Y 方向（垂直）的通量向量 G
+ * @param rho 密度
+ * @param u   x方向速度
+ * @param v   y方向速度
+ * @param p   压强
+ * @param E   总能量密度
+ * @param[out] g_rho   质量通量
+ * @param[out] g_rho_u X动量通量
+ * @param[out] g_rho_v Y动量通量
+ * @param[out] g_E     能量通量
+ */
 __device__ __forceinline__ void computeFluxY(float rho, float u, float v, float p, float E,
                                              float &g_rho, float &g_rho_u, float &g_rho_v, float &g_E)
 {
@@ -833,9 +1003,12 @@ __device__ __forceinline__ void computeFluxY(float rho, float u, float v, float 
     g_E = (E + p) * v;         // 能量通量 = (总能量+压强功) * Y速度
 }
 
-// 功能:HLL (Harten-Lax-van Leer) Riemann 求解器(X方向)，比HLLC更稳健但稍微扩散
-// 输入:界面左侧状态(rhoL, uL, vL, pL, EL)和右侧状态(rhoR, uR, vR, pR, ER)
-// 输出:界面处的数值通量(f_rho, f_rho_u, f_rho_v, f_E)
+/**
+ * @brief HLL (Harten-Lax-van Leer) Riemann 求解器（X方向），比HLLC更稳健但稍微扩散
+ * @param rhoL,uL,vL,pL,EL 界面左侧状态
+ * @param rhoR,uR,vR,pR,ER 界面右侧状态
+ * @param[out] f_rho,f_rho_u,f_rho_v,f_E 界面处的数值通量
+ */
 __device__ __forceinline__ void hllFluxX(
     float rhoL, float uL, float vL, float pL, float EL,
     float rhoR, float uR, float vR, float pR, float ER,
@@ -891,20 +1064,23 @@ __device__ __forceinline__ void hllFluxX(
     }
 }
 
-// 功能:HLLC (HLL-Contact) Riemann 求解器(X方向)，考虑接触间断，比HLL更精确
-// 输入:界面左侧状态(rhoL, uL, vL, pL, EL)和右侧状态(rhoR, uR, vR, pR, ER)
-// 输出:界面处的数值通量(f_rho, f_rho_u, f_rho_v, f_E)
+/**
+ * @brief HLLC (HLL-Contact) Riemann 求解器（X方向），考虑接触间断，比HLL更精确
+ * @param rhoL,uL,vL,pL,EL 界面左侧状态
+ * @param rhoR,uR,vR,pR,ER 界面右侧状态
+ * @param[out] f_rho,f_rho_u,f_rho_v,f_E 界面处的数值通量
+ *
+ * @par 数值安全前提（调用方须保证，本函数不重复检查）
+ * - rhoL, rhoR ≥ MIN_DENSITY
+ * - pL, pR ≥ MIN_PRESSURE
+ * 由 computeFluxesKernel 在调用前完成 MUSCL 后置 clamp 保证。
+ * 星区中间量（rho_star, pLR）仍在内部 clamp，因其由公式推导得出可能为负。
+ */
 __device__ __forceinline__ void hllcFluxX(
     float rhoL, float uL, float vL, float pL, float EL,
     float rhoR, float uR, float vR, float pR, float ER,
     float &f_rho, float &f_rho_u, float &f_rho_v, float &f_E)
 {
-    // 强制密度和压强满足物理约束，防止负值
-    rhoL = fmaxf(rhoL, MIN_DENSITY);
-    rhoR = fmaxf(rhoR, MIN_DENSITY);
-    pL = fmaxf(pL, MIN_PRESSURE);
-    pR = fmaxf(pR, MIN_PRESSURE);
-
     // 计算左右状态的声速
     float cL = sqrtf(GAMMA * pL / rhoL);
     float cR = sqrtf(GAMMA * pR / rhoR);
@@ -1017,20 +1193,22 @@ __device__ __forceinline__ void hllcFluxX(
     }
 }
 
-// 功能:HLL Riemann 求解器(Y方向)，适用于垂直方向的通量计算
-// 输入:界面下方状态(rhoB, uB, vB, pB, EB)和上方状态(rhoT, uT, vT, pT, ET)
-// 输出:界面处的Y方向数值通量(g_rho, g_rho_u, g_rho_v, g_E)
+/**
+ * @brief HLL Riemann 求解器（Y方向），适用于垂直方向的通量计算
+ * @param rhoB,uB,vB,pB,EB 界面下方状态
+ * @param rhoT,uT,vT,pT,ET 界面上方状态
+ * @param[out] g_rho,g_rho_u,g_rho_v,g_E 界面处的Y方向数值通量
+ *
+ * @par 数值安全前提（调用方须保证，本函数不重复检查）
+ * - rhoB, rhoT ≥ MIN_DENSITY
+ * - pB, pT ≥ MIN_PRESSURE
+ * 由 computeFluxesKernel 在调用前完成 MUSCL 后置 clamp 保证。
+ */
 __device__ __forceinline__ void hllFluxY(
     float rhoB, float uB, float vB, float pB, float EB,
     float rhoT, float uT, float vT, float pT, float ET,
     float &g_rho, float &g_rho_u, float &g_rho_v, float &g_E)
 {
-    // 强制物理约束
-    rhoB = fmaxf(rhoB, MIN_DENSITY);
-    rhoT = fmaxf(rhoT, MIN_DENSITY);
-    pB = fmaxf(pB, MIN_PRESSURE);
-    pT = fmaxf(pT, MIN_PRESSURE);
-
     // 计算声速
     float cB = sqrtf(GAMMA * pB / rhoB);
     float cT = sqrtf(GAMMA * pT / rhoT);
@@ -1093,20 +1271,23 @@ __device__ __forceinline__ void hllFluxY(
     }
 }
 
-// 功能:HLLC Riemann 求解器(Y方向)，考虑接触间断
-// 输入:界面下方状态(rhoB, uB, vB, pB, EB)和上方状态(rhoT, uT, vT, pT, ET)
-// 输出:界面处的Y方向数值通量(g_rho, g_rho_u, g_rho_v, g_E)
+/**
+ * @brief HLLC Riemann 求解器（Y方向），考虑接触间断
+ * @param rhoB,uB,vB,pB,EB 界面下方状态
+ * @param rhoT,uT,vT,pT,ET 界面上方状态
+ * @param[out] g_rho,g_rho_u,g_rho_v,g_E 界面处的Y方向数值通量
+ *
+ * @par 数值安全前提（调用方须保证，本函数不重复检查）
+ * - rhoB, rhoT ≥ MIN_DENSITY
+ * - pB, pT ≥ MIN_PRESSURE
+ * 由 computeFluxesKernel 在调用前完成 MUSCL 后置 clamp 保证。
+ * 星区中间量（rho_star, pBT）仍在内部 clamp，因其由公式推导得出可能为负。
+ */
 __device__ __forceinline__ void hllcFluxY(
     float rhoB, float uB, float vB, float pB, float EB,
     float rhoT, float uT, float vT, float pT, float ET,
     float &g_rho, float &g_rho_u, float &g_rho_v, float &g_E)
 {
-    // 强制物理约束
-    rhoB = fmaxf(rhoB, MIN_DENSITY);
-    rhoT = fmaxf(rhoT, MIN_DENSITY);
-    pB = fmaxf(pB, MIN_PRESSURE);
-    pT = fmaxf(pT, MIN_PRESSURE);
-
     // 计算声速
     float cB = sqrtf(GAMMA * pB / rhoB);
     float cT = sqrtf(GAMMA * pT / rhoT);
@@ -1223,10 +1404,24 @@ __device__ __forceinline__ void hllcFluxY(
     }
 }
 
-// 功能:使用 MUSCL 方法和 HLLC Riemann 求解器计算网格界面通量
-// 输入:守恒变量和原始变量数组，网格类型，网格间距 dx,dy
-// 输出:X方向和Y方向的通量数组(包括内能通量)
-// 说明:这是求解器的核心，实现了二阶精度的空间离散
+/**
+ * @brief 使用 MUSCL 方法和 HLLC Riemann 求解器计算网格界面通量
+ * @note 这是求解器的核心，实现了二阶精度的空间离散
+ * @param[in]  rho          密度（守恒量，用于MUSCL重构）
+ * @param[in]  u,v,p        原始变量（用于MUSCL+Riemann）
+ * @param[in]  cell_type    网格类型
+ * @param[out] flux_rho_x,flux_rho_u_x,flux_rho_v_x,flux_E_x,flux_rho_e_x  X方向通量
+ * @param[out] flux_rho_y,flux_rho_u_y,flux_rho_v_y,flux_E_y,flux_rho_e_y  Y方向通量
+ * @param dx,dy 网格间距
+ * @param nx,ny 网格尺寸
+ *
+ * @par 数值安全前提（调用方须保证，本函数不重复检查）
+ * - rho[*] ≥ MIN_DENSITY：由 updateKernel 的最终 fmaxf 保证
+ * - p[*] ≥ MIN_PRESSURE：由 computePrimitivesKernelInline 保证
+ * - T[*] ∈ [MIN_TEMPERATURE, MAX_TEMPERATURE]：由 computePrimitivesKernelInline 保证
+ * 本函数在 MUSCL 二阶重构之后对界面重构值再次 clamp（因为线性外推可能产生负值），
+ * 并将已 clamp 的界面值无条件传给 Riemann 求解器。
+ */
 __global__ void computeFluxesKernel(
     const float *rho,                               // 密度(守恒量，用于MUSCL重构)
     const float *u, const float *v, const float *p, // 原始变量(用于MUSCL+Riemann)
@@ -1289,15 +1484,16 @@ __global__ void computeFluxesKernel(
             {
                 // ===== 一阶重构(分片常数) =====
                 // 直接使用网格中心的值，不外推
-                rhoL = fmaxf(rho[idx], MIN_DENSITY);
+                // rho/p 由调用前置条件保证 ≥ MIN_DENSITY/MIN_PRESSURE，无需重复 clamp
+                rhoL = rho[idx];
                 uL = u[idx];
                 vL = v[idx];
-                pL = fmaxf(p[idx], MIN_PRESSURE);
+                pL = p[idx];
 
-                rhoR = fmaxf(rho[idx_ip1], MIN_DENSITY);
+                rhoR = rho[idx_ip1];
                 uR = u[idx_ip1];
                 vR = v[idx_ip1];
-                pR = fmaxf(p[idx_ip1], MIN_PRESSURE);
+                pR = p[idx_ip1];
             }
             else
             {
@@ -1329,7 +1525,8 @@ __global__ void computeFluxesKernel(
                 pR = p[idx_ip1] - 0.5f * slope_p_R;
             }
 
-            // 确保重构后的状态仍然物理合理
+            // MUSCL 线性外推可能产生负密度/压强，此处是唯一需要 clamp 的位置
+            // 一阶路径的输入已由前置条件保证，故 clamp 对其实际无效，但统一处理简化逻辑
             rhoL = fmaxf(rhoL, MIN_DENSITY);
             pL = fmaxf(pL, MIN_PRESSURE);
             rhoR = fmaxf(rhoR, MIN_DENSITY);
@@ -1376,11 +1573,12 @@ __global__ void computeFluxesKernel(
         else
         {
             // ===== 固体壁面或无效通量 =====
-            flux_rho_x[idx] = 0.0f;                          // 质量不穿透
-            flux_rho_u_x[idx] = fmaxf(p[idx], MIN_PRESSURE); // 压力作用在壁面上
-            flux_rho_v_x[idx] = 0.0f;                        // 动量不穿透
-            flux_E_x[idx] = 0.0f;                            // 能量不穿透
-            flux_rho_e_x[idx] = 0.0f;                        // 内能不穿透
+            // p ≥ MIN_PRESSURE 由 computePrimitivesKernelInline 保证，无需重复 clamp
+            flux_rho_x[idx] = 0.0f;     // 质量不穿透
+            flux_rho_u_x[idx] = p[idx]; // 压力作用在壁面上
+            flux_rho_v_x[idx] = 0.0f;   // 动量不穿透
+            flux_E_x[idx] = 0.0f;       // 能量不穿透
+            flux_rho_e_x[idx] = 0.0f;   // 内能不穿透
         }
     }
 
@@ -1405,15 +1603,16 @@ __global__ void computeFluxesKernel(
             if (nearBoundary || lowDensity)
             {
                 // 一阶重构
-                rhoB = fmaxf(rho[idx], MIN_DENSITY);
+                // rho/p 由调用前置条件保证 ≥ MIN_DENSITY/MIN_PRESSURE，无需重复 clamp
+                rhoB = rho[idx];
                 uB = u[idx];
                 vB = v[idx];
-                pB = fmaxf(p[idx], MIN_PRESSURE);
+                pB = p[idx];
 
-                rhoT = fmaxf(rho[idx_jp1], MIN_DENSITY);
+                rhoT = rho[idx_jp1];
                 uT = u[idx_jp1];
                 vT = v[idx_jp1];
-                pT = fmaxf(p[idx_jp1], MIN_PRESSURE);
+                pT = p[idx_jp1];
             }
             else
             {
@@ -1439,7 +1638,7 @@ __global__ void computeFluxesKernel(
                 pT = p[idx_jp1] - 0.5f * slope_p_T;
             }
 
-            // 确保正定性
+            // MUSCL 线性外推可能产生负密度/压强，此处是唯一需要 clamp 的位置
             rhoB = fmaxf(rhoB, MIN_DENSITY);
             pB = fmaxf(pB, MIN_PRESSURE);
             rhoT = fmaxf(rhoT, MIN_DENSITY);
@@ -1480,19 +1679,34 @@ __global__ void computeFluxesKernel(
         else
         {
             // 壁面边界
+            // p ≥ MIN_PRESSURE 由 computePrimitivesKernelInline 保证，无需重复 clamp
             flux_rho_y[idx] = 0.0f;
             flux_rho_u_y[idx] = 0.0f;
-            flux_rho_v_y[idx] = fmaxf(p[idx], MIN_PRESSURE); // 压力作用
+            flux_rho_v_y[idx] = p[idx]; // 压力作用
             flux_E_y[idx] = 0.0f;
             flux_rho_e_y[idx] = 0.0f;
         }
     }
 }
 
-// 功能:使用有限体积法和双能量法更新守恒变量
-// 输入:当前守恒变量，通量数组，时间步长 dt，网格间距 dx,dy
-// 输出:更新后的守恒变量(新时间步)
-// 说明:实现欧拉前向时间积分和双能量同步
+/**
+ * @brief 使用有限体积法和双能量法更新守恒变量
+ * @note 实现欧拉前向时间积分和双能量同步
+ * @param[in]  rho,rho_u,rho_v,E,rho_e 当前守恒变量
+ * @param[in]  u,v,p 已计算的原始变量（复用避免重复除法）
+ * @param[in]  flux_rho_x..flux_rho_e_y X/Y方向通量
+ * @param[in]  cell_type 网格类型
+ * @param[out] rho_new,rho_u_new,rho_v_new,E_new,rho_e_new 更新后的守恒变量
+ * @param dt   时间步长
+ * @param dx,dy 网格间距
+ * @param nx,ny 网格尺寸
+ *
+ * @par 数值安全保证（本函数对所有调用方承诺）
+ * - rho_new ≥ MIN_DENSITY（时间积分后强制，调用方无需重复检查密度下界）
+ * - 包含 NaN/Inf 回退逻辑：若积分结果非有限数则恢复为旧值
+ * - 速度幅值限制在 MAX_VELOCITY_LIMIT 以内
+ * - 双能量同步后 E 与 rho_e 保持一致（eta 切换策略）
+ */
 __global__ void updateKernel(
     const float *rho, const float *rho_u, const float *rho_v, const float *E,
     const float *rho_e,
@@ -1556,23 +1770,34 @@ __global__ void updateKernel(
     }
 
     // ===== 计算内能方程的源项: -p * div(v) =====
-    // 这是双能量法的关键:内能方程有压力做功项
-    // div(v) = du/dx + dv/dy (速度散度)
+    // 使用 Riemann 质量通量反推界面速度，避免中心差分的奇偶解耦:
+    //   u_face_{i+1/2} = flux_rho_x[i] / rho_face_{i+1/2}
+    //   div(v) = (u_face_{i+1/2} - u_face_{i-1/2}) / dx + (v_face 同理)
+    // 界面速度天然继承 Riemann 求解器的迎风耗散，且格子 i 通过 rho_face
+    // 同时参与左右两个界面的计算，消除了奇偶格子互不相见的问题。
     int idx_ip1 = (i < nx - 1) ? (j * nx + (i + 1)) : idx;
     int idx_jp1 = (j < ny - 1) ? ((j + 1) * nx + i) : idx;
 
-    // 直接使用已计算的原始变量:
-    // - 避免 5 次除法 (rho_u/rho) 和 5 次 fmaxf 操作
-    // - 避免 8 次额外的全局内存读取 (rho_u/rho_v/rho 在邻居处)
-    // - 压强使用双能量法选取的值(比 E-KE 更精确)
-    float du_dx = (u[idx_ip1] - u[idx_im1]) / (2.0f * dx);
-    float dv_dy = (v[idx_jp1] - v[idx_jm1]) / (2.0f * dy);
-    float div_v = du_dx + dv_dy;
+    float source_rho_e = 0.0f;
+    if (i > 0 && i < nx - 1 && j > 0 && j < ny - 1)
+    {
+        float rho_c = fmaxf(rho[idx], MIN_DENSITY);
 
-    float p_c = p[idx];
+        // X 方向: 从质量通量反推界面速度
+        float rho_xR = fmaxf(rho[idx_ip1], MIN_DENSITY);
+        float rho_xL = fmaxf(rho[idx_im1], MIN_DENSITY);
+        float u_face_R = flux_rho_x[idx] / (0.5f * (rho_c + rho_xR));
+        float u_face_L = flux_rho_x[idx_im1] / (0.5f * (rho_xL + rho_c));
 
-    // 内能方程源项: d(rho*e)/dt = -p * div(v) + ... (这里只包含压力做功)
-    float source_rho_e = -p_c * div_v;
+        // Y 方向: 同理
+        float rho_yT = fmaxf(rho[idx_jp1], MIN_DENSITY);
+        float rho_yB = fmaxf(rho[idx_jm1], MIN_DENSITY);
+        float v_face_T = flux_rho_y[idx] / (0.5f * (rho_c + rho_yT));
+        float v_face_B = flux_rho_y[idx_jm1] / (0.5f * (rho_yB + rho_c));
+
+        float div_v = (u_face_R - u_face_L) / dx + (v_face_T - v_face_B) / dy;
+        source_rho_e = -p[idx] * div_v;
+    }
 
     // ===== 欧拉前向时间积分 =====
     // U^{n+1} = U^n - dt * div(F)
@@ -1618,54 +1843,29 @@ __global__ void updateKernel(
     // 计算动能
     float ke = 0.5f * new_rho * (u_new * u_new + v_new * v_new);
 
-    // ========== 双能量同步 ==========
-    // 关键思想:
-    // - 在激波区(高压强): 使用 E - KE 计算内能(保守性好，准确捕捉激波)
-    // - 在膨胀区(低KE占比): 使用 rho_e 直接计算(避免E-KE的精度损失)
-
-    // 从总能量计算内能(E法)
-    float e_from_E = new_E - ke;
-
-    // 从双能量方程得到的内能(e法)
-    float e_from_e = new_rho_e;
-
-    // 确保两种方法都是正值
-    float e_min = new_rho * R_GAS * MIN_TEMPERATURE / (GAMMA - 1.0f);
-    e_from_E = fmaxf(e_from_E, e_min);
-    e_from_e = fmaxf(e_from_e, e_min);
-
-    // 切换准则: eta = e_internal / E_total
-    // 当 eta 小时，KE 占主导，E-KE减法不可靠
-    float eta = e_from_e / (new_E + 1e-20f);
-    float eta_threshold = DUAL_ENERGY_ETA_THRESHOLD; // 阈值以下使用e法
-
+    // ========== 双能量同步（eta切换） ==========
+    // eta = rho_e / E 衡量内能占总能量的比例
+    // eta > threshold (低/中马赫)：使用 E-KE（守恒、无源项奇偶解耦）
+    // eta < threshold (高马赫)  ：使用 rho_e（避免 E-KE 大数相减取消误差）
+    float eta = (new_E > 0.0f) ? (new_rho_e / new_E) : 1.0f;
     float e_internal;
-    if (eta > eta_threshold && e_from_E > 0.0f)
+    if (eta < DUAL_ENERGY_ETA_THRESHOLD)
     {
-        // 情况1: 热能占比显著 - 安全使用E法
-        // 这在激波处保持守恒性
-        e_internal = e_from_E;
-
-        // 同步: 更新 rho_e 使其与 E 一致
-        // 防止两个能量之间漂移
-        new_rho_e = e_from_E;
+        // 高马赫区域：E-KE 精度不足，使用独立追踪的内能
+        e_internal = new_rho_e;
     }
     else
     {
-        // 情况2: 动能占主导 - 使用追踪的内能
-        // 这避免了"大数减大数"的精度问题
-        e_internal = e_from_e;
-
-        // 重构总能量使其一致
-        new_E = e_internal + ke;
+        // 低/中马赫区域：使用守恒的 E-KE（避免源项中心差分的奇偶解耦）
+        e_internal = new_E - ke;
     }
 
-    // 最终安全限制
+    float e_min = new_rho * R_GAS * MIN_TEMPERATURE / (GAMMA - 1.0f);
     float e_max = new_rho * R_GAS * MAX_TEMPERATURE / (GAMMA - 1.0f);
-    e_internal = fminf(e_internal, e_max);
     e_internal = fmaxf(e_internal, e_min);
+    e_internal = fminf(e_internal, e_max);
 
-    // 确保一致性
+    // 同步：确保 E 和 rho_e 一致
     new_rho_e = e_internal;
     new_E = e_internal + ke;
 
@@ -1677,10 +1877,19 @@ __global__ void updateKernel(
     rho_e_new[idx] = new_rho_e;
 }
 
-// 功能:应用边界条件到守恒变量
-// 输入:守恒变量数组，网格类型，SDF场，来流参数，粘性/壁面温度设置
-// 输出:更新边界处的守恒变量
-// 说明:实现流入/流出/上下边界的特征边界条件，以及固体壁面的Ghost Cell方法
+/**
+ * @brief 应用边界条件到守恒变量
+ * @note 实现流入/流出/上下边界的特征边界条件，以及固体壁面的 Ghost Cell 方法
+ * @param[in,out] rho,rho_u,rho_v,E,rho_e 守恒变量（边界处会被更新）
+ * @param[in]  cell_type 网格类型
+ * @param[in]  sdf       带符号距离场
+ * @param rho_inf,u_inf,v_inf,p_inf 来流参数
+ * @param dx,dy 网格间距
+ * @param nx,ny 网格尺寸
+ * @param enable_viscosity 是否启用粘性
+ * @param adiabatic_wall   是否使用绝热壁面
+ * @param T_wall           等温壁面温度 [K]
+ */
 __global__ void applyBoundaryConditionsKernel(
     float *rho, float *rho_u, float *rho_v, float *E, float *rho_e,
     const uint8_t *cell_type, const float *sdf,
@@ -2021,91 +2230,26 @@ __global__ void applyBoundaryConditionsKernel(
 
 #pragma region 有粘性逻辑
 
-// ===== 辅助设备函数：在任意网格点 (i,j) 计算粘性项 =====
-// 用于融合核函数中按需重算邻居粘性量，避免中间全局内存往返
-__device__ __forceinline__ void computeViscousAtPoint(
-    const float *__restrict__ u, const float *__restrict__ v, const float *__restrict__ T,
-    const uint8_t *__restrict__ cell_type,
-    int i, int j, int nx, int ny, float dx, float dy,
-    float &tau_xx_out, float &tau_yy_out, float &tau_xy_out,
-    float &qx_out, float &qy_out, float &mu_val_out)
-{
-    int idx = j * nx + i;
-
-    if (cell_type[idx] == CELL_SOLID)
-    {
-        mu_val_out = tau_xx_out = tau_yy_out = tau_xy_out = qx_out = qy_out = 0.0f;
-        return;
-    }
-
-    // Sutherland 粘性 + 热导率
-    float T_val = fmaxf(T[idx], MIN_TEMPERATURE);
-    T_val = fminf(T_val, MAX_TEMPERATURE);
-    float T_ratio = T_val / T_REF;
-    float mu_val = MU_REF * (T_ratio * sqrtf(T_ratio)) * (T_REF + S_SUTHERLAND) / (T_val + S_SUTHERLAND);
-    float k_val = mu_val * CP / PRANDTL_NUMBER;
-    mu_val_out = mu_val;
-
-    // 邻居索引
-    int idx_im1 = (i > 0) ? (j * nx + (i - 1)) : idx;
-    int idx_ip1 = (i < nx - 1) ? (j * nx + (i + 1)) : idx;
-    int idx_jm1 = (j > 0) ? ((j - 1) * nx + i) : idx;
-    int idx_jp1 = (j < ny - 1) ? ((j + 1) * nx + i) : idx;
-
-    // 速度梯度
-    float du_dx = (u[idx_ip1] - u[idx_im1]) / (2.0f * dx);
-    float du_dy = (u[idx_jp1] - u[idx_jm1]) / (2.0f * dy);
-    float dv_dx = (v[idx_ip1] - v[idx_im1]) / (2.0f * dx);
-    float dv_dy = (v[idx_jp1] - v[idx_jm1]) / (2.0f * dy);
-
-    if (i == 0)
-    {
-        du_dx = (u[idx_ip1] - u[idx]) / dx;
-        dv_dx = (v[idx_ip1] - v[idx]) / dx;
-    }
-    else if (i == nx - 1)
-    {
-        du_dx = (u[idx] - u[idx_im1]) / dx;
-        dv_dx = (v[idx] - v[idx_im1]) / dx;
-    }
-    if (j == 0)
-    {
-        du_dy = (u[idx_jp1] - u[idx]) / dy;
-        dv_dy = (v[idx_jp1] - v[idx]) / dy;
-    }
-    else if (j == ny - 1)
-    {
-        du_dy = (u[idx] - u[idx_jm1]) / dy;
-        dv_dy = (v[idx] - v[idx_jm1]) / dy;
-    }
-
-    float div_v = du_dx + dv_dy;
-    tau_xx_out = mu_val * (2.0f * du_dx - (2.0f / 3.0f) * div_v);
-    tau_yy_out = mu_val * (2.0f * dv_dy - (2.0f / 3.0f) * div_v);
-    tau_xy_out = mu_val * (du_dy + dv_dx);
-
-    // 温度梯度 → 热通量
-    float dT_dx = (T[idx_ip1] - T[idx_im1]) / (2.0f * dx);
-    float dT_dy = (T[idx_jp1] - T[idx_jm1]) / (2.0f * dy);
-    if (i == 0)
-        dT_dx = (T[idx_ip1] - T[idx]) / dx;
-    else if (i == nx - 1)
-        dT_dx = (T[idx] - T[idx_im1]) / dx;
-    if (j == 0)
-        dT_dy = (T[idx_jp1] - T[idx]) / dy;
-    else if (j == ny - 1)
-        dT_dy = (T[idx] - T[idx_jm1]) / dy;
-
-    qx_out = -k_val * dT_dx;
-    qy_out = -k_val * dT_dy;
-}
-
-// ===== 融合核函数：粘性项计算 + 扩散步一次完成 =====
-// 原理：每个线程按需重算中心及4邻居的粘性量(tau/q)，结果保持在寄存器中，
-//       消除 5 个中间数组(tau_xx/yy/xy, qx, qy)的全局内存写+读往返。
-//       因原核函数 Compute Throughput 仅 17.84%（严重 memory-bound），
-//       5x 重算的额外计算量在 SM 空闲算力内完全消化。
-// 输出：mu_out(供CFL条件使用)，直接更新 rho_u/rho_v/E/rho_e
+/**
+ * @brief 融合核函数：粘性项计算 + 扩散步一次完成（Shared Memory Tiled 优化版）
+ * @note 优化策略：
+ *   1. Shared Memory Tiling：将 u/v/T/cell_type 加载到共享内存（halo=2），
+ *      消除 stencil 计算中对全局内存的重复访问
+ *   2. 两阶段 tau/q 共享：Phase A 协作计算 tau/q 到共享内存，Phase B 从共享内存读取邻居
+ *   3. 除法→乘法倒数预计算：所有 /(2*dx) 替换为 *inv_2dx
+ *   4. 线程块 32×8：warp 在 x 方向连续 32 元素，完美对齐 128B cache line
+ * @param[in]  u,v,T       原始变量场
+ * @param[out] mu_out      动力粘性系数（供CFL条件使用）
+ * @param[in,out] rho_u,rho_v,E,rho_e 守恒变量（直接更新）
+ * @param[in]  cell_type   网格类型
+ * @param dt   时间步长
+ * @param dx,dy 网格间距
+ * @param nx,ny 网格尺寸
+ *
+ * @par 数值安全前提（调用方须保证，本函数不重复检查）
+ * - T[*] ∈ [MIN_TEMPERATURE, MAX_TEMPERATURE]：由 computePrimitivesKernelInline 保证，
+ *   因此 Sutherland 公式中的 T_clamped 直接读取共享内存值，不再做双侧限幅。
+ */
 __global__ void fusedViscousDiffusionKernel(
     const float *__restrict__ u, const float *__restrict__ v, const float *__restrict__ T,
     float *__restrict__ mu_out,
@@ -2114,87 +2258,251 @@ __global__ void fusedViscousDiffusionKernel(
     const uint8_t *__restrict__ cell_type,
     float dt, float dx, float dy, int nx, int ny)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    // ===== 共享内存声明 =====
+    // u/v/T/cell_type: (VD_BX+4)×(VD_BY+4) = 36×12，halo=2 覆盖邻居的 stencil
+    __shared__ float s_u[VD_SY][VD_SX];
+    __shared__ float s_v[VD_SY][VD_SX];
+    __shared__ float s_T[VD_SY][VD_SX];
+    __shared__ uint8_t s_ct[VD_SY][VD_SX];
+    // tau/q: (VD_BX+2)×(VD_BY+2) = 34×10，halo=1 覆盖散度的 ±1 邻居
+    __shared__ float s_tau_xx[VD_TY][VD_TX];
+    __shared__ float s_tau_yy[VD_TY][VD_TX];
+    __shared__ float s_tau_xy[VD_TY][VD_TX];
+    __shared__ float s_qx[VD_TY][VD_TX];
+    __shared__ float s_qy[VD_TY][VD_TX];
 
-    if (i >= nx || j >= ny)
+    const int tx = threadIdx.x;                    // 线程块内 x 方向线程索引
+    const int ty = threadIdx.y;                    // 线程块内 y 方向线程索引
+    const int thread_id = ty * VD_BX + tx;         // 线程在块内的线性编号（用于协作加载）
+    const int block_origin_i = blockIdx.x * VD_BX; // 本线程块负责的全局网格起始 i 坐标
+    const int block_origin_j = blockIdx.y * VD_BY; // 本线程块负责的全局网格起始 j 坐标
+    const int global_i = block_origin_i + tx;      // 本线程对应的全局网格 i 坐标
+    const int global_j = block_origin_j + ty;      // 本线程对应的全局网格 j 坐标
+
+    // 倒数预计算（消除内核中所有除法）
+    const float inv_2dx = 0.5f / dx;
+    const float inv_2dy = 0.5f / dy;
+    const float inv_dx = 1.0f / dx;
+    const float inv_dy = 1.0f / dy;
+
+    // ===== Phase 0: 协作加载 u/v/T/cell_type 到共享内存 =====
+    // 每个线程循环加载多个元素，确保 (VD_BX+4)×(VD_BY+4) 的 halo 区域被完整填充
+    for (int n = thread_id; n < VD_SX * VD_SY; n += VD_BX * VD_BY)
+    {
+        int tile_i = n % VD_SX;                        // 共享内存 tile 内的 x 位置
+        int tile_j = n / VD_SX;                        // 共享内存 tile 内的 y 位置
+        int src_i = block_origin_i + tile_i - VD_HALO; // 对应的全局 i（含 halo 偏移）
+        int src_j = block_origin_j + tile_j - VD_HALO; // 对应的全局 j（含 halo 偏移）
+        src_i = max(0, min(src_i, nx - 1));            // 边界 clamp
+        src_j = max(0, min(src_j, ny - 1));
+        int src_idx = src_j * nx + src_i;
+        s_u[tile_j][tile_i] = u[src_idx];
+        s_v[tile_j][tile_i] = v[src_idx];
+        s_T[tile_j][tile_i] = T[src_idx];
+        s_ct[tile_j][tile_i] = cell_type[src_idx];
+    }
+    __syncthreads();
+
+    // ===== Phase 1: 写出 mu（每线程处理自己的网格点） =====
+    if (global_i < nx && global_j < ny)
+    {
+        // 本线程在 u/v/T 共享内存 tile 中的坐标（halo 偏移后指向中心区域）
+        int uvt_i = tx + VD_HALO;
+        int uvt_j = ty + VD_HALO;
+        if (s_ct[uvt_j][uvt_i] == CELL_SOLID)
+        {
+            mu_out[global_j * nx + global_i] = 0.0f;
+        }
+        else
+        {
+            // T ∈ [MIN_TEMPERATURE, MAX_TEMPERATURE] 由 computePrimitivesKernelInline 保证
+            float T_val = s_T[uvt_j][uvt_i];
+            float T_ratio = T_val / T_REF; // Sutherland 公式的温度比
+            mu_out[global_j * nx + global_i] = MU_REF * (T_ratio * sqrtf(T_ratio)) * (T_REF + S_SUTHERLAND) / (T_val + S_SUTHERLAND);
+        }
+    }
+
+    // ===== Phase 2: 协作计算 tau/q 到共享内存 =====
+    // tau tile 尺寸 (VD_BX+2)×(VD_BY+2) = 34×10，覆盖全局范围
+    //   [block_origin_i-1, block_origin_i+VD_BX] × [block_origin_j-1, block_origin_j+VD_BY]
+    // tau tile(tau_si, tau_sj) 对应 u/v/T 共享内存索引 (tau_si+1, tau_sj+1)
+    for (int n = thread_id; n < VD_TX * VD_TY; n += VD_BX * VD_BY)
+    {
+        int tau_si = n % VD_TX;                   // tau tile 内的 x 位置
+        int tau_sj = n / VD_TX;                   // tau tile 内的 y 位置
+        int tau_gi = block_origin_i + tau_si - 1; // 此 tau 点的全局 i 坐标
+        int tau_gj = block_origin_j + tau_sj - 1; // 此 tau 点的全局 j 坐标
+        int uvt_i = tau_si + 1;                   // 此 tau 点在 u/v/T 共享内存中的 x 索引（tau halo=1 + uvt halo=2 的偏差为 +1）
+        int uvt_j = tau_sj + 1;                   // 此 tau 点在 u/v/T 共享内存中的 y 索引
+
+        // 域外或固体 → tau/q 置零
+        if (tau_gi < 0 || tau_gi >= nx || tau_gj < 0 || tau_gj >= ny || s_ct[uvt_j][uvt_i] == CELL_SOLID)
+        {
+            s_tau_xx[tau_sj][tau_si] = 0.0f;
+            s_tau_yy[tau_sj][tau_si] = 0.0f;
+            s_tau_xy[tau_sj][tau_si] = 0.0f;
+            s_qx[tau_sj][tau_si] = 0.0f;
+            s_qy[tau_sj][tau_si] = 0.0f;
+            continue;
+        }
+
+        // Sutherland 粘性 + 热导率
+        // T ∈ [MIN_TEMPERATURE, MAX_TEMPERATURE] 由 computePrimitivesKernelInline 保证
+        float T_val = s_T[uvt_j][uvt_i];
+        float T_ratio = T_val / T_REF;
+        float mu_val = MU_REF * (T_ratio * sqrtf(T_ratio)) * (T_REF + S_SUTHERLAND) / (T_val + S_SUTHERLAND);
+        float k_val = mu_val * CP / PRANDTL_NUMBER;
+
+        // =========================================================
+        // 计算速度的梯度 (物理意义: 评分流体层之间的滑动速率)
+        // 这些局部偏导反映了流体微团在这一瞬间的“变形率”。
+        // =========================================================
+        float du_dx_local = (s_u[uvt_j][uvt_i + 1] - s_u[uvt_j][uvt_i - 1]) * inv_2dx;
+        float du_dy_local = (s_u[uvt_j + 1][uvt_i] - s_u[uvt_j - 1][uvt_i]) * inv_2dy;
+        float dv_dx_local = (s_v[uvt_j][uvt_i + 1] - s_v[uvt_j][uvt_i - 1]) * inv_2dx;
+        float dv_dy_local = (s_v[uvt_j + 1][uvt_i] - s_v[uvt_j - 1][uvt_i]) * inv_2dy;
+
+        // 域边界单侧差分（前向/后向差分替代中心差分）
+        if (tau_gi == 0)
+        {
+            du_dx_local = (s_u[uvt_j][uvt_i + 1] - s_u[uvt_j][uvt_i]) * inv_dx;
+            dv_dx_local = (s_v[uvt_j][uvt_i + 1] - s_v[uvt_j][uvt_i]) * inv_dx;
+        }
+        else if (tau_gi == nx - 1)
+        {
+            du_dx_local = (s_u[uvt_j][uvt_i] - s_u[uvt_j][uvt_i - 1]) * inv_dx;
+            dv_dx_local = (s_v[uvt_j][uvt_i] - s_v[uvt_j][uvt_i - 1]) * inv_dx;
+        }
+        if (tau_gj == 0)
+        {
+            du_dy_local = (s_u[uvt_j + 1][uvt_i] - s_u[uvt_j][uvt_i]) * inv_dy;
+            dv_dy_local = (s_v[uvt_j + 1][uvt_i] - s_v[uvt_j][uvt_i]) * inv_dy;
+        }
+        else if (tau_gj == ny - 1)
+        {
+            du_dy_local = (s_u[uvt_j][uvt_i] - s_u[uvt_j - 1][uvt_i]) * inv_dy;
+            dv_dy_local = (s_v[uvt_j][uvt_i] - s_v[uvt_j - 1][uvt_i]) * inv_dy;
+        }
+
+        // =========================================================
+        // 从速度梯度 -> 粘性应力 tau (牛顿粘性定律)
+        // 物理意义: tau 的量纲是 N/m² (Pa)。
+        // 这表示了因为上面求出来的滑动和形变，当前网格表面受到的具体抵抗拉力/摩擦力大小。
+        //
+        // 注: div_v (速度散度) 反映的是体积的“纯膨胀”。
+        // 根据“斯托克斯假设”，粘滞摩擦力不干预纯体积缩放，
+        // 因此要在法向应力中减去膨胀带来的影响 (2/3 * div_v)
+        // =========================================================
+        float div_v = du_dx_local + dv_dy_local;
+        s_tau_xx[tau_sj][tau_si] = mu_val * (2.0f * du_dx_local - (2.0f / 3.0f) * div_v);
+        s_tau_yy[tau_sj][tau_si] = mu_val * (2.0f * dv_dy_local - (2.0f / 3.0f) * div_v);
+        s_tau_xy[tau_sj][tau_si] = mu_val * (du_dy_local + dv_dx_local);
+
+        // =========================================================
+        // 温度梯度计算 -> 头/尾热通量 q (傅里叶热传导定律)
+        // 物理意义: q 的量纲是 W/m²。即当前网格表面由于温度差，传进传出的真实热流功率密度。
+        // =========================================================
+        float dT_dx_local = (s_T[uvt_j][uvt_i + 1] - s_T[uvt_j][uvt_i - 1]) * inv_2dx;
+        float dT_dy_local = (s_T[uvt_j + 1][uvt_i] - s_T[uvt_j - 1][uvt_i]) * inv_2dy;
+        if (tau_gi == 0)
+            dT_dx_local = (s_T[uvt_j][uvt_i + 1] - s_T[uvt_j][uvt_i]) * inv_dx;
+        else if (tau_gi == nx - 1)
+            dT_dx_local = (s_T[uvt_j][uvt_i] - s_T[uvt_j][uvt_i - 1]) * inv_dx;
+        if (tau_gj == 0)
+            dT_dy_local = (s_T[uvt_j + 1][uvt_i] - s_T[uvt_j][uvt_i]) * inv_dy;
+        else if (tau_gj == ny - 1)
+            dT_dy_local = (s_T[uvt_j][uvt_i] - s_T[uvt_j - 1][uvt_i]) * inv_dy;
+
+        s_qx[tau_sj][tau_si] = -k_val * dT_dx_local;
+        s_qy[tau_sj][tau_si] = -k_val * dT_dy_local;
+    }
+    __syncthreads();
+
+    // ===== Phase 3: 散度计算 + 时间积分（仅内部流体网格） =====
+    if (global_i >= nx || global_j >= ny)
         return;
 
-    int idx = j * nx + i;
-
-    // ===== Phase 1: 计算本单元粘性项，写出 mu(始终需要) =====
-    float tau_xx_c, tau_yy_c, tau_xy_c, qx_c, qy_c, mu_c;
-    computeViscousAtPoint(u, v, T, cell_type, i, j, nx, ny, dx, dy,
-                          tau_xx_c, tau_yy_c, tau_xy_c, qx_c, qy_c, mu_c);
-    mu_out[idx] = mu_c;
-
-    // ===== Phase 2: 扩散步(跳过边界/固体/虚拟网格) =====
-    if (cell_type[idx] == CELL_SOLID || cell_type[idx] == CELL_GHOST)
+    // 本线程在 u/v/T 共享内存 tile 中的坐标
+    const int uvt_i = tx + VD_HALO;
+    const int uvt_j = ty + VD_HALO;
+    if (s_ct[uvt_j][uvt_i] == CELL_SOLID || s_ct[uvt_j][uvt_i] == CELL_GHOST)
         return;
-    if (i == 0 || i == nx - 1 || j == 0 || j == ny - 1)
+    if (global_i == 0 || global_i == nx - 1 || global_j == 0 || global_j == ny - 1)
         return;
 
-    // --- 重算 i+1 邻居粘性项 ---
-    float tau_xx_ip1, tau_yy_ip1, tau_xy_ip1, qx_ip1, qy_ip1, mu_tmp;
-    computeViscousAtPoint(u, v, T, cell_type, i + 1, j, nx, ny, dx, dy,
-                          tau_xx_ip1, tau_yy_ip1, tau_xy_ip1, qx_ip1, qy_ip1, mu_tmp);
+    const int idx = global_j * nx + global_i;
 
-    // --- 重算 i-1 邻居粘性项 ---
-    float tau_xx_im1, tau_yy_im1, tau_xy_im1, qx_im1, qy_im1;
-    computeViscousAtPoint(u, v, T, cell_type, i - 1, j, nx, ny, dx, dy,
-                          tau_xx_im1, tau_yy_im1, tau_xy_im1, qx_im1, qy_im1, mu_tmp);
+    // 本线程在 tau tile 中的坐标（tau tile halo=1，所以偏移 +1）
+    const int tau_li = tx + 1;
+    const int tau_lj = ty + 1;
 
-    // --- 重算 j+1 邻居粘性项 ---
-    float tau_xx_jp1, tau_yy_jp1, tau_xy_jp1, qx_jp1, qy_jp1;
-    computeViscousAtPoint(u, v, T, cell_type, i, j + 1, nx, ny, dx, dy,
-                          tau_xx_jp1, tau_yy_jp1, tau_xy_jp1, qx_jp1, qy_jp1, mu_tmp);
+    // =========================================================
+    // 应力张量的散度 (物理意义: 把面上的力(N/m²) 转化为 体积截留力密度(N/m³))
+    // 这是真正加在当前网格上，能改变它动量的净拉力和净摩擦力。
+    // 例如 dtau_xx_dx 代表: (微团右侧受到的向前拉力 - 左边受到的向前拉力) / dx
+    // =========================================================
+    float dtau_xx_dx = (s_tau_xx[tau_lj][tau_li + 1] - s_tau_xx[tau_lj][tau_li - 1]) * inv_2dx;
+    float dtau_xy_dy = (s_tau_xy[tau_lj + 1][tau_li] - s_tau_xy[tau_lj - 1][tau_li]) * inv_2dy;
+    float dtau_xy_dx = (s_tau_xy[tau_lj][tau_li + 1] - s_tau_xy[tau_lj][tau_li - 1]) * inv_2dx;
+    float dtau_yy_dy = (s_tau_yy[tau_lj + 1][tau_li] - s_tau_yy[tau_lj - 1][tau_li]) * inv_2dy;
 
-    // --- 重算 j-1 邻居粘性项 ---
-    float tau_xx_jm1, tau_yy_jm1, tau_xy_jm1, qx_jm1, qy_jm1;
-    computeViscousAtPoint(u, v, T, cell_type, i, j - 1, nx, ny, dx, dy,
-                          tau_xx_jm1, tau_yy_jm1, tau_xy_jm1, qx_jm1, qy_jm1, mu_tmp);
+    // =========================================================
+    // 热通量散度 (物理意义: 把面上的热流(W/m²) 转化为 体积截留热功率密度(W/m³))
+    // 正值代表热量从当前网格流失。
+    // =========================================================
+    float dqx_dx = (s_qx[tau_lj][tau_li + 1] - s_qx[tau_lj][tau_li - 1]) * inv_2dx;
+    float dqy_dy = (s_qy[tau_lj + 1][tau_li] - s_qy[tau_lj - 1][tau_li]) * inv_2dy;
 
-    // ===== 应力张量散度(动量方程右端项) =====
-    float dtau_xx_dx = (tau_xx_ip1 - tau_xx_im1) / (2.0f * dx);
-    float dtau_xy_dy = (tau_xy_jp1 - tau_xy_jm1) / (2.0f * dy);
-    float dtau_xy_dx = (tau_xy_ip1 - tau_xy_im1) / (2.0f * dx);
-    float dtau_yy_dy = (tau_yy_jp1 - tau_yy_jm1) / (2.0f * dy);
+    // =========================================================
+    // 速度梯度（中心单元，从共享内存读取，用于计算粘性耗散 Phi）
+    // =========================================================
+    float du_dx = (s_u[uvt_j][uvt_i + 1] - s_u[uvt_j][uvt_i - 1]) * inv_2dx;
+    float du_dy = (s_u[uvt_j + 1][uvt_i] - s_u[uvt_j - 1][uvt_i]) * inv_2dy;
+    float dv_dx = (s_v[uvt_j][uvt_i + 1] - s_v[uvt_j][uvt_i - 1]) * inv_2dx;
+    float dv_dy = (s_v[uvt_j + 1][uvt_i] - s_v[uvt_j - 1][uvt_i]) * inv_2dy;
 
-    // ===== 热通量散度 =====
-    float dqx_dx = (qx_ip1 - qx_im1) / (2.0f * dx);
-    float dqy_dy = (qy_jp1 - qy_jm1) / (2.0f * dy);
-
-    // ===== 速度梯度(中心单元，用于粘性耗散) =====
-    int idx_im1 = j * nx + (i - 1);
-    int idx_ip1 = j * nx + (i + 1);
-    int idx_jm1 = (j - 1) * nx + i;
-    int idx_jp1 = (j + 1) * nx + i;
-
-    float du_dx = (u[idx_ip1] - u[idx_im1]) / (2.0f * dx);
-    float du_dy = (u[idx_jp1] - u[idx_jm1]) / (2.0f * dy);
-    float dv_dx = (v[idx_ip1] - v[idx_im1]) / (2.0f * dx);
-    float dv_dy = (v[idx_jp1] - v[idx_jm1]) / (2.0f * dy);
-
-    // ===== 粘性耗散 Phi = tau : grad(v) =====
+    // =========================================================
+    // 计算 粘性耗散 \Phi = tau : grad(v)
+    // 物理意义：粘性应力不仅改变动能，互相摩擦的过程中会有机械能转化为热能(这部分不可逆)。
+    // 它等于 摩擦应力(tau) 乘 速度差。求出的量纲是 W/m³，代表摩擦生热的发热功率。
+    // =========================================================
+    float tau_xx_c = s_tau_xx[tau_lj][tau_li];
+    float tau_yy_c = s_tau_yy[tau_lj][tau_li];
+    float tau_xy_c = s_tau_xy[tau_lj][tau_li];
     float Phi = tau_xx_c * du_dx + tau_yy_c * dv_dy + tau_xy_c * (du_dy + dv_dx);
 
-    // ===== 动量右端项 =====
+    // =========================================================
+    // 动量方程右端项 (N/m³)
+    // X方向：拉伸力导致的净力 dtau_xx_dx + 侧向摩擦力导致的净力 dtau_xy_dy
+    // =========================================================
     float rhs_rho_u = dtau_xx_dx + dtau_xy_dy;
     float rhs_rho_v = dtau_xy_dx + dtau_yy_dy;
 
-    // ===== 粘性应力做功项 div(tau·v) =====
-    float work_x_ip1 = u[idx_ip1] * tau_xx_ip1 + v[idx_ip1] * tau_xy_ip1;
-    float work_x_im1 = u[idx_im1] * tau_xx_im1 + v[idx_im1] * tau_xy_im1;
-    float work_y_jp1 = u[idx_jp1] * tau_xy_jp1 + v[idx_jp1] * tau_yy_jp1;
-    float work_y_jm1 = u[idx_jm1] * tau_xy_jm1 + v[idx_jm1] * tau_yy_jm1;
+    // =========================================================
+    // 计算做功项散度 \nabla \cdot (tau \cdot v) (用于总能量求解)
+    // 物理意义: work 变量是表面受到的粘性拉力和摩擦力，推着该表面上的流体微团运动，所传入/传出的机械能功率。
+    // 差分 dwork_dx/dy 求出体积内真正截留下的“外力做总功” (W/m³)。
+    // =========================================================
+    float work_x_ip1 = s_u[uvt_j][uvt_i + 1] * s_tau_xx[tau_lj][tau_li + 1] + s_v[uvt_j][uvt_i + 1] * s_tau_xy[tau_lj][tau_li + 1];
+    float work_x_im1 = s_u[uvt_j][uvt_i - 1] * s_tau_xx[tau_lj][tau_li - 1] + s_v[uvt_j][uvt_i - 1] * s_tau_xy[tau_lj][tau_li - 1];
+    float work_y_jp1 = s_u[uvt_j + 1][uvt_i] * s_tau_xy[tau_lj + 1][tau_li] + s_v[uvt_j + 1][uvt_i] * s_tau_yy[tau_lj + 1][tau_li];
+    float work_y_jm1 = s_u[uvt_j - 1][uvt_i] * s_tau_xy[tau_lj - 1][tau_li] + s_v[uvt_j - 1][uvt_i] * s_tau_yy[tau_lj - 1][tau_li];
 
-    float dwork_dx = (work_x_ip1 - work_x_im1) / (2.0f * dx);
-    float dwork_dy = (work_y_jp1 - work_y_jm1) / (2.0f * dy);
+    float dwork_dx = (work_x_ip1 - work_x_im1) * inv_2dx;
+    float dwork_dy = (work_y_jp1 - work_y_jm1) * inv_2dy;
 
-    // ===== 总能量右端项 = -div(q) + div(tau·v) =====
+    // =========================================================
+    // 总能量更新 (总能量 E = 气体内能 + 宏观动能)
+    // 根据物理方程：流体得到/失去总能量 = (由于粘性被拉着跑做功截留下来的的总功) - (传导走的热量)
+    // =========================================================
     float rhs_E = -dqx_dx - dqy_dy + dwork_dx + dwork_dy;
 
-    // ===== 内能右端项 = -div(q) + Phi =====
+    // =========================================================
+    // 内能更新 (双能量法)
+    // 为什么这里不要总功，而用了极度发热项 Phi？
+    // 因为 总做功(dwork) = 改变流体宏观动能的部分 + 纯粹摩擦生热产生的内能(Phi)
+    // 内能只负责接收纯由摩擦生热的热量，因此用 Phi 替代了 dwork。
+    // =========================================================
     float rhs_rho_e = -dqx_dx - dqy_dy + Phi;
 
     // ===== 欧拉前向时间积分 =====
@@ -2206,10 +2514,35 @@ __global__ void fusedViscousDiffusionKernel(
 #pragma endregion
 #pragma endregion
 
+/**
+ * @brief SSP-RK2 凸组合混合核函数
+ * @details 对五个守恒变量执行: dst[i] = 0.5 * dst[i] + 0.5 * src[i]
+ *          其中 dst 保存 U^n（初始状态），src 保存 U**（Stage 2 的欧拉步结果）
+ * @param n 元素总数
+ */
+__global__ void sspRK2BlendKernel(
+    float *__restrict__ rho, float *__restrict__ rho_u,
+    float *__restrict__ rho_v, float *__restrict__ E,
+    float *__restrict__ rho_e,
+    const float *__restrict__ rho_rk, const float *__restrict__ rho_u_rk,
+    const float *__restrict__ rho_v_rk, const float *__restrict__ E_rk,
+    const float *__restrict__ rho_e_rk,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        rho[i] = 0.5f * rho[i] + 0.5f * rho_rk[i];
+        rho_u[i] = 0.5f * rho_u[i] + 0.5f * rho_u_rk[i];
+        rho_v[i] = 0.5f * rho_v[i] + 0.5f * rho_v_rk[i];
+        E[i] = 0.5f * E[i] + 0.5f * E_rk[i];
+        rho_e[i] = 0.5f * rho_e[i] + 0.5f * rho_e_rk[i];
+    }
+}
+
 #pragma region 并行计算任务发射函数
 #pragma region 无条件初始化
-// 功能:启动初始化核函数
-// 说明:将所有网格初始化为来流条件
+/** @brief 启动初始化核函数，将所有网格初始化为来流条件 */
 void CFDSolver::launchInitializeKernel(float *rho, float *rho_u, float *rho_v, float *E, float *rho_e,
                                        const SimParams &params, int nx, int ny)
 {
@@ -2222,8 +2555,7 @@ void CFDSolver::launchInitializeKernel(float *rho, float *rho_u, float *rho_v, f
     CUDA_CHECK(cudaGetLastError());
 }
 
-// 功能:启动SDF计算核函数
-// 说明:计算带符号距离场并初始化网格类型
+/** @brief 启动SDF计算核函数，计算带符号距离场并初始化网格类型 */
 void CFDSolver::launchComputeSDFKernel(float *sdf, uint8_t *cell_type,
                                        const SimParams &params, int nx, int ny)
 {
@@ -2239,8 +2571,7 @@ void CFDSolver::launchComputeSDFKernel(float *sdf, uint8_t *cell_type,
 #pragma endregion
 
 #pragma region 无粘性条件
-// 功能:启动原始变量计算核函数
-// 说明:从守恒变量计算原始变量(使用双能量法)
+/** @brief 启动原始变量计算核函数，从守恒变量计算原始变量（使用双能量法） */
 void CFDSolver::launchComputePrimitivesKernel(const float *rho, const float *rho_u,
                                               const float *rho_v, const float *E,
                                               const float *rho_e,
@@ -2254,9 +2585,11 @@ void CFDSolver::launchComputePrimitivesKernel(const float *rho, const float *rho
     CUDA_CHECK(cudaGetLastError());
 }
 
-// 功能:启动通量计算核函数
-// 说明:使用MUSCL重构和HLLC Riemann求解器计算数值通量
-//       仅需密度(rho)和原始变量(u,v,p)，不再传入未使用的守恒量指针
+/**
+ * @brief 启动通量计算核函数
+ * @note 使用MUSCL重构和HLLC Riemann求解器计算数值通量，
+ *       仅需密度(rho)和原始变量(u,v,p)
+ */
 void CFDSolver::launchComputeFluxesKernel(const float *rho,
                                           const float *u, const float *v,
                                           const float *p,
@@ -2279,8 +2612,7 @@ void CFDSolver::launchComputeFluxesKernel(const float *rho,
     CUDA_CHECK(cudaGetLastError());
 }
 
-// 功能:启动更新核函数
-// 说明:使用有限体积法和双能量法更新守恒变量，复用已计算的原始变量(u,v,p)
+/** @brief 启动更新核函数，使用有限体积法和双能量法更新守恒变量，复用已计算的原始变量(u,v,p) */
 void CFDSolver::launchUpdateKernel(const float *rho, const float *rho_u,
                                    const float *rho_v, const float *E, const float *rho_e,
                                    const float *u, const float *v, const float *p,
@@ -2308,8 +2640,7 @@ void CFDSolver::launchUpdateKernel(const float *rho, const float *rho_u,
     CUDA_CHECK(cudaGetLastError());
 }
 
-// 功能:启动边界条件应用核函数
-// 说明:处理所有类型的边界条件(流入/流出/上下边界/固体壁面)
+/** @brief 启动边界条件应用核函数，处理所有类型的边界条件（流入/流出/上下边界/固体壁面） */
 void CFDSolver::launchApplyBoundaryConditionsKernel(float *rho, float *rho_u, float *rho_v, float *E,
                                                     float *rho_e,
                                                     const uint8_t *cell_type, const float *sdf,
@@ -2328,9 +2659,10 @@ void CFDSolver::launchApplyBoundaryConditionsKernel(float *rho, float *rho_u, fl
 #pragma endregion
 
 #pragma region 有粘性条件
-// 功能:启动融合粘性-扩散核函数(替代 ViscousTerms + DiffusionStep 双核函数调用)
-// 说明:每线程按需重算邻居粘性量，消除 tau/q 5个中间数组的全局内存往返
-//       节省约 40-50% 的显存带宽
+/**
+ * @brief 启动融合粘性-扩散核函数（替代 ViscousTerms + DiffusionStep 双核函数调用）
+ * @note 每线程按需重算邻居粘性量，消除 tau/q 中间数组的全局内存往返
+ */
 void CFDSolver::launchFusedViscousDiffusionKernel(
     const float *u, const float *v, const float *T,
     float *mu,
@@ -2338,7 +2670,7 @@ void CFDSolver::launchFusedViscousDiffusionKernel(
     const uint8_t *cell_type,
     float dt, float dx, float dy, int nx, int ny)
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(VD_BX, VD_BY);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     fusedViscousDiffusionKernel<<<grid, block>>>(u, v, T, mu,
@@ -2351,7 +2683,13 @@ void CFDSolver::launchFusedViscousDiffusionKernel(
 
 #pragma region 统计工具
 
-// 核函数:计算运动粘性系数 nu = mu/rho
+/**
+ * @brief 计算运动粘性系数 nu = mu / rho
+ * @param[in] mu 动力粘性系数数组
+ * @param[in] rho 密度数组
+ * @param[out] nu_out 运动粘性系数输出数组
+ * @param[in] n 元素总数
+ */
 __global__ void computeViscousNumberKernel(const float *mu, const float *rho,
                                            float *nu_out, int n)
 {
@@ -2362,8 +2700,15 @@ __global__ void computeViscousNumberKernel(const float *mu, const float *rho,
     }
 }
 
-// 功能:计算最大运动粘性系数(用于粘性CFL条件)
-// 优化:使用预分配缓冲区,无动态分配,无显式同步
+/**
+ * @brief 计算最大运动粘性系数（用于粘性CFL条件）
+ * @details 使用预分配缓冲区进行CUB归约，无动态分配，无显式同步
+ * @param[in] mu 动力粘性系数数组
+ * @param[in] rho 密度数组
+ * @param[in] nx 网格X方向尺寸
+ * @param[in] ny 网格Y方向尺寸
+ * @return 最大运动粘性系数值
+ */
 float CFDSolver::launchComputeMaxViscousNumber(const float *mu, const float *rho, int nx, int ny)
 {
     int n = nx * ny;
@@ -2386,7 +2731,15 @@ float CFDSolver::launchComputeMaxViscousNumber(const float *mu, const float *rho
     return result;
 }
 
-// 核函数:计算波速 |v| + c
+/**
+ * @brief 计算波速 |v| + c
+ * @param[in] u X方向速度
+ * @param[in] v Y方向速度
+ * @param[in] p 压力
+ * @param[in] rho 密度
+ * @param[out] speed_out 波速输出数组
+ * @param[in] n 元素总数
+ */
 __global__ void computeWaveSpeedKernel(const float *u, const float *v,
                                        const float *p, const float *rho,
                                        float *speed_out, int n)
@@ -2399,8 +2752,17 @@ __global__ void computeWaveSpeedKernel(const float *u, const float *v,
     }
 }
 
-// 功能:计算最大波速(用于对流CFL条件)
-// 优化:使用预分配缓冲区,无动态分配,无显式同步
+/**
+ * @brief 计算最大波速（用于对流CFL条件）
+ * @details 使用预分配缓冲区进行CUB归约，无动态分配，无显式同步
+ * @param[in] u X方向速度
+ * @param[in] v Y方向速度
+ * @param[in] p 压力
+ * @param[in] rho 密度
+ * @param[in] nx 网格X方向尺寸
+ * @param[in] ny 网格Y方向尺寸
+ * @return 最大波速值
+ */
 float CFDSolver::launchComputeMaxWaveSpeed(const float *u, const float *v, const float *p,
                                            const float *rho, int nx, int ny)
 {
@@ -2422,7 +2784,15 @@ float CFDSolver::launchComputeMaxWaveSpeed(const float *u, const float *v, const
     return result;
 }
 
-// 核函数:计算马赫数 |v| / c
+/**
+ * @brief 计算马赫数 |v| / c
+ * @param[in] u X方向速度
+ * @param[in] v Y方向速度
+ * @param[in] p 压力（由 computePrimitivesKernelInline 保证 ≥ MIN_PRESSURE）
+ * @param[in] rho 密度
+ * @param[out] mach_out 马赫数输出数组
+ * @param[in] n 元素总数
+ */
 __global__ void computeMachNumberKernel(const float *u, const float *v,
                                         const float *p, const float *rho,
                                         float *mach_out, int n)
@@ -2432,13 +2802,22 @@ __global__ void computeMachNumberKernel(const float *u, const float *v,
     {
         float rho_val = rho[i] + 1e-10f;
         float speed = sqrtf(u[i] * u[i] + v[i] * v[i]);
-        float c = sqrtf(GAMMA * fmaxf(p[i], MIN_PRESSURE) / rho_val);
+        float c = sqrtf(GAMMA * p[i] / rho_val); // p ≥ MIN_PRESSURE 由前置条件保证
         mach_out[i] = speed / (c + 1e-10f);
     }
 }
 
-// 功能:计算最大马赫数
-// 优化:使用预分配缓冲区,无动态分配,无显式同步
+/**
+ * @brief 计算最大马赫数
+ * @details 使用预分配缓冲区进行CUB归约，无动态分配，无显式同步
+ * @param[in] u X方向速度
+ * @param[in] v Y方向速度
+ * @param[in] p 压力
+ * @param[in] rho 密度
+ * @param[in] nx 网格X方向尺寸
+ * @param[in] ny 网格Y方向尺寸
+ * @return 最大马赫数值
+ */
 float CFDSolver::launchComputeMaxMach(const float *u, const float *v, const float *p,
                                       const float *rho, int nx, int ny)
 {
@@ -2460,9 +2839,13 @@ float CFDSolver::launchComputeMaxMach(const float *u, const float *v, const floa
     return result;
 }
 
-// 功能:使用CUB库计算最大温度(直接对原始数组归约)
-// 输入:温度场T，网格尺寸
-// 输出:最大温度值
+/**
+ * @brief 使用CUB库计算最大温度（直接对原始数组归约）
+ * @param[in] T 温度场
+ * @param[in] nx 网格X方向尺寸
+ * @param[in] ny 网格Y方向尺寸
+ * @return 最大温度值
+ */
 float CFDSolver::launchComputeMaxTemperature(const float *T, int nx, int ny)
 {
     int n = nx * ny;
@@ -2501,19 +2884,19 @@ float CFDSolver::launchComputeMaxTemperature(const float *T, int nx, int ny)
 
 #pragma region solver类的公开接口实现
 #pragma region solver类的初始化
-// 功能:求解器构造函数
-// 说明:初始化为空状态，需要调用initialize()分配内存
+/** @brief 求解器构造函数，初始化为空状态，需要调用 initialize() 分配内存 */
 CFDSolver::CFDSolver() {}
 
-// 功能:求解器析构函数
-// 说明:自动释放所有显存
+/** @brief 求解器析构函数，自动释放所有显存 */
 CFDSolver::~CFDSolver()
 {
     freeMemory();
 }
 
-// 功能:分配所有GPU显存
-// 说明:根据网格尺寸 _nx, _ny 分配守恒变量、通量、辅助变量等数组
+/**
+ * @brief 分配所有GPU显存
+ * @details 根据网格尺寸 _nx, _ny 分配守恒变量、通量、辅助变量等数组
+ */
 void CFDSolver::allocateMemory()
 {
     if (_nx <= 0 || _ny <= 0)
@@ -2535,6 +2918,13 @@ void CFDSolver::allocateMemory()
     CUDA_CHECK(cudaMalloc(&d_rho_v_new_, size));
     CUDA_CHECK(cudaMalloc(&d_E_new_, size));
     CUDA_CHECK(cudaMalloc(&d_rho_e_new_, size));
+
+    // 2b. 分配SSP-RK2第二阶段缓冲区
+    CUDA_CHECK(cudaMalloc(&d_rho_rk_, size));
+    CUDA_CHECK(cudaMalloc(&d_rho_u_rk_, size));
+    CUDA_CHECK(cudaMalloc(&d_rho_v_rk_, size));
+    CUDA_CHECK(cudaMalloc(&d_E_rk_, size));
+    CUDA_CHECK(cudaMalloc(&d_rho_e_rk_, size));
 
     // 3. 分配原始变量
     CUDA_CHECK(cudaMalloc(&d_u_, size));
@@ -2604,7 +2994,7 @@ void CFDSolver::allocateMemory()
     h_pinnedReduction_[1] = 0.0f;
 }
 
-// 功能:释放所有GPU显存
+/** @brief 释放所有GPU显存 */
 void CFDSolver::freeMemory()
 {
     // 释放守恒变量
@@ -2630,6 +3020,18 @@ void CFDSolver::freeMemory()
         cudaFree(d_E_new_);
     if (d_rho_e_new_)
         cudaFree(d_rho_e_new_);
+
+    // 释放SSP-RK2缓冲区
+    if (d_rho_rk_)
+        cudaFree(d_rho_rk_);
+    if (d_rho_u_rk_)
+        cudaFree(d_rho_u_rk_);
+    if (d_rho_v_rk_)
+        cudaFree(d_rho_v_rk_);
+    if (d_E_rk_)
+        cudaFree(d_E_rk_);
+    if (d_rho_e_rk_)
+        cudaFree(d_rho_e_rk_);
 
     // 释放原始变量
     if (d_u_)
@@ -2692,6 +3094,7 @@ void CFDSolver::freeMemory()
     // 置空所有指针(防止重复释放)
     d_rho_ = d_rho_u_ = d_rho_v_ = d_E_ = d_rho_e_ = nullptr;
     d_rho_new_ = d_rho_u_new_ = d_rho_v_new_ = d_E_new_ = d_rho_e_new_ = nullptr;
+    d_rho_rk_ = d_rho_u_rk_ = d_rho_v_rk_ = d_E_rk_ = d_rho_e_rk_ = nullptr;
     d_u_ = d_v_ = d_p_ = d_T_ = nullptr;
     d_cell_type_ = nullptr;
     d_sdf_ = nullptr;
@@ -2705,9 +3108,11 @@ void CFDSolver::freeMemory()
     h_pinnedReduction_ = nullptr;
 }
 
-// 功能:初始化求解器
-// 输入:仿真参数 params(包含网格尺寸、来流条件等)
-// 说明:设置网格尺寸，分配显存，调用reset初始化流场
+/**
+ * @brief 初始化求解器
+ * @details 设置网格尺寸，分配显存，调用 reset() 初始化流场
+ * @param[in] params 仿真参数（包含网格尺寸、来流条件等）
+ */
 void CFDSolver::initialize(const SimParams &params)
 {
     _nx = params.nx;
@@ -2719,9 +3124,12 @@ void CFDSolver::initialize(const SimParams &params)
     reset(params); // 初始化流场
 }
 
-// 功能:调整网格分辨率
-// 输入:新的网格尺寸 nx, ny
-// 说明:如果尺寸改变，重新分配显存
+/**
+ * @brief 调整网格分辨率
+ * @details 如果尺寸改变，重新分配显存
+ * @param[in] nx 新的网格X方向尺寸
+ * @param[in] ny 新的网格Y方向尺寸
+ */
 void CFDSolver::resize(int nx, int ny)
 {
     if (nx == _nx && ny == _ny)
@@ -2734,9 +3142,11 @@ void CFDSolver::resize(int nx, int ny)
     allocateMemory();
 }
 
-// 功能:重置流场到初始状态
-// 输入:仿真参数 params
-// 说明:将所有网格初始化为来流条件，计算SDF，应用边界条件
+/**
+ * @brief 重置流场到初始状态
+ * @details 将所有网格初始化为来流条件，计算SDF，应用边界条件
+ * @param[in] params 仿真参数
+ */
 void CFDSolver::reset(const SimParams &params)
 {
     // 1. 初始化为来流(包括内能)
@@ -2765,11 +3175,13 @@ void CFDSolver::reset(const SimParams &params)
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-// 功能:动态更新障碍物几何（不重置仿真状态）
-// 输入:仿真参数 params（可包含位置、大小、旋转、形状、翼角度的任意变化）
-// 说明:重新计算SDF和网格类型，对新暴露的流体区域填充真空，
-//      原本在障碍物内部的流体区域守恒变量保持不变（边界条件内核会正确处理），
-//      然后重新应用边界条件和计算原始变量，确保下一步仿真正常进行
+/**
+ * @brief 动态更新障碍物几何（不重置仿真状态）
+ * @details 重新计算SDF和网格类型，对新暴露的流体区域填充真空，
+ *          原本在障碍物内部的流体区域守恒变量保持不变（边界条件内核会正确处理），
+ *          然后重新应用边界条件和计算原始变量
+ * @param[in] params 仿真参数（可包含位置、大小、旋转、形状、翼角度的任意变化）
+ */
 void CFDSolver::updateObstacleGeometry(const SimParams &params)
 {
     dim3 block(BLOCK_SIZE, BLOCK_SIZE);
@@ -2799,9 +3211,12 @@ void CFDSolver::updateObstacleGeometry(const SimParams &params)
 #pragma endregion
 
 #pragma region solver类计算链顶层的计算函数
-// 功能:将归约核函数+异步D→H回传排入GPU流，不阻塞CPU
-// 设计:所有GPU工作背靠背排入流中，消除原来两次同步cudaMemcpy导致的GPU空闲气泡
-//       调用方负责在读取结果前确保GPU已同步
+/**
+ * @brief 将归约核函数+异步D→H回传排入GPU流，不阻塞CPU
+ * @details 所有GPU工作背靠背排入流中，消除原来两次同步cudaMemcpy导致的GPU空闲气泡。
+ *          调用方负责在读取结果前确保GPU已同步
+ * @param[in] params 仿真参数
+ */
 void CFDSolver::queueTimeStepComputation(const SimParams &params)
 {
     int n = _nx * _ny;
@@ -2840,8 +3255,12 @@ void CFDSolver::queueTimeStepComputation(const SimParams &params)
     // 不同步 — GPU继续执行，CPU立即返回
 }
 
-// 功能:从Pinned Memory读取已完成的异步归约结果，计算CFL时间步长
-// 前置条件：queueTimeStepComputation()已调用且GPU已同步
+/**
+ * @brief 从Pinned Memory读取已完成的异步归约结果，计算CFL时间步长
+ * @pre queueTimeStepComputation() 已调用且GPU已同步
+ * @param[in] params 仿真参数
+ * @return CFL时间步长
+ */
 float CFDSolver::readTimeStepResult(const SimParams &params) const
 {
     float max_speed = h_pinnedReduction_[0];
@@ -2859,10 +3278,12 @@ float CFDSolver::readTimeStepResult(const SimParams &params) const
     return dt;
 }
 
-// 功能:计算稳定时间步长（同步版本，用于首帧或重置后的一次性计算）
-// 输入:仿真参数 params
-// 输出:满足CFL条件的时间步长 dt
-// 说明:同时考虑对流CFL和扩散CFL条件
+/**
+ * @brief 计算稳定时间步长（同步版本，用于首帧或重置后的一次性计算）
+ * @details 同时考虑对流CFL和扩散CFL条件
+ * @param[in] params 仿真参数
+ * @return 满足CFL条件的时间步长 dt
+ */
 float CFDSolver::computeStableTimeStep(const SimParams &params)
 {
     queueTimeStepComputation(params);
@@ -2870,35 +3291,42 @@ float CFDSolver::computeStableTimeStep(const SimParams &params)
     return readTimeStepResult(params);
 }
 
-// 功能:执行单步时间推进
-// 输入输出:仿真参数 params(会更新时间和步数)
-// 说明:根据是否启用粘性选择不同的求解策略
+/**
+/**
+ * @brief 执行单步时间推进（SSP-RK2 时间积分）
+ * @details SSP-RK2（强保TVD的二阶Runge-Kutta）匹配MUSCL二阶空间重构：
+ *   Stage 1: U* = U^n + dt * L(U^n)
+ *   Stage 2: U^{n+1} = 0.5 * U^n + 0.5 * (U* + dt * L(U*))
+ * 粘性项仍采用Strang算子分裂（扩散半步使用前向欧拉）
+ * @param[in,out] params 仿真参数（会更新时间和步数）
+ */
 void CFDSolver::step(SimParams &params)
 {
     // 注意: 原始变量(d_u_, d_v_, d_p_, d_T_)在进入此函数时已由
     //       reset() 或上一步 step() 结尾的 computePrimitives 计算完毕，
     //       因此无需在函数开头重复计算
 
+    int n = _nx * _ny;
+    dim3 blendBlock(256);
+    dim3 blendGrid((n + blendBlock.x - 1) / blendBlock.x);
+
     if (params.enable_viscosity)
     {
-        // ========== Navier-Stokes求解器(Strang算子分裂) ==========
-        // Strang分裂将一个时间步分为三部分:
-        // 1. 扩散半步(dt/2)
-        // 2. 对流全步(dt)
-        // 3. 扩散半步(dt/2)
-        // 这样做二阶精度且保持稳定性
+        // ========== Navier-Stokes求解器(Strang算子分裂 + SSP-RK2对流) ==========
 
-        // 步骤1: 扩散半步(使用已有的原始变量)
-        // 融合核函数: 单次启动完成粘性项计算+扩散积分，消除中间数组的全局内存往返
+        // 步骤1: 扩散半步(dt/2)（使用已有的原始变量）
         launchFusedViscousDiffusionKernel(d_u_, d_v_, d_T_,
                                           d_mu_,
                                           d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                           d_cell_type_,
                                           params.dt * 0.5f, params.dx, params.dy, _nx, _ny);
 
-        // 步骤2: 对流全步(扩散半步修改了守恒变量，需重新计算原始变量)
+        // 步骤2: SSP-RK2 对流全步
+        // 扩散半步修改了守恒变量(in-place)，重新计算原始变量
         launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                       d_u_, d_v_, d_p_, d_T_, _nx, _ny);
+
+        // --- Stage 1: U* = U^n + dt * L(U^n) → d_rho_new_ ---
         launchComputeFluxesKernel(d_rho_, d_u_, d_v_, d_p_, d_cell_type_,
                                   d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
                                   d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
@@ -2910,17 +3338,36 @@ void CFDSolver::step(SimParams &params)
                            d_cell_type_,
                            d_rho_new_, d_rho_u_new_, d_rho_v_new_, d_E_new_, d_rho_e_new_,
                            params, _nx, _ny);
-        // 交换指针(双缓冲)
-        std::swap(d_rho_, d_rho_new_);
-        std::swap(d_rho_u_, d_rho_u_new_);
-        std::swap(d_rho_v_, d_rho_v_new_);
-        std::swap(d_E_, d_E_new_);
-        std::swap(d_rho_e_, d_rho_e_new_);
 
-        // 步骤3: 扩散半步(对流步修改了守恒变量，需重新计算原始变量)
+        // U* 需要边界条件和原始变量，才能正确计算 Stage 2 的通量
+        launchApplyBoundaryConditionsKernel(d_rho_new_, d_rho_u_new_, d_rho_v_new_, d_E_new_, d_rho_e_new_,
+                                            d_cell_type_, d_sdf_, params, _nx, _ny);
+        launchComputePrimitivesKernel(d_rho_new_, d_rho_u_new_, d_rho_v_new_, d_E_new_, d_rho_e_new_,
+                                      d_u_, d_v_, d_p_, d_T_, _nx, _ny);
+
+        // --- Stage 2: U** = U* + dt * L(U*) → d_rho_rk_ ---
+        launchComputeFluxesKernel(d_rho_new_, d_u_, d_v_, d_p_, d_cell_type_,
+                                  d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
+                                  d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
+                                  params, _nx, _ny);
+        launchUpdateKernel(d_rho_new_, d_rho_u_new_, d_rho_v_new_, d_E_new_, d_rho_e_new_,
+                           d_u_, d_v_, d_p_,
+                           d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
+                           d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
+                           d_cell_type_,
+                           d_rho_rk_, d_rho_u_rk_, d_rho_v_rk_, d_E_rk_, d_rho_e_rk_,
+                           params, _nx, _ny);
+
+        // --- Blend: U^{n+1} = 0.5 * U^n + 0.5 * U** → d_rho_ ---
+        // d_rho_ 此时仍保存着 U^n（对流步只写了 d_rho_new_ 和 d_rho_rk_）
+        sspRK2BlendKernel<<<blendGrid, blendBlock>>>(
+            d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+            d_rho_rk_, d_rho_u_rk_, d_rho_v_rk_, d_E_rk_, d_rho_e_rk_, n);
+        CUDA_CHECK(cudaGetLastError());
+
+        // 步骤3: 扩散半步(dt/2)
         launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                       d_u_, d_v_, d_p_, d_T_, _nx, _ny);
-        // 融合核函数: 单次启动完成粘性项计算+扩散积分
         launchFusedViscousDiffusionKernel(d_u_, d_v_, d_T_,
                                           d_mu_,
                                           d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
@@ -2929,16 +3376,14 @@ void CFDSolver::step(SimParams &params)
     }
     else
     {
-        // ========== 原始欧拉求解器(无粘性) ==========
-        // 原始变量已由上一步结尾计算完毕，直接使用
+        // ========== 欧拉求解器(无粘性, SSP-RK2) ==========
+        // 原始变量已由上一步结尾计算完毕
 
-        // 1. 计算通量(包括内能通量)
+        // --- Stage 1: U* = U^n + dt * L(U^n) → d_rho_new_ ---
         launchComputeFluxesKernel(d_rho_, d_u_, d_v_, d_p_, d_cell_type_,
                                   d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
                                   d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
                                   params, _nx, _ny);
-
-        // 2. 更新守恒变量(包括内能)
         launchUpdateKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                            d_u_, d_v_, d_p_,
                            d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
@@ -2947,12 +3392,30 @@ void CFDSolver::step(SimParams &params)
                            d_rho_new_, d_rho_u_new_, d_rho_v_new_, d_E_new_, d_rho_e_new_,
                            params, _nx, _ny);
 
-        // 3. 交换缓冲区指针(双缓冲技术，避免数据拷贝)
-        std::swap(d_rho_, d_rho_new_);
-        std::swap(d_rho_u_, d_rho_u_new_);
-        std::swap(d_rho_v_, d_rho_v_new_);
-        std::swap(d_E_, d_E_new_);
-        std::swap(d_rho_e_, d_rho_e_new_);
+        // U* 需要边界条件和原始变量，才能正确计算 Stage 2 的通量
+        launchApplyBoundaryConditionsKernel(d_rho_new_, d_rho_u_new_, d_rho_v_new_, d_E_new_, d_rho_e_new_,
+                                            d_cell_type_, d_sdf_, params, _nx, _ny);
+        launchComputePrimitivesKernel(d_rho_new_, d_rho_u_new_, d_rho_v_new_, d_E_new_, d_rho_e_new_,
+                                      d_u_, d_v_, d_p_, d_T_, _nx, _ny);
+
+        // --- Stage 2: U** = U* + dt * L(U*) → d_rho_rk_ ---
+        launchComputeFluxesKernel(d_rho_new_, d_u_, d_v_, d_p_, d_cell_type_,
+                                  d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
+                                  d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
+                                  params, _nx, _ny);
+        launchUpdateKernel(d_rho_new_, d_rho_u_new_, d_rho_v_new_, d_E_new_, d_rho_e_new_,
+                           d_u_, d_v_, d_p_,
+                           d_flux_rho_x_, d_flux_rho_u_x_, d_flux_rho_v_x_, d_flux_E_x_, d_flux_rho_e_x_,
+                           d_flux_rho_y_, d_flux_rho_u_y_, d_flux_rho_v_y_, d_flux_E_y_, d_flux_rho_e_y_,
+                           d_cell_type_,
+                           d_rho_rk_, d_rho_u_rk_, d_rho_v_rk_, d_E_rk_, d_rho_e_rk_,
+                           params, _nx, _ny);
+
+        // --- Blend: U^{n+1} = 0.5 * U^n + 0.5 * U** → d_rho_ ---
+        sspRK2BlendKernel<<<blendGrid, blendBlock>>>(
+            d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+            d_rho_rk_, d_rho_u_rk_, d_rho_v_rk_, d_E_rk_, d_rho_e_rk_, n);
+        CUDA_CHECK(cudaGetLastError());
     }
 
     // 应用边界条件
@@ -2960,7 +3423,6 @@ void CFDSolver::step(SimParams &params)
                                         d_cell_type_, d_sdf_, params, _nx, _ny);
 
     // 计算原始变量：为下一次 computeStableTimeStep 和可视化准备最新的原始变量
-    // 这样 computeStableTimeStep 和 step() 之间不再有冗余的 computePrimitives 调用
     launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
                                   d_u_, d_v_, d_p_, d_T_, _nx, _ny);
 
@@ -2971,27 +3433,34 @@ void CFDSolver::step(SimParams &params)
 #pragma endregion
 
 #pragma region 非零拷贝模式下的统计工具
-// 功能:获取最大温度(使用CUB库的归约)
+/** @brief 获取最大温度（使用CUB库归约） */
 float CFDSolver::getMaxTemperature()
 {
     return launchComputeMaxTemperature(d_T_, _nx, _ny);
 }
 
-// 功能:获取最大马赫数
+/** @brief 获取最大马赫数 */
 float CFDSolver::getMaxMach()
 {
     return launchComputeMaxMach(d_u_, d_v_, d_p_, d_rho_, _nx, _ny);
 }
 
-// 功能:获取网格类型
+/**
+ * @brief 获取网格类型数据
+ * @param[out] host_types 主机端缓冲区，大小至少 _nx*_ny*sizeof(uint8_t)
+ */
 void CFDSolver::getCellTypes(uint8_t *host_types)
 {
     CUDA_CHECK(cudaMemcpy(host_types, d_cell_type_, _nx * _ny * sizeof(uint8_t), cudaMemcpyDeviceToHost));
 }
 
-// 功能:在GPU上将uint8网格类型转换为float并写入设备指针（用于CUDA-GL互操作零拷贝更新）
-// 输入:目标设备指针（已映射的PBO地址），大小至少 _nx*_ny*sizeof(float)
-// 说明:消除了原来 getCellTypes(D→H) + CPU uint8→float转换 + glTexImage2D 的CPU瓶颈
+/**
+ * @brief 在GPU上将uint8网格类型转换为float并写入设备指针
+ * @details 用于CUDA-GL互操作零拷贝更新，消除了原来 getCellTypes(D→H) + CPU转换的瓶颈
+ * @param[in] cellType 网格类型数组 (uint8_t)
+ * @param[out] output 转换后的float数组
+ * @param[in] n 元素总数
+ */
 static __global__ void cellTypeToFloatKernel(const uint8_t *__restrict__ cellType,
                                              float *__restrict__ output, int n)
 {
@@ -3011,13 +3480,17 @@ void CFDSolver::convertCellTypesToDevice(float *devOutput)
 #pragma endregion
 
 #pragma region 内存占用统计
-// 静态函数:获取GPU内存信息
+/**
+ * @brief 获取GPU内存信息
+ * @param[out] freeMem 可用显存字节数
+ * @param[out] totalMem 总显存字节数
+ */
 void CFDSolver::getGPUMemoryInfo(size_t &freeMem, size_t &totalMem)
 {
     cudaMemGetInfo(&freeMem, &totalMem);
 }
 
-// 获取本程序占用的显存
+/** @brief 获取本程序占用的显存字节数 */
 size_t CFDSolver::getSimulationMemoryUsage()
 {
     size_t totalMemory = 0;
@@ -3030,6 +3503,9 @@ size_t CFDSolver::getSimulationMemoryUsage()
 
     // 守恒变量（下一时间步）- 5个数组
     totalMemory += gridSize * floatSize * 5; // rho_new, rho_u_new, rho_v_new, E_new, rho_e_new
+
+    // SSP-RK2中间缓冲区 - 5个数组
+    totalMemory += gridSize * floatSize * 5; // rho_rk, rho_u_rk, rho_v_rk, E_rk, rho_e_rk
 
     // 原始变量 - 4个数组
     totalMemory += gridSize * floatSize * 4; // u, v, p, T
@@ -3048,8 +3524,8 @@ size_t CFDSolver::getSimulationMemoryUsage()
     // 归约用临时计算缓冲区
     totalMemory += gridSize * floatSize; // d_scratch_
 
-    // 粘性相关数组 - 6个数组
-    totalMemory += gridSize * floatSize * 6; // mu, tau_xx, tau_yy, tau_xy, qx, qy
+    // 粘性相关数组 - 1个数组（tau/q 已由融合核函数在共享内存中就地计算）
+    totalMemory += gridSize * floatSize * 1; // mu
 
     // 原子计数器
     totalMemory += sizeof(int); // d_atomic_counter_
@@ -3060,8 +3536,14 @@ size_t CFDSolver::getSimulationMemoryUsage()
 #pragma endregion
 
 #pragma region cuda-OpenGL互操作
-// CUDA-OpenGL 互操作实现 - 零拷贝核函数
-// 从保守变量直接计算温度到目标指针（避免中间拷贝）
+/**
+ * @brief CUDA-OpenGL互操作零拷贝核函数：从守恒变量直接计算温度到目标指针
+ * @param[in] rho 密度场
+ * @param[in] rho_e 内能密度场
+ * @param[out] T_out 温度输出指针
+ * @param[in] nx 网格X方向尺寸
+ * @param[in] ny 网格Y方向尺寸
+ */
 __global__ void computeTemperatureDirectKernel(
     const float *rho, const float *rho_e, float *T_out, int nx, int ny)
 {
@@ -3081,7 +3563,14 @@ __global__ void computeTemperatureDirectKernel(
     T_out[idx] = (GAMMA - 1.0f) * e / R_GAS;
 }
 
-// 从保守变量直接计算压强到目标指针
+/**
+ * @brief 从守恒变量直接计算压强到目标指针
+ * @param[in] rho 密度场
+ * @param[in] rho_e 内能密度场
+ * @param[out] p_out 压强输出指针
+ * @param[in] nx 网格X方向尺寸
+ * @param[in] ny 网格Y方向尺寸
+ */
 __global__ void computePressureDirectKernel(
     const float *rho, const float *rho_e, float *p_out, int nx, int ny)
 {
@@ -3098,7 +3587,15 @@ __global__ void computePressureDirectKernel(
     p_out[idx] = (GAMMA - 1.0f) * rho_e_val;
 }
 
-// 从保守变量直接计算速度大小和马赫数到目标指针
+/**
+ * @brief 从守恒变量直接计算速度大小到目标指针
+ * @param[in] rho 密度场
+ * @param[in] rho_u X方向动量密度
+ * @param[in] rho_v Y方向动量密度
+ * @param[out] vmag_out 速度大小输出指针
+ * @param[in] nx 网格X方向尺寸
+ * @param[in] ny 网格Y方向尺寸
+ */
 __global__ void computeVelocityMagDirectKernel(
     const float *rho, const float *rho_u, const float *rho_v,
     float *vmag_out, int nx, int ny)
@@ -3117,7 +3614,16 @@ __global__ void computeVelocityMagDirectKernel(
     vmag_out[idx] = sqrtf(u * u + v * v);
 }
 
-// 从保守变量直接计算马赫数到目标指针
+/**
+ * @brief 从守恒变量直接计算马赫数到目标指针
+ * @param[in] rho 密度场
+ * @param[in] rho_u X方向动量密度
+ * @param[in] rho_v Y方向动量密度
+ * @param[in] rho_e 内能密度场
+ * @param[out] mach_out 马赫数输出指针
+ * @param[in] nx 网格X方向尺寸
+ * @param[in] ny 网格Y方向尺寸
+ */
 __global__ void computeMachDirectKernel(
     const float *rho, const float *rho_u, const float *rho_v,
     const float *rho_e, float *mach_out, int nx, int ny)
@@ -3142,7 +3648,7 @@ __global__ void computeMachDirectKernel(
     mach_out[idx] = speed / (c + 1e-10f);
 }
 
-// 直接计算温度到目标指针
+/** @brief 直接计算温度到设备目标指针（零拷贝） */
 void CFDSolver::computeTemperatureToDevice(float *dev_dst)
 {
     dim3 block(16, 16);
@@ -3151,7 +3657,7 @@ void CFDSolver::computeTemperatureToDevice(float *dev_dst)
     CUDA_CHECK(cudaGetLastError());
 }
 
-// 直接计算压强到目标指针
+/** @brief 直接计算压强到设备目标指针（零拷贝） */
 void CFDSolver::computePressureToDevice(float *dev_dst)
 {
     dim3 block(16, 16);
@@ -3160,13 +3666,13 @@ void CFDSolver::computePressureToDevice(float *dev_dst)
     CUDA_CHECK(cudaGetLastError());
 }
 
-// 直接计算密度到目标指针
+/** @brief 直接计算密度到设备目标指针（D2D memcpy） */
 void CFDSolver::computeDensityToDevice(float *dev_dst)
 {
     CUDA_CHECK(cudaMemcpy(dev_dst, d_rho_, _nx * _ny * sizeof(float), cudaMemcpyDeviceToDevice));
 }
 
-// 直接计算速度大小到目标指针
+/** @brief 直接计算速度大小到设备目标指针（零拷贝） */
 void CFDSolver::computeVelocityMagToDevice(float *dev_dst)
 {
     dim3 block(16, 16);
@@ -3175,7 +3681,7 @@ void CFDSolver::computeVelocityMagToDevice(float *dev_dst)
     CUDA_CHECK(cudaGetLastError());
 }
 
-// 直接计算马赫数到目标指针
+/** @brief 直接计算马赫数到设备目标指针（零拷贝） */
 void CFDSolver::computeMachToDevice(float *dev_dst)
 {
     dim3 block(16, 16);
@@ -3186,9 +3692,20 @@ void CFDSolver::computeMachToDevice(float *dev_dst)
 #pragma endregion
 
 #pragma region 矢量箭头生成（CUDA-OpenGL互操作）
-// CUDA kernel：GPU并行生成速度矢量箭头的顶点数据
-// 输入：速度场 u, v；网格尺寸 nx, ny；箭头参数
-// 输出：直接写入映射的OpenGL VBO
+/**
+ * @brief GPU并行生成速度矢量箭头的顶点数据，直接写入映射的OpenGL VBO
+ * @param[in] u X方向速度场
+ * @param[in] v Y方向速度场
+ * @param[out] vertexData VBO顶点数据指针
+ * @param[in,out] atomicCounter 原子计数器，用于分配顶点写入位置
+ * @param[in] nx 网格X方向尺寸
+ * @param[in] ny 网格Y方向尺寸
+ * @param[in] step 箭头采样步长
+ * @param[in] u_inf 来流速度（用于归一化）
+ * @param[in] maxArrowLength 最大箭头长度（NDC坐标）
+ * @param[in] arrowHeadAngle 箭头张角
+ * @param[in] arrowHeadLength 箭头长度比例
+ */
 __global__ void generateVectorArrowsKernel(
     const float *u, const float *v,
     float *vertexData,
@@ -3298,7 +3815,17 @@ __global__ void generateVectorArrowsKernel(
     vertexData[baseIdx + 29] = b;
 }
 
-// 生成速度矢量箭头，直接写入OpenGL VBO
+/**
+ * @brief 生成速度矢量箭头，直接写入OpenGL VBO
+ * @param[out] dev_vertexData VBO设备指针
+ * @param[in] maxVertices 最大顶点数
+ * @param[in] step 箭头采样步长
+ * @param[in] u_inf 来流速度
+ * @param[in] maxArrowLength 最大箭头长度
+ * @param[in] arrowHeadAngle 箭头张角
+ * @param[in] arrowHeadLength 箭头长度比例
+ * @return 实际生成的顶点数量
+ */
 int CFDSolver::generateVectorArrows(float *dev_vertexData, int maxVertices,
                                     int step, float u_inf,
                                     float maxArrowLength, float arrowHeadAngle, float arrowHeadLength)
