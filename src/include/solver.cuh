@@ -207,6 +207,13 @@ private:
                                              const uint8_t *cell_type, const float *sdf,
                                              const SimParams &params, int nx, int ny);
 
+    // 功能:启动SSP-RK2凸组合混合核函数，将 U^n 与 U** 按 0.5:0.5 加权得到 U^{n+1}
+    // 输入:dst守恒变量(U^n)，src守恒变量(U**)，网格尺寸
+    // 输出:覆写dst为 U^{n+1} = 0.5*U^n + 0.5*U**
+    void launchSSPRK2BlendKernel(float *rho, float *rho_u, float *rho_v, float *E, float *rho_e,
+                                 const float *rho_rk, const float *rho_u_rk, const float *rho_v_rk,
+                                 const float *E_rk, const float *rho_e_rk, int nx, int ny);
+
     // 功能:启动SDF计算核函数，计算带符号距离场并初始化网格类型
     // 输入:障碍物几何参数(位置/尺寸/旋转/形状)，网格尺寸
     // 输出:SDF场和网格类型标记(流体/固体/虚拟/流入/流出)

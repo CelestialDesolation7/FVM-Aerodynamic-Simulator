@@ -14,7 +14,15 @@ __device__ __constant__ float MIN_TEMPERATURE = 50.0f;
 __device__ __constant__ float MAX_VELOCITY = 10000.0f;
 
 // 主机端编译期常量
-constexpr int BLOCK_SIZE = 16; // CUDA线程块尺寸（2D）
+constexpr int BLOCK_X = 32;  // CUDA线程块X尺寸（对齐warp宽度，优化全局内存合并访存）
+constexpr int BLOCK_Y = 8;   // CUDA线程块Y尺寸（总线程256，匹配SM调度甜点区间）
+
+// 通量计算核函数线程块尺寸（32×8 + halo=2，MUSCL ±2 stencil 的 Tiling 优化）
+constexpr int CF_BX = 32;
+constexpr int CF_BY = 8;
+constexpr int CF_HALO = 2;
+constexpr int CF_SX = CF_BX + 2 * CF_HALO;  // 36
+constexpr int CF_SY = CF_BY + 2 * CF_HALO;  // 12
 
 // 粘性扩散融合核函数线程块尺寸（32×8 对齐 warp 以优化合并访存）
 constexpr int VD_BX = 32;
@@ -888,7 +896,7 @@ __device__ __forceinline__ void computePrimitivesKernelInline(const float rho, c
 }
 #pragma endregion
 
-#pragma region 无条件初始化
+#pragma region 无条件通用
 /**
  * @brief 初始化流场为来流（自由流）条件
  * @param[out] rho   密度场
@@ -931,6 +939,33 @@ __global__ void initializeKernel(float *rho, float *rho_u, float *rho_v, float *
     E[idx] = e_internal + ke;
     // 单独存储内能密度用于双能量法
     rho_e[idx] = e_internal;
+}
+
+/**
+ * @brief SSP-RK2凸组合混合核函数，将 U^n 与 U** 按 0.5:0.5 加权得到 U^{n+1}
+ * @note 每个时间步的两阶段RK完成后调用一次，dst 保存 U^n，src 保存 U**
+ * @param[in,out] rho,rho_u,rho_v,E,rho_e   dst：当前步守恒变量 U^n，输出覆写为 U^{n+1}
+ * @param[in]     rho_rk,rho_u_rk,rho_v_rk,E_rk,rho_e_rk  src：Stage 2 结果 U**
+ * @param n 元素总数 (nx*ny)
+ */
+__global__ void sspRK2BlendKernel(
+    float *__restrict__ rho, float *__restrict__ rho_u,
+    float *__restrict__ rho_v, float *__restrict__ E,
+    float *__restrict__ rho_e,
+    const float *__restrict__ rho_rk, const float *__restrict__ rho_u_rk,
+    const float *__restrict__ rho_v_rk, const float *__restrict__ E_rk,
+    const float *__restrict__ rho_e_rk,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        rho[i] = 0.5f * rho[i] + 0.5f * rho_rk[i];
+        rho_u[i] = 0.5f * rho_u[i] + 0.5f * rho_u_rk[i];
+        rho_v[i] = 0.5f * rho_v[i] + 0.5f * rho_v_rk[i];
+        E[i] = 0.5f * E[i] + 0.5f * E_rk[i];
+        rho_e[i] = 0.5f * rho_e[i] + 0.5f * rho_e_rk[i];
+    }
 }
 #pragma endregion
 
@@ -1423,59 +1458,74 @@ __device__ __forceinline__ void hllcFluxY(
  * 并将已 clamp 的界面值无条件传给 Riemann 求解器。
  */
 __global__ void computeFluxesKernel(
-    const float *rho,                               // 密度(守恒量，用于MUSCL重构)
-    const float *u, const float *v, const float *p, // 原始变量(用于MUSCL+Riemann)
-    const uint8_t *cell_type,
-    float *flux_rho_x, float *flux_rho_u_x, float *flux_rho_v_x, float *flux_E_x,
-    float *flux_rho_e_x, // 内能通量
-    float *flux_rho_y, float *flux_rho_u_y, float *flux_rho_v_y, float *flux_E_y,
-    float *flux_rho_e_y, // 内能通量
+    const float *__restrict__ rho,
+    const float *__restrict__ u, const float *__restrict__ v, const float *__restrict__ p,
+    const uint8_t *__restrict__ cell_type,
+    float *__restrict__ flux_rho_x, float *__restrict__ flux_rho_u_x,
+    float *__restrict__ flux_rho_v_x, float *__restrict__ flux_E_x,
+    float *__restrict__ flux_rho_e_x,
+    float *__restrict__ flux_rho_y, float *__restrict__ flux_rho_u_y,
+    float *__restrict__ flux_rho_v_y, float *__restrict__ flux_E_y,
+    float *__restrict__ flux_rho_e_y,
     float dx, float dy, int nx, int ny)
 {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    // ===== 共享内存声明（MUSCL ±2 stencil 的 Tiling 优化） =====
+    __shared__ float s_rho[CF_SY][CF_SX];
+    __shared__ float s_u[CF_SY][CF_SX];
+    __shared__ float s_v[CF_SY][CF_SX];
+    __shared__ float s_p[CF_SY][CF_SX];
+    __shared__ uint8_t s_ct[CF_SY][CF_SX];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    const int thread_id = ty * CF_BX + tx;
+    const int block_origin_i = blockIdx.x * CF_BX;
+    const int block_origin_j = blockIdx.y * CF_BY;
+    const int i = block_origin_i + tx;
+    const int j = block_origin_j + ty;
+    const int sx = tx + CF_HALO;
+    const int sy = ty + CF_HALO;
+
+    // ===== Phase 0: 协作加载 rho/u/v/p/cell_type 到共享内存 =====
+    for (int n = thread_id; n < CF_SX * CF_SY; n += CF_BX * CF_BY)
+    {
+        int tile_i = n % CF_SX;
+        int tile_j = n / CF_SX;
+        int src_i = block_origin_i + tile_i - CF_HALO;
+        int src_j = block_origin_j + tile_j - CF_HALO;
+        src_i = max(0, min(src_i, nx - 1));
+        src_j = max(0, min(src_j, ny - 1));
+        int src_idx = src_j * nx + src_i;
+        s_rho[tile_j][tile_i] = rho[src_idx];
+        s_u[tile_j][tile_i] = u[src_idx];
+        s_v[tile_j][tile_i] = v[src_idx];
+        s_p[tile_j][tile_i] = p[src_idx];
+        s_ct[tile_j][tile_i] = cell_type[src_idx];
+    }
+    __syncthreads();
 
     if (i >= nx || j >= ny)
         return;
 
     int idx = j * nx + i;
 
-    // 索引辅助函数(带边界限制)
-    auto getIdx = [nx, ny](int ii, int jj)
-    {
-        // 将索引限制在有效范围内
-        ii = max(0, min(nx - 1, ii));
-        jj = max(0, min(ny - 1, jj));
-        return jj * nx + ii;
-    };
-
-    // 获取相邻网格的索引(用于MUSCL重构)
-    int idx_im1 = getIdx(i - 1, j); // 左邻居
-    int idx_ip1 = getIdx(i + 1, j); // 右邻居
-    int idx_jm1 = getIdx(i, j - 1); // 下邻居
-    int idx_jp1 = getIdx(i, j + 1); // 上邻居
-    int idx_im2 = getIdx(i - 2, j); // 左侧第二个邻居
-    int idx_ip2 = getIdx(i + 2, j); // 右侧第二个邻居
-    int idx_jm2 = getIdx(i, j - 2); // 下侧第二个邻居
-    int idx_jp2 = getIdx(i, j + 2); // 上侧第二个邻居
-
     // ==================== X方向通量(在 i+1/2 界面处) ====================
     if (i < nx - 1)
     {
         // 检查通量是否应该计算(不穿过固体或虚拟网格)
-        bool isSolidOrGhost = (cell_type[idx] == CELL_SOLID || cell_type[idx] == CELL_GHOST);
-        bool isSolidOrGhostRight = (cell_type[idx_ip1] == CELL_SOLID || cell_type[idx_ip1] == CELL_GHOST);
+        bool isSolidOrGhost = (s_ct[sy][sx] == CELL_SOLID || s_ct[sy][sx] == CELL_GHOST);
+        bool isSolidOrGhostRight = (s_ct[sy][sx + 1] == CELL_SOLID || s_ct[sy][sx + 1] == CELL_GHOST);
         bool validFlux = !isSolidOrGhost && !isSolidOrGhostRight;
 
         if (validFlux)
         {
             // 检查是否靠近边界(邻居是固体/虚拟网格)
             // 靠近边界时降级为一阶格式(更稳定)
-            bool nearBoundary = (cell_type[idx_im1] == CELL_SOLID || cell_type[idx_im1] == CELL_GHOST ||
-                                 cell_type[idx_ip2] == CELL_SOLID || cell_type[idx_ip2] == CELL_GHOST);
+            bool nearBoundary = (s_ct[sy][sx - 1] == CELL_SOLID || s_ct[sy][sx - 1] == CELL_GHOST ||
+                                 s_ct[sy][sx + 2] == CELL_SOLID || s_ct[sy][sx + 2] == CELL_GHOST);
 
             // 在低密度区域(如尾流)也使用一阶格式，防止数值不稳定
-            bool lowDensity = (rho[idx] < LOW_DENSITY_THRESHOLD || rho[idx_ip1] < LOW_DENSITY_THRESHOLD);
+            bool lowDensity = (s_rho[sy][sx] < LOW_DENSITY_THRESHOLD || s_rho[sy][sx + 1] < LOW_DENSITY_THRESHOLD);
 
             float rhoL, uL, vL, pL, EL; // 界面左侧重构状态
             float rhoR, uR, vR, pR, ER; // 界面右侧重构状态
@@ -1485,15 +1535,15 @@ __global__ void computeFluxesKernel(
                 // ===== 一阶重构(分片常数) =====
                 // 直接使用网格中心的值，不外推
                 // rho/p 由调用前置条件保证 ≥ MIN_DENSITY/MIN_PRESSURE，无需重复 clamp
-                rhoL = rho[idx];
-                uL = u[idx];
-                vL = v[idx];
-                pL = p[idx];
+                rhoL = s_rho[sy][sx];
+                uL = s_u[sy][sx];
+                vL = s_v[sy][sx];
+                pL = s_p[sy][sx];
 
-                rhoR = rho[idx_ip1];
-                uR = u[idx_ip1];
-                vR = v[idx_ip1];
-                pR = p[idx_ip1];
+                rhoR = s_rho[sy][sx + 1];
+                uR = s_u[sy][sx + 1];
+                vR = s_v[sy][sx + 1];
+                pR = s_p[sy][sx + 1];
             }
             else
             {
@@ -1501,28 +1551,28 @@ __global__ void computeFluxesKernel(
                 // 对每个原始变量计算限制后的斜率
 
                 // 左侧状态重构(从 i 网格外推到 i+1/2 界面)
-                float slope_rho_L = musclSlope(rho[idx_im1], rho[idx], rho[idx_ip1]);
-                float slope_u_L = musclSlope(u[idx_im1], u[idx], u[idx_ip1]);
-                float slope_v_L = musclSlope(v[idx_im1], v[idx], v[idx_ip1]);
-                float slope_p_L = musclSlope(p[idx_im1], p[idx], p[idx_ip1]);
+                float slope_rho_L = musclSlope(s_rho[sy][sx - 1], s_rho[sy][sx], s_rho[sy][sx + 1]);
+                float slope_u_L = musclSlope(s_u[sy][sx - 1], s_u[sy][sx], s_u[sy][sx + 1]);
+                float slope_v_L = musclSlope(s_v[sy][sx - 1], s_v[sy][sx], s_v[sy][sx + 1]);
+                float slope_p_L = musclSlope(s_p[sy][sx - 1], s_p[sy][sx], s_p[sy][sx + 1]);
 
                 // 外推到界面: q_L(i+1/2) = q(i) + 0.5 * slope
-                rhoL = rho[idx] + 0.5f * slope_rho_L;
-                uL = u[idx] + 0.5f * slope_u_L;
-                vL = v[idx] + 0.5f * slope_v_L;
-                pL = p[idx] + 0.5f * slope_p_L;
+                rhoL = s_rho[sy][sx] + 0.5f * slope_rho_L;
+                uL = s_u[sy][sx] + 0.5f * slope_u_L;
+                vL = s_v[sy][sx] + 0.5f * slope_v_L;
+                pL = s_p[sy][sx] + 0.5f * slope_p_L;
 
                 // 右侧状态重构(从 i+1 网格外推到 i+1/2 界面)
-                float slope_rho_R = musclSlope(rho[idx], rho[idx_ip1], rho[idx_ip2]);
-                float slope_u_R = musclSlope(u[idx], u[idx_ip1], u[idx_ip2]);
-                float slope_v_R = musclSlope(v[idx], v[idx_ip1], v[idx_ip2]);
-                float slope_p_R = musclSlope(p[idx], p[idx_ip1], p[idx_ip2]);
+                float slope_rho_R = musclSlope(s_rho[sy][sx], s_rho[sy][sx + 1], s_rho[sy][sx + 2]);
+                float slope_u_R = musclSlope(s_u[sy][sx], s_u[sy][sx + 1], s_u[sy][sx + 2]);
+                float slope_v_R = musclSlope(s_v[sy][sx], s_v[sy][sx + 1], s_v[sy][sx + 2]);
+                float slope_p_R = musclSlope(s_p[sy][sx], s_p[sy][sx + 1], s_p[sy][sx + 2]);
 
                 // 外推到界面: q_R(i+1/2) = q(i+1) - 0.5 * slope
-                rhoR = rho[idx_ip1] - 0.5f * slope_rho_R;
-                uR = u[idx_ip1] - 0.5f * slope_u_R;
-                vR = v[idx_ip1] - 0.5f * slope_v_R;
-                pR = p[idx_ip1] - 0.5f * slope_p_R;
+                rhoR = s_rho[sy][sx + 1] - 0.5f * slope_rho_R;
+                uR = s_u[sy][sx + 1] - 0.5f * slope_u_R;
+                vR = s_v[sy][sx + 1] - 0.5f * slope_v_R;
+                pR = s_p[sy][sx + 1] - 0.5f * slope_p_R;
             }
 
             // MUSCL 线性外推可能产生负密度/压强，此处是唯一需要 clamp 的位置
@@ -1575,7 +1625,7 @@ __global__ void computeFluxesKernel(
             // ===== 固体壁面或无效通量 =====
             // p ≥ MIN_PRESSURE 由 computePrimitivesKernelInline 保证，无需重复 clamp
             flux_rho_x[idx] = 0.0f;     // 质量不穿透
-            flux_rho_u_x[idx] = p[idx]; // 压力作用在壁面上
+            flux_rho_u_x[idx] = s_p[sy][sx]; // 压力作用在壁面上
             flux_rho_v_x[idx] = 0.0f;   // 动量不穿透
             flux_E_x[idx] = 0.0f;       // 能量不穿透
             flux_rho_e_x[idx] = 0.0f;   // 内能不穿透
@@ -1586,16 +1636,16 @@ __global__ void computeFluxesKernel(
     // 算法与X方向相同，只是方向变为Y方向
     if (j < ny - 1)
     {
-        bool isSolidOrGhost = (cell_type[idx] == CELL_SOLID || cell_type[idx] == CELL_GHOST);
-        bool isSolidOrGhostTop = (cell_type[idx_jp1] == CELL_SOLID || cell_type[idx_jp1] == CELL_GHOST);
+        bool isSolidOrGhost = (s_ct[sy][sx] == CELL_SOLID || s_ct[sy][sx] == CELL_GHOST);
+        bool isSolidOrGhostTop = (s_ct[sy + 1][sx] == CELL_SOLID || s_ct[sy + 1][sx] == CELL_GHOST);
         bool validFlux = !isSolidOrGhost && !isSolidOrGhostTop;
 
         if (validFlux)
         {
-            bool nearBoundary = (cell_type[idx_jm1] == CELL_SOLID || cell_type[idx_jm1] == CELL_GHOST ||
-                                 cell_type[idx_jp2] == CELL_SOLID || cell_type[idx_jp2] == CELL_GHOST);
+            bool nearBoundary = (s_ct[sy - 1][sx] == CELL_SOLID || s_ct[sy - 1][sx] == CELL_GHOST ||
+                                 s_ct[sy + 2][sx] == CELL_SOLID || s_ct[sy + 2][sx] == CELL_GHOST);
 
-            bool lowDensity = (rho[idx] < LOW_DENSITY_THRESHOLD || rho[idx_jp1] < LOW_DENSITY_THRESHOLD);
+            bool lowDensity = (s_rho[sy][sx] < LOW_DENSITY_THRESHOLD || s_rho[sy + 1][sx] < LOW_DENSITY_THRESHOLD);
 
             float rhoB, uB, vB, pB, EB; // 界面下方(Bottom)状态
             float rhoT, uT, vT, pT, ET; // 界面上方(Top)状态
@@ -1603,39 +1653,38 @@ __global__ void computeFluxesKernel(
             if (nearBoundary || lowDensity)
             {
                 // 一阶重构
-                // rho/p 由调用前置条件保证 ≥ MIN_DENSITY/MIN_PRESSURE，无需重复 clamp
-                rhoB = rho[idx];
-                uB = u[idx];
-                vB = v[idx];
-                pB = p[idx];
+                rhoB = s_rho[sy][sx];
+                uB = s_u[sy][sx];
+                vB = s_v[sy][sx];
+                pB = s_p[sy][sx];
 
-                rhoT = rho[idx_jp1];
-                uT = u[idx_jp1];
-                vT = v[idx_jp1];
-                pT = p[idx_jp1];
+                rhoT = s_rho[sy + 1][sx];
+                uT = s_u[sy + 1][sx];
+                vT = s_v[sy + 1][sx];
+                pT = s_p[sy + 1][sx];
             }
             else
             {
                 // MUSCL二阶重构(Y方向)
-                float slope_rho_B = musclSlope(rho[idx_jm1], rho[idx], rho[idx_jp1]);
-                float slope_u_B = musclSlope(u[idx_jm1], u[idx], u[idx_jp1]);
-                float slope_v_B = musclSlope(v[idx_jm1], v[idx], v[idx_jp1]);
-                float slope_p_B = musclSlope(p[idx_jm1], p[idx], p[idx_jp1]);
+                float slope_rho_B = musclSlope(s_rho[sy - 1][sx], s_rho[sy][sx], s_rho[sy + 1][sx]);
+                float slope_u_B = musclSlope(s_u[sy - 1][sx], s_u[sy][sx], s_u[sy + 1][sx]);
+                float slope_v_B = musclSlope(s_v[sy - 1][sx], s_v[sy][sx], s_v[sy + 1][sx]);
+                float slope_p_B = musclSlope(s_p[sy - 1][sx], s_p[sy][sx], s_p[sy + 1][sx]);
 
-                rhoB = rho[idx] + 0.5f * slope_rho_B;
-                uB = u[idx] + 0.5f * slope_u_B;
-                vB = v[idx] + 0.5f * slope_v_B;
-                pB = p[idx] + 0.5f * slope_p_B;
+                rhoB = s_rho[sy][sx] + 0.5f * slope_rho_B;
+                uB = s_u[sy][sx] + 0.5f * slope_u_B;
+                vB = s_v[sy][sx] + 0.5f * slope_v_B;
+                pB = s_p[sy][sx] + 0.5f * slope_p_B;
 
-                float slope_rho_T = musclSlope(rho[idx], rho[idx_jp1], rho[idx_jp2]);
-                float slope_u_T = musclSlope(u[idx], u[idx_jp1], u[idx_jp2]);
-                float slope_v_T = musclSlope(v[idx], v[idx_jp1], v[idx_jp2]);
-                float slope_p_T = musclSlope(p[idx], p[idx_jp1], p[idx_jp2]);
+                float slope_rho_T = musclSlope(s_rho[sy][sx], s_rho[sy + 1][sx], s_rho[sy + 2][sx]);
+                float slope_u_T = musclSlope(s_u[sy][sx], s_u[sy + 1][sx], s_u[sy + 2][sx]);
+                float slope_v_T = musclSlope(s_v[sy][sx], s_v[sy + 1][sx], s_v[sy + 2][sx]);
+                float slope_p_T = musclSlope(s_p[sy][sx], s_p[sy + 1][sx], s_p[sy + 2][sx]);
 
-                rhoT = rho[idx_jp1] - 0.5f * slope_rho_T;
-                uT = u[idx_jp1] - 0.5f * slope_u_T;
-                vT = v[idx_jp1] - 0.5f * slope_v_T;
-                pT = p[idx_jp1] - 0.5f * slope_p_T;
+                rhoT = s_rho[sy + 1][sx] - 0.5f * slope_rho_T;
+                uT = s_u[sy + 1][sx] - 0.5f * slope_u_T;
+                vT = s_v[sy + 1][sx] - 0.5f * slope_v_T;
+                pT = s_p[sy + 1][sx] - 0.5f * slope_p_T;
             }
 
             // MUSCL 线性外推可能产生负密度/压强，此处是唯一需要 clamp 的位置
@@ -1682,7 +1731,7 @@ __global__ void computeFluxesKernel(
             // p ≥ MIN_PRESSURE 由 computePrimitivesKernelInline 保证，无需重复 clamp
             flux_rho_y[idx] = 0.0f;
             flux_rho_u_y[idx] = 0.0f;
-            flux_rho_v_y[idx] = p[idx]; // 压力作用
+            flux_rho_v_y[idx] = s_p[sy][sx]; // 压力作用
             flux_E_y[idx] = 0.0f;
             flux_rho_e_y[idx] = 0.0f;
         }
@@ -1744,19 +1793,23 @@ __global__ void updateKernel(
     int idx_jm1 = (j > 0) ? ((j - 1) * nx + i) : idx;
 
     // ===== 计算通量散度(有限体积法) =====
+    // 倒数预计算（消除除法指令）
+    const float inv_dx = 1.0f / dx;
+    const float inv_dy = 1.0f / dy;
+
     // div(F) = (F_{i+1/2} - F_{i-1/2}) / dx
-    float dFx_rho = (flux_rho_x[idx] - flux_rho_x[idx_im1]) / dx;
-    float dFx_rho_u = (flux_rho_u_x[idx] - flux_rho_u_x[idx_im1]) / dx;
-    float dFx_rho_v = (flux_rho_v_x[idx] - flux_rho_v_x[idx_im1]) / dx;
-    float dFx_E = (flux_E_x[idx] - flux_E_x[idx_im1]) / dx;
-    float dFx_rho_e = (flux_rho_e_x[idx] - flux_rho_e_x[idx_im1]) / dx;
+    float dFx_rho = (flux_rho_x[idx] - flux_rho_x[idx_im1]) * inv_dx;
+    float dFx_rho_u = (flux_rho_u_x[idx] - flux_rho_u_x[idx_im1]) * inv_dx;
+    float dFx_rho_v = (flux_rho_v_x[idx] - flux_rho_v_x[idx_im1]) * inv_dx;
+    float dFx_E = (flux_E_x[idx] - flux_E_x[idx_im1]) * inv_dx;
+    float dFx_rho_e = (flux_rho_e_x[idx] - flux_rho_e_x[idx_im1]) * inv_dx;
 
     // div(G) = (G_{j+1/2} - G_{j-1/2}) / dy
-    float dFy_rho = (flux_rho_y[idx] - flux_rho_y[idx_jm1]) / dy;
-    float dFy_rho_u = (flux_rho_u_y[idx] - flux_rho_u_y[idx_jm1]) / dy;
-    float dFy_rho_v = (flux_rho_v_y[idx] - flux_rho_v_y[idx_jm1]) / dy;
-    float dFy_E = (flux_E_y[idx] - flux_E_y[idx_jm1]) / dy;
-    float dFy_rho_e = (flux_rho_e_y[idx] - flux_rho_e_y[idx_jm1]) / dy;
+    float dFy_rho = (flux_rho_y[idx] - flux_rho_y[idx_jm1]) * inv_dy;
+    float dFy_rho_u = (flux_rho_u_y[idx] - flux_rho_u_y[idx_jm1]) * inv_dy;
+    float dFy_rho_v = (flux_rho_v_y[idx] - flux_rho_v_y[idx_jm1]) * inv_dy;
+    float dFy_E = (flux_E_y[idx] - flux_E_y[idx_jm1]) * inv_dy;
+    float dFy_rho_e = (flux_rho_e_y[idx] - flux_rho_e_y[idx_jm1]) * inv_dy;
 
     // 处理边界通量(域边界处单侧通量为零)
     // i==0: 左边界面通量未定义; i==nx-1: 右边界面(i+1/2)通量未计算
@@ -1795,7 +1848,7 @@ __global__ void updateKernel(
         float v_face_T = flux_rho_y[idx] / (0.5f * (rho_c + rho_yT));
         float v_face_B = flux_rho_y[idx_jm1] / (0.5f * (rho_yB + rho_c));
 
-        float div_v = (u_face_R - u_face_L) / dx + (v_face_T - v_face_B) / dy;
+        float div_v = (u_face_R - u_face_L) * inv_dx + (v_face_T - v_face_B) * inv_dy;
         source_rho_e = -p[idx] * div_v;
     }
 
@@ -2514,39 +2567,13 @@ __global__ void fusedViscousDiffusionKernel(
 #pragma endregion
 #pragma endregion
 
-/**
- * @brief SSP-RK2 凸组合混合核函数
- * @details 对五个守恒变量执行: dst[i] = 0.5 * dst[i] + 0.5 * src[i]
- *          其中 dst 保存 U^n（初始状态），src 保存 U**（Stage 2 的欧拉步结果）
- * @param n 元素总数
- */
-__global__ void sspRK2BlendKernel(
-    float *__restrict__ rho, float *__restrict__ rho_u,
-    float *__restrict__ rho_v, float *__restrict__ E,
-    float *__restrict__ rho_e,
-    const float *__restrict__ rho_rk, const float *__restrict__ rho_u_rk,
-    const float *__restrict__ rho_v_rk, const float *__restrict__ E_rk,
-    const float *__restrict__ rho_e_rk,
-    int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n)
-    {
-        rho[i] = 0.5f * rho[i] + 0.5f * rho_rk[i];
-        rho_u[i] = 0.5f * rho_u[i] + 0.5f * rho_u_rk[i];
-        rho_v[i] = 0.5f * rho_v[i] + 0.5f * rho_v_rk[i];
-        E[i] = 0.5f * E[i] + 0.5f * E_rk[i];
-        rho_e[i] = 0.5f * rho_e[i] + 0.5f * rho_e_rk[i];
-    }
-}
-
 #pragma region 并行计算任务发射函数
 #pragma region 无条件初始化
 /** @brief 启动初始化核函数，将所有网格初始化为来流条件 */
 void CFDSolver::launchInitializeKernel(float *rho, float *rho_u, float *rho_v, float *E, float *rho_e,
                                        const SimParams &params, int nx, int ny)
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(BLOCK_X, BLOCK_Y);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     initializeKernel<<<grid, block>>>(rho, rho_u, rho_v, E, rho_e,
@@ -2559,7 +2586,7 @@ void CFDSolver::launchInitializeKernel(float *rho, float *rho_u, float *rho_v, f
 void CFDSolver::launchComputeSDFKernel(float *sdf, uint8_t *cell_type,
                                        const SimParams &params, int nx, int ny)
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(BLOCK_X, BLOCK_Y);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     computeSDFKernel<<<grid, block>>>(sdf, cell_type,
@@ -2578,7 +2605,7 @@ void CFDSolver::launchComputePrimitivesKernel(const float *rho, const float *rho
                                               float *u, float *v, float *p, float *T,
                                               int nx, int ny)
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(BLOCK_X, BLOCK_Y);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     computePrimitivesKernel<<<grid, block>>>(rho, rho_u, rho_v, E, rho_e, u, v, p, T, nx, ny);
@@ -2602,8 +2629,8 @@ void CFDSolver::launchComputeFluxesKernel(const float *rho,
                                           float *flux_rho_e_y,
                                           const SimParams &params, int nx, int ny)
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
-    dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
+    dim3 block(CF_BX, CF_BY);
+    dim3 grid((nx + CF_BX - 1) / CF_BX, (ny + CF_BY - 1) / CF_BY);
 
     computeFluxesKernel<<<grid, block>>>(rho, u, v, p, cell_type,
                                          flux_rho_x, flux_rho_u_x, flux_rho_v_x, flux_E_x, flux_rho_e_x,
@@ -2627,7 +2654,7 @@ void CFDSolver::launchUpdateKernel(const float *rho, const float *rho_u,
                                    float *rho_v_new, float *E_new, float *rho_e_new,
                                    const SimParams &params, int nx, int ny)
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(BLOCK_X, BLOCK_Y);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     updateKernel<<<grid, block>>>(rho, rho_u, rho_v, E, rho_e,
@@ -2646,7 +2673,7 @@ void CFDSolver::launchApplyBoundaryConditionsKernel(float *rho, float *rho_u, fl
                                                     const uint8_t *cell_type, const float *sdf,
                                                     const SimParams &params, int nx, int ny)
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(BLOCK_X, BLOCK_Y);
     dim3 grid((nx + block.x - 1) / block.x, (ny + block.y - 1) / block.y);
 
     applyBoundaryConditionsKernel<<<grid, block>>>(rho, rho_u, rho_v, E, rho_e,
@@ -2654,6 +2681,21 @@ void CFDSolver::launchApplyBoundaryConditionsKernel(float *rho, float *rho_u, fl
                                                    params.rho_inf, params.u_inf, params.v_inf, params.p_inf,
                                                    params.dx, params.dy, nx, ny,
                                                    params.enable_viscosity, params.adiabatic_wall, params.T_wall);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+/** @brief 启动SSP-RK2凸组合混合核函数，将 U^n 与 U** 按 0.5:0.5 加权得到 U^{n+1} */
+void CFDSolver::launchSSPRK2BlendKernel(
+    float *rho, float *rho_u, float *rho_v, float *E, float *rho_e,
+    const float *rho_rk, const float *rho_u_rk, const float *rho_v_rk,
+    const float *E_rk, const float *rho_e_rk, int nx, int ny)
+{
+    int n = nx * ny;
+    dim3 block(256);
+    dim3 grid((n + block.x - 1) / block.x);
+
+    sspRK2BlendKernel<<<grid, block>>>(rho, rho_u, rho_v, E, rho_e,
+                                       rho_rk, rho_u_rk, rho_v_rk, E_rk, rho_e_rk, n);
     CUDA_CHECK(cudaGetLastError());
 }
 #pragma endregion
@@ -2682,7 +2724,6 @@ void CFDSolver::launchFusedViscousDiffusionKernel(
 #pragma endregion
 
 #pragma region 统计工具
-
 /**
  * @brief 计算运动粘性系数 nu = mu / rho
  * @param[in] mu 动力粘性系数数组
@@ -3184,7 +3225,7 @@ void CFDSolver::reset(const SimParams &params)
  */
 void CFDSolver::updateObstacleGeometry(const SimParams &params)
 {
-    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 block(BLOCK_X, BLOCK_Y);
     dim3 grid((_nx + block.x - 1) / block.x, (_ny + block.y - 1) / block.y);
 
     // 1. 重新计算SDF和网格类型，同时修正新暴露区域的守恒变量
@@ -3306,10 +3347,6 @@ void CFDSolver::step(SimParams &params)
     //       reset() 或上一步 step() 结尾的 computePrimitives 计算完毕，
     //       因此无需在函数开头重复计算
 
-    int n = _nx * _ny;
-    dim3 blendBlock(256);
-    dim3 blendGrid((n + blendBlock.x - 1) / blendBlock.x);
-
     if (params.enable_viscosity)
     {
         // ========== Navier-Stokes求解器(Strang算子分裂 + SSP-RK2对流) ==========
@@ -3360,10 +3397,9 @@ void CFDSolver::step(SimParams &params)
 
         // --- Blend: U^{n+1} = 0.5 * U^n + 0.5 * U** → d_rho_ ---
         // d_rho_ 此时仍保存着 U^n（对流步只写了 d_rho_new_ 和 d_rho_rk_）
-        sspRK2BlendKernel<<<blendGrid, blendBlock>>>(
-            d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
-            d_rho_rk_, d_rho_u_rk_, d_rho_v_rk_, d_E_rk_, d_rho_e_rk_, n);
-        CUDA_CHECK(cudaGetLastError());
+        launchSSPRK2BlendKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+                                d_rho_rk_, d_rho_u_rk_, d_rho_v_rk_, d_E_rk_, d_rho_e_rk_,
+                                _nx, _ny);
 
         // 步骤3: 扩散半步(dt/2)
         launchComputePrimitivesKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
@@ -3412,10 +3448,9 @@ void CFDSolver::step(SimParams &params)
                            params, _nx, _ny);
 
         // --- Blend: U^{n+1} = 0.5 * U^n + 0.5 * U** → d_rho_ ---
-        sspRK2BlendKernel<<<blendGrid, blendBlock>>>(
-            d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
-            d_rho_rk_, d_rho_u_rk_, d_rho_v_rk_, d_E_rk_, d_rho_e_rk_, n);
-        CUDA_CHECK(cudaGetLastError());
+        launchSSPRK2BlendKernel(d_rho_, d_rho_u_, d_rho_v_, d_E_, d_rho_e_,
+                                d_rho_rk_, d_rho_u_rk_, d_rho_v_rk_, d_E_rk_, d_rho_e_rk_,
+                                _nx, _ny);
     }
 
     // 应用边界条件
